@@ -1,0 +1,45 @@
+# Copy this file to `.sutcac/config.toml` (or `~/.config/catus/config.toml`)
+# and fill in your OpenAI-compatible API key.
+
+[api]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+model = "gpt-4o-mini"
+
+[agent]
+system_prompt = """You are a helpful assistant running inside a simplified Bash shell.
+You can execute shell commands using the provided `shell` function.
+Call it with a JSON object like {"command": "the command"}.
+The user will see the command output and you can continue.
+When you have enough information, answer the user directly without tools."""
+max_tool_rounds = 10
+# Optional directory for JSON conversation-history files. When set, catus can
+# load a previous conversation with `/resume <name>` and saves the current
+# session to a timestamped JSON file on exit.
+history_path = ".sutcac/history"
+
+# Optional log file path. All catus diagnostics are written here; nothing is
+# printed to stderr while the TUI is running. Defaults to `.sutcac/catus.log`.
+# log_path = ".sutcac/catus.log"
+
+# Optional log level: trace, debug, info, warn, error. Defaults to info.
+# log_level = "info"
+
+[shell]
+perm_mode = "allow_all"
+audit_log = "/tmp/sutcac-audit.log"
+audit_format = "text"
+
+# Optional structured metadata appended to every audit log entry.
+[shell.audit_meta]
+session = "example-session"
+
+# Per-command permission overrides. Built-in read-only coreutils such as
+# cat, cut, find, grep, head, ls, more, ps, pwd, sed, sort, tail, tr, uniq,
+# and wc already default to READ. Use this section to add custom tags or
+# override specific commands.
+[shell.commands]
+grep = ["read"]
+find = ["read"]
+curl = ["network", "read"]
+clip = ["clipboard"]

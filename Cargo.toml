@@ -1,0 +1,3 @@
+[workspace]
+members = ["catus","sutcac-sh"]
+resolver = "3"
