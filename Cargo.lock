@@ -2424,6 +2424,7 @@ name = "sutcac-sh"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "libc",
  "rustyline",
  "serde",
  "toml",

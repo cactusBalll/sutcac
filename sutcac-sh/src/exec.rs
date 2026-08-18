@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -599,6 +599,36 @@ fn execute_external(
     }
 }
 
+/// Create an OS pipe with two write ends sharing the same read end.
+///
+/// This is used to implement `2>&1` for intermediate pipeline stages so that
+/// both stdout and stderr of a process write into the pipe consumed by the
+/// next stage, instead of stderr leaking onto the terminal.
+#[cfg(unix)]
+fn create_merged_stdout_stderr_pipe() -> io::Result<(File, File, File)> {
+    use std::os::unix::io::{FromRawFd, RawFd};
+
+    let mut fds: [RawFd; 2] = [-1; 2];
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        let write_dup = libc::dup(write_fd);
+        if write_dup < 0 {
+            libc::close(read_fd);
+            libc::close(write_fd);
+            return Err(io::Error::last_os_error());
+        }
+        Ok((
+            File::from_raw_fd(read_fd),
+            File::from_raw_fd(write_fd),
+            File::from_raw_fd(write_dup),
+        ))
+    }
+}
+
 fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
     // For simplicity, require all pipeline elements to be external simple commands.
     let mut externals: Vec<(String, Vec<String>, Vec<Redirect>)> = Vec::new();
@@ -654,7 +684,7 @@ fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
 
     // Build a chain of processes.
     let mut children = Vec::new();
-    let mut prev_stdout: Option<std::process::ChildStdout> = None;
+    let mut prev_stdout: Option<Stdio> = None;
     let mut last_stdout: Option<std::process::ChildStdout> = None;
     let mut last_stderr: Option<std::process::ChildStderr> = None;
     let mut last_status = 0;
@@ -748,7 +778,7 @@ fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
                 cmd.stdin(Stdio::from(f));
             }
         } else {
-            cmd.stdin(Stdio::from(prev_stdout.take().unwrap()));
+            cmd.stdin(prev_stdout.take().unwrap());
         }
 
         if is_last {
@@ -771,6 +801,46 @@ fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
             }
         } else if is_last {
             cmd.stderr(Stdio::piped());
+        } else if merge_stderr_to_stdout {
+            // For intermediate stages, merge stderr into the stdout pipe so
+            // constructs like `cmd 2>&1 | tail` capture stderr in the pipeline
+            // instead of writing it to the terminal and corrupting the TUI.
+            #[cfg(unix)]
+            {
+                match create_merged_stdout_stderr_pipe() {
+                    Ok((read_end, stdout_write, stderr_write)) => {
+                        // Revert the default piped stdout so we can use our
+                        // custom pipe for both streams.
+                        cmd.stdout(Stdio::from(stdout_write));
+                        cmd.stderr(Stdio::from(stderr_write));
+                        prev_stdout = Some(Stdio::from(read_end));
+                        // Skip the default stdout handling below.
+                        match cmd.spawn() {
+                            Ok(child) => {
+                                children.push(child);
+                            }
+                            Err(e) => {
+                                return CommandOutput::with_output(
+                                    126,
+                                    String::new(),
+                                    exec_failed_message(&program, &e),
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        // Fall back to inheriting stderr if pipe creation fails.
+                    }
+                }
+            }
+            // Non-Unix fallback (or Unix pipe creation failure): discard stderr
+            // so it cannot overwrite the TUI.
+            cmd.stderr(Stdio::null());
+        } else {
+            // Intermediate stages normally inherit stderr; inside a TUI that
+            // leaks onto the terminal, so discard it instead.
+            cmd.stderr(Stdio::null());
         }
 
         match cmd.spawn() {
@@ -779,7 +849,7 @@ fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
                     last_stdout = child.stdout.take();
                     last_stderr = child.stderr.take();
                 } else {
-                    prev_stdout = child.stdout.take();
+                    prev_stdout = child.stdout.take().map(Stdio::from);
                 }
                 children.push(child);
             }
@@ -1150,5 +1220,50 @@ mod tests {
         let output = execute_command(&cmd, &mut state);
         assert_eq!(output.status, 0);
         assert_eq!(output.stdout, "out");
+    }
+
+    #[test]
+    fn pipeline_captures_stdout() {
+        let mut state = ShellState::new();
+        let mut parser = Parser::new("/bin/echo hello | /usr/bin/tr a-z A-Z").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.trim(), "HELLO");
+    }
+
+    #[test]
+    fn pipeline_merges_stderr_into_stdout() {
+        let mut state = ShellState::new();
+        // /bin/sh -c 'echo err >&2; echo out' writes to both streams.
+        // With 2>&1 the stderr line should appear in the captured stdout.
+        let mut parser =
+            Parser::new("/bin/sh -c 'echo err >&2; echo out' 2>&1 | /usr/bin/sort").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert!(
+            output.stdout.contains("err"),
+            "stderr should be merged into stdout, got: {:?}",
+            output.stdout
+        );
+        assert!(
+            output.stdout.contains("out"),
+            "stdout should contain out, got: {:?}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn pipeline_intermediate_stderr_is_not_inherited() {
+        let mut state = ShellState::new();
+        // Intermediate process writes only to stderr; without 2>&1 that stderr
+        // is discarded rather than inherited by the parent terminal.
+        let mut parser = Parser::new("/bin/sh -c 'echo err >&2' | /bin/cat").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, "");
+        assert_eq!(output.stderr, "");
     }
 }

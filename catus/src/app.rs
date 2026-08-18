@@ -307,9 +307,8 @@ impl App {
 
         // Drop invalid assistant placeholders created by older versions that
         // left empty assistant messages with no tool calls in history.
-        loaded.retain(|m| {
-            !(m.role == Role::Assistant && m.content.is_empty() && !m.had_tool_calls)
-        });
+        loaded
+            .retain(|m| !(m.role == Role::Assistant && m.content.is_empty() && !m.had_tool_calls));
 
         // Make sure the first message is the configured system prompt.
         if self
@@ -666,6 +665,38 @@ mod tests {
         assert!(last.is_assistant());
         assert!(last.had_tool_calls);
         assert_eq!(last.tool_calls.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_history_filters_empty_assistant_placeholders() {
+        let dir = std::env::temp_dir().join(format!("catus_load_filter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let history = dir.join("bad.json");
+        let messages = vec![
+            Message::system("old".to_string()),
+            Message::user("hello".to_string()),
+            Message::assistant(String::new()),
+            Message::event("LLM request failed".to_string()),
+        ];
+        std::fs::write(&history, serde_json::to_string(&messages).unwrap()).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.load_history(&history).unwrap();
+
+        assert!(
+            !app.messages.iter().any(|m| m.role == Role::Assistant),
+            "empty assistant placeholder should be filtered from loaded history"
+        );
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.is_user() && m.content == "hello")
+        );
+        assert!(app.messages.iter().any(|m| m.is_event()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
