@@ -307,7 +307,7 @@ fn default_command_permissions() -> HashMap<String, PermissionSet> {
 
     let mut map = HashMap::new();
     for cmd in [
-        "cat", "cut", "find", "grep", "head", "ls", "more", "ps", "pwd", "sed", "sort", "tail",
+        "cat", "cut", "find", "grep", "head", "ls", "more", "ps", "pwd", "sort", "tail",
         "tr", "uniq", "wc",
     ] {
         map.insert(cmd.to_string(), read_only.clone());

@@ -55,6 +55,8 @@ impl From<serde_json::Error> for LlmError {
 pub enum StreamEvent {
     /// A chunk of text content.
     Text(String),
+    /// A chunk of reasoning content.
+    Reasoning(String),
     /// A completed tool call.
     ToolCall(ToolCall),
 }
@@ -63,12 +65,13 @@ pub enum StreamEvent {
 #[derive(Debug, Clone, Default)]
 pub struct ChatReply {
     pub content: String,
+    pub reasoning_content: String,
     pub tool_calls: Vec<ToolCall>,
 }
 
 impl ChatReply {
     pub fn is_empty(&self) -> bool {
-        self.content.is_empty() && self.tool_calls.is_empty()
+        self.content.is_empty() && self.reasoning_content.is_empty() && self.tool_calls.is_empty()
     }
 }
 
@@ -100,6 +103,12 @@ struct ApiMessage {
         deserialize_with = "null_as_default"
     )]
     content: String,
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "null_as_default"
+    )]
+    reasoning_content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCallChunk>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,6 +257,7 @@ impl LlmClient {
         let mut reply = ChatReply::default();
         if let Some(msg) = message {
             reply.content = msg.content;
+            reply.reasoning_content = msg.reasoning_content;
             reply.tool_calls = msg
                 .tool_calls
                 .unwrap_or_default()
@@ -329,6 +339,13 @@ impl LlmClient {
                 if !delta.content.is_empty() {
                     log::debug!("sse text delta: {}", delta.content);
                     let _ = tx.send(StreamEvent::Text(delta.content)).await;
+                }
+
+                if !delta.reasoning_content.is_empty() {
+                    log::debug!("sse reasoning delta: {}", delta.reasoning_content);
+                    let _ = tx
+                        .send(StreamEvent::Reasoning(delta.reasoning_content))
+                        .await;
                 }
 
                 if let Some(calls) = delta.tool_calls {
@@ -444,6 +461,7 @@ fn into_api_message(msg: &Message) -> ApiMessage {
             Role::Event => "event".to_string(),
         },
         content: msg.content.clone(),
+        reasoning_content: msg.reasoning_content.clone(),
         tool_calls,
         tool_call_id: msg.tool_call_id.clone(),
     }
@@ -531,5 +549,54 @@ mod tests {
             calls[0].function.as_ref().unwrap().name,
             Some("shell".to_string())
         );
+    }
+
+    #[test]
+    fn parse_response_with_reasoning_content() {
+        let json = r#"{
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "The answer is 42.",
+                    "reasoning_content": "Let me calculate..."
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(json).expect("should parse reasoning");
+        let choices = parsed.choices.unwrap();
+        let msg = choices[0].message.as_ref().unwrap();
+        assert_eq!(msg.content, "The answer is 42.");
+        assert_eq!(msg.reasoning_content, "Let me calculate...");
+    }
+
+    #[test]
+    fn parse_streaming_delta_with_reasoning_content() {
+        let json = r#"{
+            "choices": [{
+                "delta": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "thinking..."
+                },
+                "finish_reason": null
+            }]
+        }"#;
+        let parsed: ChatResponse =
+            serde_json::from_str(json).expect("should parse reasoning delta");
+        let choices = parsed.choices.unwrap();
+        let delta = choices[0].delta.as_ref().unwrap();
+        assert_eq!(delta.content, "");
+        assert_eq!(delta.reasoning_content, "thinking...");
+    }
+
+    #[test]
+    fn into_api_message_includes_reasoning_content() {
+        let mut msg = Message::assistant("answer");
+        msg.reasoning_content = "my reasoning".to_string();
+        let api = into_api_message(&msg);
+        assert_eq!(api.reasoning_content, "my reasoning");
+        let json = serde_json::to_string(&api).unwrap();
+        assert!(json.contains("reasoning_content"));
     }
 }

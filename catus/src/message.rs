@@ -33,6 +33,11 @@ impl Role {
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// For `Role::Assistant` messages, the model's internal reasoning content
+    /// (returned by some providers such as DeepSeek). It is sent back to the
+    /// API in subsequent requests and saved in the conversation history.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning_content: String,
     /// For `Role::Tool` messages, the id of the tool call this message is
     /// responding to (required by the OpenAI tool-calling protocol).
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -52,6 +57,7 @@ impl Message {
         Self {
             role: Role::System,
             content: content.into(),
+            reasoning_content: String::new(),
             tool_call_id: None,
             had_tool_calls: false,
             tool_calls: Vec::new(),
@@ -62,6 +68,7 @@ impl Message {
         Self {
             role: Role::User,
             content: content.into(),
+            reasoning_content: String::new(),
             tool_call_id: None,
             had_tool_calls: false,
             tool_calls: Vec::new(),
@@ -72,6 +79,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            reasoning_content: String::new(),
             tool_call_id: None,
             had_tool_calls: false,
             tool_calls: Vec::new(),
@@ -82,6 +90,7 @@ impl Message {
         Self {
             role: Role::Tool,
             content: content.into(),
+            reasoning_content: String::new(),
             tool_call_id: Some(tool_call_id.into()),
             had_tool_calls: false,
             tool_calls: Vec::new(),
@@ -92,6 +101,7 @@ impl Message {
         Self {
             role: Role::Event,
             content: content.into(),
+            reasoning_content: String::new(),
             tool_call_id: None,
             had_tool_calls: false,
             tool_calls: Vec::new(),
@@ -103,6 +113,7 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            reasoning_content: String::new(),
             tool_call_id: None,
             had_tool_calls: true,
             tool_calls: Vec::new(),
@@ -143,6 +154,17 @@ mod tests {
         assert_eq!(parsed.content, "thinking...");
         assert!(parsed.had_tool_calls);
         assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn serialize_reasoning_content_roundtrip() {
+        let mut msg = Message::assistant("answer");
+        msg.reasoning_content = "let me think...".to_string();
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("reasoning_content"));
+        let parsed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.content, "answer");
+        assert_eq!(parsed.reasoning_content, "let me think...");
     }
 
     #[test]

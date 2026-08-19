@@ -24,15 +24,59 @@ pub struct App {
     pub shell_state: ShellState,
     pub messages: Vec<Message>,
     pub input: String,
+    /// Byte index of the cursor inside `input`. Always aligned to a UTF-8
+    /// character boundary.
+    pub cursor: usize,
     pub status: AppStatus,
     pub status_message: String,
     pub scroll: usize,
     pub auto_scroll: bool,
     pub max_tool_rounds: usize,
+    /// Submitted user inputs in the current session, newest first.
+    pub input_history: Vec<String>,
+    /// Index into `input_history` when recalling a previous input.
+    /// `None` means the user is editing a fresh line.
+    pub input_history_index: Option<usize>,
+    /// The line being typed before history recall started, restored by Down.
+    pub draft_input: String,
+    /// Current completion candidates shown below the input box.
+    pub candidates: Vec<String>,
+    /// Currently selected candidate index, if any.
+    pub selected_candidate: Option<usize>,
     pending_tool_calls: Vec<ToolCall>,
     tool_rounds_this_turn: usize,
     /// Path of the history file currently being continued, if any.
     current_history_file: Option<std::path::PathBuf>,
+}
+
+/// Built-in TUI slash commands offered by command completion.
+const SLASH_COMMANDS: &[&str] = &["/resume"];
+
+/// Maximum number of completion candidates shown at once.
+const MAX_CANDIDATES: usize = 8;
+
+/// Return the previous UTF-8 character boundary before `idx`.
+fn prev_char_boundary(s: &str, idx: usize) -> usize {
+    if idx == 0 {
+        return 0;
+    }
+    let mut pos = idx - 1;
+    while !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Return the next UTF-8 character boundary at or after `idx`.
+fn next_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut pos = idx + 1;
+    while pos < s.len() && !s.is_char_boundary(pos) {
+        pos += 1;
+    }
+    pos
 }
 
 impl App {
@@ -64,11 +108,17 @@ impl App {
             shell_state,
             messages: vec![Message::system(system_prompt)],
             input: String::new(),
+            cursor: 0,
             status: AppStatus::Idle,
             status_message: String::new(),
             scroll: 0,
             auto_scroll: true,
             max_tool_rounds,
+            input_history: Vec::new(),
+            input_history_index: None,
+            draft_input: String::new(),
+            candidates: Vec::new(),
+            selected_candidate: None,
             pending_tool_calls: Vec::new(),
             tool_rounds_this_turn: 0,
             current_history_file: None,
@@ -76,15 +126,52 @@ impl App {
     }
 
     pub fn push_char(&mut self, c: char) {
-        self.input.push(c);
+        self.input_history_index = None;
+        self.input.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+        self.recompute_candidates();
     }
 
     pub fn backspace(&mut self) {
-        self.input.pop();
+        if self.cursor == 0 {
+            return;
+        }
+        self.input_history_index = None;
+        let prev = prev_char_boundary(&self.input, self.cursor);
+        self.input.replace_range(prev..self.cursor, "");
+        self.cursor = prev;
+        self.recompute_candidates();
+    }
+
+    pub fn move_cursor_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor = prev_char_boundary(&self.input, self.cursor);
+    }
+
+    pub fn move_cursor_right(&mut self) {
+        if self.cursor >= self.input.len() {
+            return;
+        }
+        self.cursor = next_char_boundary(&self.input, self.cursor);
+    }
+
+    pub fn move_cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_cursor_end(&mut self) {
+        self.cursor = self.input.len();
     }
 
     pub fn clear_input(&mut self) {
         self.input.clear();
+        self.cursor = 0;
+        self.input_history_index = None;
+        self.draft_input.clear();
+        self.selected_candidate = None;
+        self.recompute_candidates();
     }
 
     /// Take the current input and append it as a user message.
@@ -95,10 +182,128 @@ impl App {
         }
         let text = text.to_string();
         self.messages.push(Message::user(text.clone()));
+        self.record_input_history(&text);
+
         self.input.clear();
+        self.cursor = 0;
+        self.input_history_index = None;
+        self.draft_input.clear();
+        self.selected_candidate = None;
+        self.recompute_candidates();
         self.tool_rounds_this_turn = 0;
         self.scroll_to_bottom();
         Some(text)
+    }
+
+    /// Remember a submitted line for Up/Down recall.
+    pub fn record_input_history(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.input_history.first().map(|s| s.as_str()) != Some(text) {
+            self.input_history.insert(0, text.to_string());
+        }
+    }
+
+    /// Recompute the completion candidate list based on the current input.
+    fn recompute_candidates(&mut self) {
+        self.candidates.clear();
+        self.selected_candidate = None;
+
+        if self.input.is_empty() {
+            return;
+        }
+
+        if self.input.starts_with('/') {
+            for &cmd in SLASH_COMMANDS {
+                if cmd.starts_with(&self.input) && !self.candidates.contains(&cmd.to_string()) {
+                    self.candidates.push(cmd.to_string());
+                }
+            }
+        } else {
+            let prefix = self.input.to_lowercase();
+            for entry in &self.input_history {
+                if entry.to_lowercase().starts_with(&prefix) && !self.candidates.contains(entry) {
+                    self.candidates.push(entry.clone());
+                    if self.candidates.len() >= MAX_CANDIDATES {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Recall the next older input from the session history (bound to Up).
+    pub fn history_previous(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+
+        match self.input_history_index {
+            None => {
+                self.draft_input = self.input.clone();
+                self.input_history_index = Some(0);
+            }
+            Some(i) if i + 1 < self.input_history.len() => {
+                self.input_history_index = Some(i + 1);
+            }
+            Some(_) => {}
+        }
+
+        if let Some(i) = self.input_history_index {
+            self.input = self.input_history[i].clone();
+            self.cursor = self.input.len();
+        }
+        self.selected_candidate = None;
+        self.recompute_candidates();
+    }
+
+    /// Recall the next newer input, restoring the draft line at the top (bound to Down).
+    pub fn history_next(&mut self) {
+        match self.input_history_index {
+            None => {}
+            Some(0) => {
+                self.input_history_index = None;
+                self.input = self.draft_input.clone();
+            }
+            Some(i) => {
+                self.input_history_index = Some(i - 1);
+                self.input = self.input_history[i - 1].clone();
+            }
+        }
+        self.cursor = self.input.len();
+        self.selected_candidate = None;
+        self.recompute_candidates();
+    }
+
+    /// Cycle through completion candidates by `delta` positions and fill the
+    /// input box with the selected candidate. Wraps around at both ends.
+    pub fn cycle_candidate(&mut self, delta: isize) {
+        if self.candidates.is_empty() {
+            return;
+        }
+
+        let idx = match self.selected_candidate {
+            None if delta >= 0 => 0usize,
+            None => self.candidates.len() - 1,
+            Some(i) => {
+                let len = self.candidates.len() as isize;
+                let next = (i as isize + delta).rem_euclid(len);
+                next as usize
+            }
+        };
+
+        self.selected_candidate = Some(idx);
+        self.input = self.candidates[idx].clone();
+        self.cursor = self.input.len();
+        self.input_history_index = None;
+        // Candidates stay valid because the new input matches the prefix.
+    }
+
+    /// Clear the active candidate selection without changing the input.
+    pub fn clear_candidate_selection(&mut self) {
+        self.selected_candidate = None;
     }
 
     /// Prepare a fresh assistant message for streaming.
@@ -114,6 +319,15 @@ impl App {
         if let Some(last) = self.messages.last_mut() {
             if last.role == Role::Assistant {
                 last.content.push_str(text);
+            }
+        }
+    }
+
+    /// Append a reasoning chunk to the most recent assistant message.
+    pub fn append_stream_reasoning(&mut self, text: &str) {
+        if let Some(last) = self.messages.last_mut() {
+            if last.role == Role::Assistant {
+                last.reasoning_content.push_str(text);
             }
         }
     }
@@ -159,12 +373,15 @@ impl App {
     }
 
     /// Return true if the most recent message is an empty assistant placeholder
-    /// (no content and no tool calls).
+    /// (no content, no reasoning content, and no tool calls).
     pub fn has_empty_assistant_placeholder(&self) -> bool {
         self.messages
             .last()
             .map(|last| {
-                last.role == Role::Assistant && last.content.is_empty() && !last.had_tool_calls
+                last.role == Role::Assistant
+                    && last.content.is_empty()
+                    && last.reasoning_content.is_empty()
+                    && !last.had_tool_calls
             })
             .unwrap_or(false)
     }
@@ -476,6 +693,7 @@ impl App {
                     }
                     Err(e) => self.set_error(e.to_string()),
                 }
+                self.record_input_history(input);
             }
             _ => self.set_error(format!("unknown command: /{}", cmd)),
         }
@@ -699,5 +917,182 @@ mod tests {
         assert!(app.messages.iter().any(|m| m.is_event()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn input_history_recalls_newest_first() {
+        let dir = std::env::temp_dir().join(format!("catus_hist_order_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        submit_message(&mut app, "first");
+        submit_message(&mut app, "second");
+        submit_message(&mut app, "third");
+
+        assert_eq!(app.input_history, vec!["third", "second", "first"]);
+
+        // Type a new draft line, then use Up/Down to recall history and restore it.
+        app.input = "draft".to_string();
+        app.history_previous();
+        assert_eq!(app.input, "third");
+        app.history_previous();
+        assert_eq!(app.input, "second");
+        app.history_next();
+        assert_eq!(app.input, "third");
+        app.history_next();
+        assert_eq!(app.input, "draft");
+        assert!(app.input_history_index.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn consecutive_duplicate_inputs_are_not_stored_twice() {
+        let dir = std::env::temp_dir().join(format!("catus_hist_dedup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        submit_message(&mut app, "same");
+        submit_message(&mut app, "same");
+
+        assert_eq!(app.input_history, vec!["same"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slash_command_completion_offers_resume() {
+        let dir = std::env::temp_dir().join(format!("catus_slash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.input = "/res".to_string();
+        app.recompute_candidates();
+
+        assert_eq!(app.candidates, vec!["/resume"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_completion_filters_by_prefix_case_insensitively() {
+        let dir = std::env::temp_dir().join(format!("catus_hist_complete_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        submit_message(&mut app, "Hello World");
+        submit_message(&mut app, "hello there");
+        submit_message(&mut app, "goodbye");
+
+        app.input = "HEL".to_string();
+        app.recompute_candidates();
+
+        assert_eq!(app.candidates, vec!["hello there", "Hello World"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tab_cycles_through_candidates() {
+        let dir = std::env::temp_dir().join(format!("catus_cycle_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.candidates = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+
+        app.cycle_candidate(1);
+        assert_eq!(app.input, "alpha");
+        assert_eq!(app.selected_candidate, Some(0));
+
+        app.cycle_candidate(1);
+        assert_eq!(app.input, "beta");
+
+        app.cycle_candidate(-1);
+        assert_eq!(app.input, "alpha");
+
+        app.cycle_candidate(-1);
+        assert_eq!(app.input, "gamma"); // wrap backward
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn typing_resets_history_recall() {
+        let dir = std::env::temp_dir().join(format!("catus_type_reset_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        submit_message(&mut app, "base");
+        app.history_previous();
+        assert!(app.input_history_index.is_some());
+
+        app.push_char('x');
+        assert!(app.input_history_index.is_none());
+        assert_eq!(app.input, "basex");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_moves_and_inserts_at_cursor() {
+        let dir = std::env::temp_dir().join(format!("catus_cursor_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.push_char('a');
+        app.push_char('b');
+        app.push_char('c');
+        assert_eq!(app.input, "abc");
+        assert_eq!(app.cursor, 3);
+
+        app.move_cursor_left();
+        app.move_cursor_left();
+        assert_eq!(app.cursor, 1);
+
+        app.push_char('x');
+        assert_eq!(app.input, "axbc");
+        assert_eq!(app.cursor, 2);
+
+        app.backspace();
+        assert_eq!(app.input, "abc");
+        assert_eq!(app.cursor, 1);
+
+        app.move_cursor_home();
+        assert_eq!(app.cursor, 0);
+        app.move_cursor_end();
+        assert_eq!(app.cursor, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slash_resume_command_is_recorded_in_history() {
+        let dir = std::env::temp_dir().join(format!("catus_cmd_hist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.json"), "[]").unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.input = "/resume foo".to_string();
+        app.handle_command("/resume foo");
+
+        assert_eq!(app.input_history, vec!["/resume foo"]);
+        app.history_previous();
+        assert_eq!(app.input, "/resume foo");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Helper that submits a user message directly without going through the TUI.
+    fn submit_message(app: &mut App, text: &str) {
+        app.input = text.to_string();
+        app.submit_user_message();
     }
 }

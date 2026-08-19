@@ -17,6 +17,7 @@ use catus::tui;
 
 enum UiEvent {
     Key(crossterm::event::KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
     Resize,
 }
 
@@ -67,7 +68,15 @@ async fn run_test_mode(
             Ok(reply) => {
                 if !reply.content.is_empty() {
                     println!("ASSISTANT: {}", reply.content);
-                    app.messages.push(Message::assistant(reply.content));
+                }
+                if !reply.reasoning_content.is_empty() {
+                    println!("REASONING: {}", reply.reasoning_content);
+                }
+
+                if !reply.content.is_empty() || !reply.reasoning_content.is_empty() {
+                    let mut msg = Message::assistant(reply.content);
+                    msg.reasoning_content = reply.reasoning_content;
+                    app.messages.push(msg);
                 }
 
                 if let Some(call) = reply.tool_calls.first() {
@@ -133,6 +142,11 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                         break;
                     }
                 }
+                Ok(Event::Mouse(mouse)) => {
+                    if ui_tx.blocking_send(UiEvent::Mouse(mouse)).is_err() {
+                        break;
+                    }
+                }
                 Ok(Event::Resize(_, _)) => {
                     let _ = ui_tx.blocking_send(UiEvent::Resize);
                 }
@@ -169,7 +183,11 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                                 app.scroll_to_bottom();
                             }
                             KeyCode::Esc => {
-                                should_quit = true;
+                                if app.selected_candidate.is_some() {
+                                    app.clear_candidate_selection();
+                                } else {
+                                    should_quit = true;
+                                }
                             }
                             KeyCode::Enter => {
                                 let input = app.input.trim().to_string();
@@ -185,17 +203,40 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                             KeyCode::Backspace => {
                                 app.backspace();
                             }
+                            KeyCode::Left => {
+                                app.move_cursor_left();
+                            }
+                            KeyCode::Right => {
+                                app.move_cursor_right();
+                            }
+                            KeyCode::Tab => {
+                                app.cycle_candidate(1);
+                            }
+                            KeyCode::BackTab => {
+                                app.cycle_candidate(-1);
+                            }
                             KeyCode::Up => {
-                                app.scroll_up(1);
+                                app.history_previous();
                             }
                             KeyCode::Down => {
-                                app.scroll_down(1);
+                                app.history_next();
                             }
                             KeyCode::PageUp => {
                                 app.scroll_up(10);
                             }
                             KeyCode::PageDown => {
                                 app.scroll_down(10);
+                            }
+                            _ => {}
+                        }
+                    }
+                    UiEvent::Mouse(mouse) => {
+                        match mouse.kind {
+                            crossterm::event::MouseEventKind::ScrollUp => {
+                                app.scroll_up(3);
+                            }
+                            crossterm::event::MouseEventKind::ScrollDown => {
+                                app.scroll_down(3);
                             }
                             _ => {}
                         }
@@ -210,6 +251,12 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                 match event {
                     StreamEvent::Text(text) => {
                         app.append_stream_text(&text);
+                        if app.auto_scroll {
+                            app.scroll_to_bottom();
+                        }
+                    }
+                    StreamEvent::Reasoning(text) => {
+                        app.append_stream_reasoning(&text);
                         if app.auto_scroll {
                             app.scroll_to_bottom();
                         }
