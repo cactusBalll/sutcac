@@ -77,6 +77,8 @@ fn main() {
     };
 
     let mut state = ShellState::with_policy_and_logger(permissions, audit_logger);
+    // The standalone shell binary should honour the `exit` builtin.
+    state.exit_process = true;
 
     if args.len() > 2 && args[1] == "-c" {
         let command = &args[2];

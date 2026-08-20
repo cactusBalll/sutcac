@@ -125,7 +125,7 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------------
 
     fn at_terminator(&self, terminators: &[&str]) -> bool {
-        if self.current == Token::RBrace || self.current == Token::RParen {
+        if self.word_is("}") || self.current == Token::RParen {
             return true;
         }
         if terminators.contains(&";;") && self.at_dsemi() {
@@ -218,7 +218,7 @@ impl<'a> Parser<'a> {
         if self.word_is("case") {
             return self.parse_case();
         }
-        if self.current == Token::LBrace {
+        if self.word_is("{") {
             return self.parse_group();
         }
         if self.current == Token::LParen {
@@ -445,10 +445,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_group(&mut self) -> Result<Command, ParseError> {
-        self.bump(); // {
+        self.expect_word("{")?;
         self.skip_newlines();
         let body = self.parse_compound_body(&["}"])?;
-        self.expect(Token::RBrace)?;
+        self.expect_word("}")?;
         Ok(Command::Group(body))
     }
 

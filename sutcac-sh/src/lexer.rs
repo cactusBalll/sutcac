@@ -16,8 +16,6 @@ pub enum Token {
     Semi,
     LParen,
     RParen,
-    LBrace,
-    RBrace,
     Less,
     Greater,
     GreaterGreater,
@@ -86,14 +84,6 @@ impl<'a> Lexer<'a> {
                 ')' => {
                     self.advance();
                     Token::RParen
-                }
-                '{' => {
-                    self.advance();
-                    Token::LBrace
-                }
-                '}' => {
-                    self.advance();
-                    Token::RBrace
                 }
                 '<' => {
                     self.advance();
@@ -191,8 +181,6 @@ impl<'a> Lexer<'a> {
                 && c != '&'
                 && c != '('
                 && c != ')'
-                && c != '{'
-                && c != '}'
             {
                 return self.read_word_from(start);
             }
@@ -260,7 +248,7 @@ impl<'a> Lexer<'a> {
                             {
                                 break;
                             }
-                            '(' | ')' | '{' | '}' => {
+                            '(' | ')' => {
                                 let current = &self.input[start..self.pos];
                                 if current.is_empty() {
                                     break;
@@ -268,7 +256,7 @@ impl<'a> Lexer<'a> {
                                 if c == '(' && is_valid_name(current) {
                                     break;
                                 }
-                                // Include paren/brace inside $-expansions ($((...)), ${...}).
+                                // Include paren inside $-expansions ($((...)), $(...)).
                                 if current.contains('$') {
                                     self.advance();
                                 } else {

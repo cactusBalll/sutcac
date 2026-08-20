@@ -10,6 +10,7 @@ use crate::ast::*;
 use crate::audit::{AuditEvent, AuditLogger};
 use crate::builtin;
 use crate::expand::{ExpandContext, expand_single, expand_word};
+use crate::parser::Parser;
 use crate::permissions::{PermissionPolicy, PermissionSet};
 
 /// Return a helpful error message when a command cannot be found.
@@ -50,6 +51,7 @@ fn redirect_failed_message(path: &str, e: &std::io::Error) -> String {
 }
 
 /// Mutable shell state shared by builtins and the execution engine.
+#[derive(Clone)]
 pub struct ShellState {
     pub vars: HashMap<String, String>,
     pub exported: HashSet<String>,
@@ -69,6 +71,10 @@ pub struct ShellState {
     pub permissions: PermissionPolicy,
     /// Audit logger for command execution traces.
     pub audit_logger: AuditLogger,
+    /// Whether the `exit` builtin should terminate the process.  Disabled by
+    /// default so the shell can be safely embedded as a library (e.g. inside
+    /// catus); the standalone binary enables it.
+    pub exit_process: bool,
 }
 
 impl ShellState {
@@ -91,6 +97,7 @@ impl ShellState {
             cwd,
             permissions: PermissionPolicy::allow_all(),
             audit_logger: AuditLogger::stderr(),
+            exit_process: false,
         }
     }
 
@@ -166,9 +173,13 @@ fn command_summary(cmd: &Command) -> String {
 }
 
 /// Return the permissions required by a command (top-level estimate for audit).
-fn command_permissions(cmd: &Command, policy: &PermissionPolicy) -> PermissionSet {
+fn command_permissions(
+    cmd: &Command,
+    policy: &PermissionPolicy,
+    state: &ShellState,
+) -> PermissionSet {
     match cmd {
-        Command::Simple(s) => simple_command_permissions(s, policy),
+        Command::Simple(s) => simple_command_permissions(s, policy, state),
         Command::Pipeline(_) => PermissionSet::read().union(PermissionSet::write()),
         Command::Subshell(_) => PermissionSet::read().union(PermissionSet::write()),
         _ => PermissionSet::empty(),
@@ -176,10 +187,16 @@ fn command_permissions(cmd: &Command, policy: &PermissionPolicy) -> PermissionSe
 }
 
 /// Return the permissions required by a simple command, including redirects.
-fn simple_command_permissions(cmd: &SimpleCommand, policy: &PermissionPolicy) -> PermissionSet {
+fn simple_command_permissions(
+    cmd: &SimpleCommand,
+    policy: &PermissionPolicy,
+    state: &ShellState,
+) -> PermissionSet {
     let mut perms = PermissionSet::empty();
+    let mut ctx = state.expand_context();
     for redir in &cmd.redirects {
-        perms = perms.union(redirect_permissions(redir.kind));
+        let target = expand_single(&redir.target.value, &mut ctx).unwrap_or_default();
+        perms = perms.union(redirect_permissions_with_path(redir.kind, &target));
     }
     if let Some(name) = cmd.words.first().map(|w| w.value.as_str()) {
         if let Some(p) = builtin::permissions_for(name) {
@@ -196,20 +213,40 @@ fn simple_command_permissions(cmd: &SimpleCommand, policy: &PermissionPolicy) ->
     perms
 }
 
-/// Return the permissions required by a redirection kind.
-fn redirect_permissions(kind: RedirectKind) -> PermissionSet {
+/// Paths that are harmless to open for reading or writing.  Redirects to these
+/// paths do not require WRITE permission, which is important for patterns like
+/// `2>/dev/null` under restrictive policies.
+fn is_special_dev(path: &str) -> bool {
+    path == "/dev/null"
+}
+
+/// Return the permissions required by a redirection kind and target path.
+fn redirect_permissions_with_path(kind: RedirectKind, path: &str) -> PermissionSet {
     match kind {
         RedirectKind::Read | RedirectKind::Here | RedirectKind::DupInput => PermissionSet::read(),
-        RedirectKind::Write
-        | RedirectKind::Append
-        | RedirectKind::ReadWrite
-        | RedirectKind::DupOutput => PermissionSet::write(),
+        RedirectKind::Write | RedirectKind::Append | RedirectKind::ReadWrite => {
+            if is_special_dev(path) {
+                PermissionSet::empty()
+            } else {
+                PermissionSet::write()
+            }
+        }
+        RedirectKind::DupOutput => {
+            // Duplicating a file descriptor (e.g. 2>&1) does not itself open a
+            // file, but if the target happens to name a special device we can
+            // safely allow it without WRITE.
+            if is_special_dev(path) {
+                PermissionSet::empty()
+            } else {
+                PermissionSet::write()
+            }
+        }
     }
 }
 
 pub fn execute_command(cmd: &Command, state: &mut ShellState) -> CommandOutput {
     let summary = command_summary(cmd);
-    let required = command_permissions(cmd, &state.permissions);
+    let required = command_permissions(cmd, &state.permissions, state);
     state.audit_logger.log(AuditEvent::CommandStart {
         cmd: summary.clone(),
         required,
@@ -276,41 +313,72 @@ pub fn execute_command(cmd: &Command, state: &mut ShellState) -> CommandOutput {
 fn execute_list(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
     let mut output = CommandOutput::new(0);
     for cmd in cmds {
-        output = execute_command(cmd, state);
+        let next = execute_command(cmd, state);
+        output.status = next.status;
+        output.stdout.push_str(&next.stdout);
+        output.stderr.push_str(&next.stderr);
     }
     output
 }
 
 fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState) -> CommandOutput {
-    // Apply environment assignments first.
-    for (name, word) in &cmd.assignments {
-        let value = match expand_single(&word.value, &state.expand_context()) {
-            Ok(v) => v,
-            Err(e) => {
-                return CommandOutput::with_output(1, String::new(), format!("sutcac-sh: {}", e));
+    // Expand assignments and words with command substitution support.  We use a
+    // cloned shell state for substitutions so they cannot mutate the parent
+    // state; the context is scoped so the original state can be used afterwards.
+    let mut subst_state = state.clone();
+    let mut executor =
+        |inner: &str| -> Result<String, String> { execute_substitution(inner, &mut subst_state) };
+    let (expanded_assignments, expanded) = {
+        let mut ctx = expand_ctx_with_subst(state, &mut executor);
+
+        // Expand environment assignments first.
+        let mut assignments = Vec::new();
+        for (name, word) in &cmd.assignments {
+            let value = match expand_single(&word.value, &mut ctx) {
+                Ok(v) => v,
+                Err(e) => {
+                    return CommandOutput::with_output(
+                        1,
+                        String::new(),
+                        format!("sutcac-sh: {}", e),
+                    );
+                }
+            };
+            assignments.push((name.clone(), value));
+        }
+
+        if cmd.words.is_empty() {
+            return CommandOutput::new(0);
+        }
+
+        let mut expanded_words: Vec<Vec<String>> = Vec::new();
+        for word in &cmd.words {
+            match expand_word(&word.value, &mut ctx) {
+                Ok(fields) => expanded_words.push(fields),
+                Err(e) => {
+                    return CommandOutput::with_output(
+                        1,
+                        String::new(),
+                        format!("sutcac-sh: {}", e),
+                    );
+                }
             }
-        };
-        state.vars.insert(name.clone(), value);
+        }
+        (assignments, expanded_words)
+    };
+
+    // Apply the expanded assignments now that the expansion context is gone.
+    for (name, value) in expanded_assignments {
+        state.vars.insert(name, value);
     }
 
     if cmd.words.is_empty() {
         return CommandOutput::new(0);
     }
 
-    let ctx = state.expand_context();
-    let mut expanded_words: Vec<Vec<String>> = Vec::new();
-    for word in &cmd.words {
-        match expand_word(&word.value, &ctx) {
-            Ok(fields) => expanded_words.push(fields),
-            Err(e) => {
-                return CommandOutput::with_output(1, String::new(), format!("sutcac-sh: {}", e));
-            }
-        }
-    }
-
     // Flatten into a single argv. Each word expansion contributes one or more fields.
     let mut argv: Vec<String> = Vec::new();
-    for fields in expanded_words {
+    for fields in expanded {
         argv.extend(fields);
     }
 
@@ -329,8 +397,8 @@ fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState) -> CommandOutput 
 
     // Permission check for builtins and external commands. Function bodies are
     // checked recursively when their internal commands execute.
-    let required = simple_command_permissions(cmd, &state.permissions);
-    if let Err(e) = state.permissions.check(&required) {
+    let required = simple_command_permissions(cmd, &state.permissions, state);
+    if let Err(e) = state.permissions.check_command(name, &required) {
         let msg = e.to_string();
         state.audit_logger.log(AuditEvent::PermissionDenied {
             cmd: command_summary(&Command::Simple(cmd.clone())),
@@ -345,6 +413,48 @@ fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState) -> CommandOutput 
     }
 
     execute_external(name, args, &cmd.redirects, state)
+}
+
+/// Execute the commands inside a `$(...)` command substitution and return the
+/// captured stdout.  The substitution runs in a cloned shell state so variable
+/// and directory changes do not leak back to the parent.
+fn execute_substitution(inner: &str, state: &mut ShellState) -> Result<String, String> {
+    let mut parser = Parser::new(inner).map_err(|e| {
+        format!(
+            "command substitution: lexer error: {}. Hint: check the inner command syntax.",
+            e
+        )
+    })?;
+    let cmds = parser.parse().map_err(|e| {
+        format!(
+            "command substitution: parse error: {}. Hint: check the inner command syntax.",
+            e
+        )
+    })?;
+    let mut stdout = String::new();
+    for cmd in cmds {
+        let out = execute_command(&cmd, state);
+        state.last_status = out.status;
+        stdout.push_str(&out.stdout);
+    }
+    // Bash strips all trailing newlines from command substitution output.
+    Ok(stdout.trim_end_matches('\n').to_string())
+}
+
+/// Build an expansion context that can execute `$(...)` command substitutions
+/// using a cloned copy of the shell state.
+fn expand_ctx_with_subst<'a>(
+    state: &'a ShellState,
+    executor: &'a mut dyn FnMut(&str) -> Result<String, String>,
+) -> ExpandContext<'a> {
+    ExpandContext {
+        vars: &state.vars,
+        args: &state.args,
+        last_status: state.last_status,
+        pid: state.pid,
+        last_bg_pid: state.last_bg_pid,
+        subst: Some(executor),
+    }
 }
 
 fn execute_function(body: &Command, args: &[String], state: &mut ShellState) -> CommandOutput {
@@ -632,13 +742,19 @@ fn create_merged_stdout_stderr_pipe() -> io::Result<(File, File, File)> {
 fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
     // For simplicity, require all pipeline elements to be external simple commands.
     let mut externals: Vec<(String, Vec<String>, Vec<Redirect>)> = Vec::new();
+
+    // Expand pipeline words with command substitution support.
+    let mut subst_state = state.clone();
+    let mut executor =
+        |inner: &str| -> Result<String, String> { execute_substitution(inner, &mut subst_state) };
+    let mut ctx = expand_ctx_with_subst(state, &mut executor);
+
     for cmd in cmds {
         match cmd {
             Command::Simple(c) => {
-                let ctx = state.expand_context();
                 let mut argv = Vec::new();
                 for word in &c.words {
-                    match expand_word(&word.value, &ctx) {
+                    match expand_word(&word.value, &mut ctx) {
                         Ok(fields) => argv.extend(fields),
                         Err(e) => {
                             return CommandOutput::with_output(
@@ -894,18 +1010,7 @@ fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
 fn execute_subshell(body: &[Command], state: &mut ShellState) -> CommandOutput {
     // Simulate a subshell by cloning state, executing, and discarding mutations.
     // The audit logger is shared so the trace remains complete.
-    let mut subshell_state = ShellState {
-        vars: state.vars.clone(),
-        exported: state.exported.clone(),
-        args: state.args.clone(),
-        funcs: state.funcs.clone(),
-        last_status: state.last_status,
-        pid: state.pid,
-        last_bg_pid: state.last_bg_pid,
-        cwd: state.cwd.clone(),
-        permissions: state.permissions.clone(),
-        audit_logger: state.audit_logger.clone(),
-    };
+    let mut subshell_state = state.clone();
     execute_list(body, &mut subshell_state)
 }
 
@@ -933,7 +1038,10 @@ fn execute_while(cond: &Command, body: &[Command], state: &mut ShellState) -> Co
         if execute_command(cond, state).status != 0 {
             break;
         }
-        output = execute_list(body, state);
+        let next = execute_list(body, state);
+        output.status = next.status;
+        output.stdout.push_str(&next.stdout);
+        output.stderr.push_str(&next.stderr);
     }
     output
 }
@@ -944,14 +1052,18 @@ fn execute_for(
     body: &[Command],
     state: &mut ShellState,
 ) -> CommandOutput {
-    let ctx = state.expand_context();
     let items: Vec<String> = if words.is_empty() {
         // Default to "$@".
         state.args.clone()
     } else {
+        let mut subst_state = state.clone();
+        let mut executor = |inner: &str| -> Result<String, String> {
+            execute_substitution(inner, &mut subst_state)
+        };
+        let mut ctx = expand_ctx_with_subst(state, &mut executor);
         let mut items = Vec::new();
         for word in words {
-            match expand_word(&word.value, &ctx) {
+            match expand_word(&word.value, &mut ctx) {
                 Ok(fields) => items.extend(fields),
                 Err(e) => {
                     return CommandOutput::with_output(
@@ -968,14 +1080,20 @@ fn execute_for(
     let mut output = CommandOutput::new(0);
     for item in items {
         state.vars.insert(var.to_string(), item);
-        output = execute_list(body, state);
+        let next = execute_list(body, state);
+        output.status = next.status;
+        output.stdout.push_str(&next.stdout);
+        output.stderr.push_str(&next.stderr);
     }
     output
 }
 
 fn execute_case(word: &Word, arms: &[CaseArm], state: &mut ShellState) -> CommandOutput {
-    let ctx = state.expand_context();
-    let value = match expand_single(&word.value, &ctx) {
+    let mut subst_state = state.clone();
+    let mut executor =
+        |inner: &str| -> Result<String, String> { execute_substitution(inner, &mut subst_state) };
+    let mut ctx = expand_ctx_with_subst(state, &mut executor);
+    let value = match expand_single(&word.value, &mut ctx) {
         Ok(v) => v,
         Err(e) => {
             return CommandOutput::with_output(1, String::new(), format!("sutcac-sh: {}", e));
@@ -983,7 +1101,7 @@ fn execute_case(word: &Word, arms: &[CaseArm], state: &mut ShellState) -> Comman
     };
     for arm in arms {
         for pat_word in &arm.patterns {
-            let pat = match expand_single(&pat_word.value, &ctx) {
+            let pat = match expand_single(&pat_word.value, &mut ctx) {
                 Ok(v) => v,
                 Err(e) => {
                     return CommandOutput::with_output(
@@ -1007,8 +1125,8 @@ fn resolve_redirect(
     redir: &Redirect,
     state: &ShellState,
 ) -> Result<(i32, RedirectKind, String), String> {
-    let ctx = state.expand_context();
-    let target = expand_single(&redir.target.value, &ctx)?;
+    let mut ctx = state.expand_context();
+    let target = expand_single(&redir.target.value, &mut ctx)?;
     let fd = redir.fd.unwrap_or(default_fd(redir.kind));
     Ok((fd, redir.kind, target))
 }
@@ -1265,5 +1383,89 @@ mod tests {
         assert_eq!(output.status, 0);
         assert_eq!(output.stdout, "");
         assert_eq!(output.stderr, "");
+    }
+
+    #[test]
+    fn allow_read_permits_dev_null_redirect() {
+        let policy = PermissionPolicy::parse("allow:read").unwrap();
+        let mut state = ShellState::with_policy_and_logger(policy, AuditLogger::null());
+        let mut parser = Parser::new("echo hi 2>/dev/null").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, "hi\n");
+        assert_eq!(output.stderr, "");
+    }
+
+    #[test]
+    fn allow_read_permits_git_log_with_config_override() {
+        // With no hard-coded READ defaults, git must be explicitly tagged READ
+        // via [shell.commands] for allow:read to permit it.
+        let mut commands = HashMap::new();
+        commands.insert("git".to_string(), PermissionSet::read());
+        let policy = PermissionPolicy::parse_with_commands("allow:read", commands).unwrap();
+        let mut state = ShellState::with_policy_and_logger(policy, AuditLogger::null());
+        let mut parser = Parser::new("git log --oneline -1").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0, "stderr: {}", output.stderr);
+        assert!(
+            !output.stdout.is_empty(),
+            "git log should produce output under allow:read when configured as READ"
+        );
+    }
+
+    #[test]
+    fn command_substitution_expands_inner_output() {
+        let mut state = ShellState::new();
+        let mut parser = Parser::new("echo $(echo hello)").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.trim(), "hello");
+    }
+
+    #[test]
+    fn group_command_accumulates_output() {
+        let mut state = ShellState::new();
+        let mut parser = Parser::new("{ echo a; echo b; }").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("a"));
+        assert!(output.stdout.contains("b"));
+    }
+
+    #[test]
+    fn for_loop_accumulates_output() {
+        let mut state = ShellState::new();
+        let mut parser = Parser::new("for i in a b c; do echo $i; done").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("a"));
+        assert!(output.stdout.contains("b"));
+        assert!(output.stdout.contains("c"));
+    }
+
+    #[test]
+    fn literal_braces_are_preserved() {
+        let mut state = ShellState::new();
+        let mut parser = Parser::new("echo {}").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("{}"), "stdout: {:?}", output.stdout);
+    }
+
+    #[test]
+    fn exit_builtin_does_not_kill_library_context() {
+        let mut state = ShellState::new();
+        // The library default is exit_process=false, so exit should return a
+        // status instead of terminating the process.
+        let mut parser = Parser::new("exit 42").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 42);
     }
 }

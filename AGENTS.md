@@ -98,7 +98,7 @@ log_path = ".sutcac/catus.log"    # optional; defaults to .sutcac/catus.log
 log_level = "info"                # optional; trace | debug | info | warn | error
 
 [shell]
-perm_mode = "allow_all"        # allow_all | deny:<tags> | allow:<tags>
+perm_mode = "allow_all"        # allow_all | allow:<tags> | deny:<tags> | allow:<tags> deny:<tags> | allow1:<cmds> | deny1:<cmds>
 audit_log = "/tmp/sutcac-audit.log"
 audit_format = "text"          # text | json
 
@@ -106,18 +106,54 @@ audit_format = "text"          # text | json
 [shell.audit_meta]
 session = "example-session"
 
-# Per-command permission overrides. Built-in read-only coreutils such as
-# cat, cut, find, grep, head, ls, more, ps, pwd, sed, sort, tail, tr, uniq,
-# and wc already default to READ. Any other tag becomes a custom permission.
+# Per-command permission tags. Any external command not listed here defaults
+# to READ+WRITE. Use this section to mark commands as READ-only or assign
+# custom tags such as `network`.
 [shell.commands]
-grep = ["read"]
+awk = ["read"]
+basename = ["read"]
+cat = ["read"]
+cmp = ["read"]
+comm = ["read"]
+cut = ["read"]
+diff = ["read"]
+dirname = ["read"]
+file = ["read"]
 find = ["read"]
+git = ["read"]
+grep = ["read"]
+head = ["read"]
+less = ["read"]
+ls = ["read"]
+more = ["read"]
+nl = ["read"]
+printf = ["read"]
+ps = ["read"]
+pwd = ["read"]
+readlink = ["read"]
+realpath = ["read"]
+sed = ["read"]
+sort = ["read"]
+strings = ["read"]
+tail = ["read"]
+tr = ["read"]
+uniq = ["read"]
+wc = ["read"]
+whereis = ["read"]
+which = ["read"]
+xargs = ["read"]
+
+# Custom-tag examples:
 curl = ["network", "read"]
 ```
 
 - `[api]` and `[agent]` are used only by `catus`.
 - `[shell]` is used by both `catus` (when invoking the embedded shell) and `sutcac-sh` (when run standalone).
 - `perm_mode` supports arbitrary custom tags (for example `allow:read,network`).
+  `allow` and `deny` clauses can be combined: the required permission set must be
+  covered by the allow set and must not intersect the deny set.  `allow1:<cmds>`
+  and `deny1:<cmds>` override everything else for individual commands (`deny1`
+  wins over `allow1`).
 - `api_key` is stored in plain text in this prototype.
 
 ## Build and run

@@ -26,6 +26,7 @@ history_path = ".sutcac/history"
 # log_level = "info"
 
 [shell]
+# allow_all | allow:<tags> | deny:<tags> | allow:<tags> deny:<tags> | allow1:<cmds> | deny1:<cmds>
 perm_mode = "allow_all"
 audit_log = "/tmp/sutcac-audit.log"
 audit_format = "text"
@@ -34,12 +35,43 @@ audit_format = "text"
 [shell.audit_meta]
 session = "example-session"
 
-# Per-command permission overrides. Built-in read-only coreutils such as
-# cat, cut, find, grep, head, ls, more, ps, pwd, sed, sort, tail, tr, uniq,
-# and wc already default to READ. Use this section to add custom tags or
-# override specific commands.
+# Per-command permission tags. Any external command not listed here defaults
+# to READ+WRITE. Use this section to mark commands as READ-only, assign custom
+# tags (e.g. network), or override specific commands.
 [shell.commands]
-grep = ["read"]
+awk = ["read"]
+basename = ["read"]
+cat = ["read"]
+cmp = ["read"]
+comm = ["read"]
+cut = ["read"]
+diff = ["read"]
+dirname = ["read"]
+file = ["read"]
 find = ["read"]
+git = ["read"]
+grep = ["read"]
+head = ["read"]
+less = ["read"]
+ls = ["read"]
+more = ["read"]
+nl = ["read"]
+printf = ["read"]
+ps = ["read"]
+pwd = ["read"]
+readlink = ["read"]
+realpath = ["read"]
+sed = ["read"]
+sort = ["read"]
+strings = ["read"]
+tail = ["read"]
+tr = ["read"]
+uniq = ["read"]
+wc = ["read"]
+whereis = ["read"]
+which = ["read"]
+xargs = ["read"]
+
+# Examples of custom tags:
 curl = ["network", "read"]
 clip = ["clipboard"]

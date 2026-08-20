@@ -16,6 +16,8 @@ pub struct ExpandContext<'a> {
     pub pid: u32,
     /// Last background job pid ($!).
     pub last_bg_pid: Option<u32>,
+    /// Optional executor for `$(...)` command substitutions.
+    pub subst: Option<&'a mut dyn FnMut(&str) -> Result<String, String>>,
 }
 
 impl<'a> ExpandContext<'a> {
@@ -31,6 +33,7 @@ impl<'a> ExpandContext<'a> {
             last_status,
             pid,
             last_bg_pid: None,
+            subst: None,
         }
     }
 }
@@ -46,7 +49,7 @@ struct Segment {
 }
 
 /// Expand a single word into zero or more fields.
-pub fn expand_word(word: &str, ctx: &ExpandContext<'_>) -> Result<Vec<String>, String> {
+pub fn expand_word(word: &str, ctx: &mut ExpandContext<'_>) -> Result<Vec<String>, String> {
     let segments = expand_to_segments(word, ctx)?;
     let fields = split_words(segments);
     Ok(expand_globs(fields))
@@ -54,14 +57,14 @@ pub fn expand_word(word: &str, ctx: &ExpandContext<'_>) -> Result<Vec<String>, S
 
 /// Expand a word but keep the result as a single string. Used for assignments
 /// and redirection targets where word splitting does not occur.
-pub fn expand_single(word: &str, ctx: &ExpandContext<'_>) -> Result<String, String> {
+pub fn expand_single(word: &str, ctx: &mut ExpandContext<'_>) -> Result<String, String> {
     Ok(expand_to_segments(word, ctx)?
         .into_iter()
         .map(|s| s.value)
         .collect())
 }
 
-fn expand_to_segments(word: &str, ctx: &ExpandContext<'_>) -> Result<Vec<Segment>, String> {
+fn expand_to_segments(word: &str, ctx: &mut ExpandContext<'_>) -> Result<Vec<Segment>, String> {
     let mut segments: Vec<Segment> = Vec::new();
     let mut chars = word.chars().peekable();
 
@@ -180,7 +183,7 @@ fn push_seg(segments: &mut Vec<Segment>, value: String, quoted: bool) {
 
 fn expand_dollar(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    ctx: &ExpandContext<'_>,
+    ctx: &mut ExpandContext<'_>,
     in_double_quotes: bool,
     segments: &mut Vec<Segment>,
 ) -> Result<(), String> {
@@ -199,8 +202,18 @@ fn expand_dollar(
                     .map_err(|e| format!("arithmetic error: {}. Hint: use integer expressions only and avoid division by zero.", e))?;
                 push_seg(segments, val.to_string(), in_double_quotes);
             } else {
-                let _ = read_balanced(chars, '(', ')');
-                return Err("command substitution '$(...)' is not implemented. Hint: rewrite the command without '$(...)' (for example, run the inner command separately and use its output explicitly).".to_string());
+                let inner = read_balanced(chars, '(', ')');
+                if let Some(executor) = ctx.subst.as_mut() {
+                    let output = executor(&inner).map_err(|e| {
+                        format!(
+                            "command substitution '$(...)' failed: {}. Hint: check that the inner command is valid and supported.",
+                            e
+                        )
+                    })?;
+                    push_seg(segments, output, in_double_quotes);
+                } else {
+                    return Err("command substitution '$(...)' is not implemented. Hint: rewrite the command without '$(...)' (for example, run the inner command separately and use its output explicitly).".to_string());
+                }
             }
         }
         Some(&'{') => {
@@ -512,6 +525,7 @@ mod tests {
             last_status: 42,
             pid: 1234,
             last_bg_pid: None,
+            subst: None,
         }
     }
 
@@ -519,40 +533,61 @@ mod tests {
     fn basic_expansion() {
         let mut vars = HashMap::new();
         vars.insert("X".into(), "hello".into());
-        let c = ctx_with_vars(vars);
-        assert_eq!(expand_word("$X", &c).unwrap(), vec!["hello"]);
-        assert_eq!(expand_word("'$X'", &c).unwrap(), vec!["$X"]);
-        assert_eq!(expand_word("\"$X\"", &c).unwrap(), vec!["hello"]);
+        let mut c = ctx_with_vars(vars);
+        assert_eq!(expand_word("$X", &mut c).unwrap(), vec!["hello"]);
+        assert_eq!(expand_word("'$X'", &mut c).unwrap(), vec!["$X"]);
+        assert_eq!(expand_word("\"$X\"", &mut c).unwrap(), vec!["hello"]);
     }
 
     #[test]
     fn special_vars() {
-        let c = ctx_with_vars(HashMap::new());
-        assert_eq!(expand_word("$?", &c).unwrap(), vec!["42"]);
-        assert_eq!(expand_word("$$", &c).unwrap(), vec!["1234"]);
-        assert_eq!(expand_word("$#", &c).unwrap(), vec!["2"]);
-        assert_eq!(expand_word("$1", &c).unwrap(), vec!["a"]);
-        assert_eq!(expand_word("\"$@\"", &c).unwrap(), vec!["a", "b"]);
+        let mut c = ctx_with_vars(HashMap::new());
+        assert_eq!(expand_word("$?", &mut c).unwrap(), vec!["42"]);
+        assert_eq!(expand_word("$$", &mut c).unwrap(), vec!["1234"]);
+        assert_eq!(expand_word("$#", &mut c).unwrap(), vec!["2"]);
+        assert_eq!(expand_word("$1", &mut c).unwrap(), vec!["a"]);
+        assert_eq!(expand_word("\"$@\"", &mut c).unwrap(), vec!["a", "b"]);
     }
 
     #[test]
     fn word_splitting() {
         let mut vars = HashMap::new();
         vars.insert("X".into(), "one two".into());
-        let c = ctx_with_vars(vars);
-        assert_eq!(expand_word("$X", &c).unwrap(), vec!["one", "two"]);
-        assert_eq!(expand_word("\"$X\"", &c).unwrap(), vec!["one two"]);
+        let mut c = ctx_with_vars(vars);
+        assert_eq!(expand_word("$X", &mut c).unwrap(), vec!["one", "two"]);
+        assert_eq!(expand_word("\"$X\"", &mut c).unwrap(), vec!["one two"]);
     }
 
     #[test]
     fn arithmetic_expansion() {
-        let c = ctx_with_vars(HashMap::new());
-        assert_eq!(expand_word("$((2+3))", &c).unwrap(), vec!["5"]);
+        let mut c = ctx_with_vars(HashMap::new());
+        assert_eq!(expand_word("$((2+3))", &mut c).unwrap(), vec!["5"]);
     }
 
     #[test]
-    fn command_substitution_is_error() {
-        let c = ctx_with_vars(HashMap::new());
-        assert!(expand_word("$(echo hi)", &c).is_err());
+    fn command_substitution_is_error_without_executor() {
+        let mut c = ctx_with_vars(HashMap::new());
+        assert!(expand_word("$(echo hi)", &mut c).is_err());
+    }
+
+    #[test]
+    fn command_substitution_with_executor() {
+        let mut executor = |inner: &str| -> Result<String, String> {
+            if inner == "echo hi" {
+                Ok("hi".to_string())
+            } else {
+                Err("unexpected".to_string())
+            }
+        };
+        let mut c = ExpandContext {
+            vars: Box::leak(Box::new(HashMap::new())),
+            args: Box::leak(Box::new(vec![String::from("a"), String::from("b")])),
+            last_status: 42,
+            pid: 1234,
+            last_bg_pid: None,
+            subst: Some(&mut executor),
+        };
+        assert_eq!(expand_word("$(echo hi)", &mut c).unwrap(), vec!["hi"]);
+        assert_eq!(expand_word("x$(echo hi)y", &mut c).unwrap(), vec!["xhiy"]);
     }
 }

@@ -239,17 +239,15 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_command_substitution_returns_error() {
+    fn command_substitution_executes_inner_command() {
         let mut state = ShellState::new();
-        let output = execute_shell_command("echo $(date)", &mut state);
-        assert_ne!(output.status, 0);
+        state.audit_logger = sutcac_sh::audit::AuditLogger::null();
+        let output = execute_shell_command("echo $(echo hi)", &mut state);
+        assert_eq!(output.status, 0);
         assert!(
-            output
-                .stderr
-                .contains("command substitution '$(...)' is not implemented"),
-            "stderr should report the unimplemented feature, got: {:?}",
-            output.stderr
+            output.stdout.contains("hi"),
+            "stdout should contain substituted output, got: {:?}",
+            output.stdout
         );
-        assert!(output.stdout.is_empty());
     }
 }

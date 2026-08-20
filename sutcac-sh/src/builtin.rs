@@ -366,7 +366,10 @@ impl Builtin for ExitBuiltin {
             cmd: "exit".into(),
             description: format!("exiting shell with code {}", code),
         });
-        process::exit(code);
+        if state.exit_process {
+            process::exit(code);
+        }
+        code
     }
 }
 

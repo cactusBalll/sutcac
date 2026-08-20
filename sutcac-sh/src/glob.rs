@@ -105,19 +105,49 @@ fn match_bracket(p: &[char], start: usize, ch: char) -> (bool, usize) {
     (matched != negated, i)
 }
 
-/// Return filesystem entries matching a glob pattern in the current directory.
+/// Return filesystem entries matching a glob pattern.
+///
+/// Patterns without a `/` are matched against the current directory.  Patterns
+/// with a directory prefix (e.g. `sutcac-sh/src/*.rs`) are matched against the
+/// entries in that prefix directory.
 pub fn expand_pathname(pattern: &str) -> Vec<String> {
     let mut results = Vec::new();
-    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            if let Ok(name) = entry.file_name().into_string() {
-                if matches(pattern, &name) {
-                    results.push(name);
+
+    if let Some(slash_pos) = pattern.rfind('/') {
+        let dir_part = &pattern[..slash_pos];
+        let file_pattern = &pattern[slash_pos + 1..];
+        let dir = if dir_part.is_empty() {
+            std::path::PathBuf::from(".")
+        } else {
+            std::path::PathBuf::from(dir_part)
+        };
+        let prefix = if dir_part.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", dir_part)
+        };
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if matches(file_pattern, &name) {
+                        results.push(format!("{}{}", prefix, name));
+                    }
+                }
+            }
+        }
+    } else {
+        let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if matches(pattern, &name) {
+                        results.push(name);
+                    }
                 }
             }
         }
     }
+
     results.sort();
     results
 }
@@ -134,5 +164,19 @@ mod tests {
         assert!(matches("[abc]at", "cat"));
         assert!(!matches("[!abc]at", "cat"));
         assert!(matches("a*b", "acb"));
+    }
+
+    #[test]
+    fn expand_pathname_with_directory_prefix() {
+        let base = std::env::temp_dir().join("sutcac-glob-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("sub/a.rs"), "").unwrap();
+        std::fs::write(base.join("sub/b.txt"), "").unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&base).unwrap();
+        let got = expand_pathname("sub/*.rs");
+        std::env::set_current_dir(&original).unwrap();
+        assert_eq!(got, vec!["sub/a.rs"]);
     }
 }
