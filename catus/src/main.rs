@@ -72,6 +72,15 @@ async fn run_test_mode(
                 if !reply.reasoning_content.is_empty() {
                     println!("REASONING: {}", reply.reasoning_content);
                 }
+                if let Some(usage) = &reply.usage {
+                    println!(
+                        "USAGE: prompt={} completion={} total={} cached={}",
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.total_tokens,
+                        usage.cached_tokens
+                    );
+                }
 
                 if !reply.content.is_empty() || !reply.reasoning_content.is_empty() {
                     let mut msg = Message::assistant(reply.content);
@@ -83,7 +92,11 @@ async fn run_test_mode(
                     let command = match call.shell_command() {
                         Some(cmd) => cmd,
                         None => {
-                            log::error!("tool {} has no shell command", call.name);
+                            log::error!("malformed tool call arguments: {}", call.arguments);
+                            eprintln!(
+                                "catus: tool call format error: expected {{\"command\": \"...\"}}, got: {}",
+                                call.arguments
+                            );
                             std::process::exit(1);
                         }
                     };
@@ -248,23 +261,21 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                 }
             }
             Some(event) = event_rx.recv() => {
-                match event {
-                    StreamEvent::Text(text) => {
-                        app.append_stream_text(&text);
-                        if app.auto_scroll {
-                            app.scroll_to_bottom();
-                        }
-                    }
-                    StreamEvent::Reasoning(text) => {
-                        app.append_stream_reasoning(&text);
-                        if app.auto_scroll {
-                            app.scroll_to_bottom();
-                        }
-                    }
-                    StreamEvent::ToolCall(call) => app.add_tool_call(call),
+                let is_content_chunk =
+                    matches!(event, StreamEvent::Text(_) | StreamEvent::Reasoning(_));
+                handle_stream_event(event, &mut app);
+                if app.auto_scroll && is_content_chunk {
+                    app.scroll_to_bottom();
                 }
             }
             Some(result) = done_rx.recv() => {
+                // The stream task sends every StreamEvent *before* signalling
+                // done, but tokio::select! may pick the done branch first even
+                // when queued events are still waiting. Drain them so tool
+                // calls and text chunks are never applied after completion.
+                while let Ok(event) = event_rx.try_recv() {
+                    handle_stream_event(event, &mut app);
+                }
                 handle_llm_done(result, &mut app, &client, &event_tx, &done_tx);
             }
         }
@@ -277,6 +288,15 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
+}
+
+fn handle_stream_event(event: StreamEvent, app: &mut App) {
+    match event {
+        StreamEvent::Text(text) => app.append_stream_text(&text),
+        StreamEvent::Reasoning(text) => app.append_stream_reasoning(&text),
+        StreamEvent::ToolCall(call) => app.add_tool_call(call),
+        StreamEvent::Usage(usage) => app.record_usage(&usage),
+    }
 }
 
 fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {

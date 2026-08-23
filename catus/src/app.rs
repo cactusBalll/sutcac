@@ -4,7 +4,7 @@ use sutcac_sh::config::ShellConfig;
 use sutcac_sh::exec::ShellState;
 
 use crate::config::AppConfig;
-use crate::llm::LlmClient;
+use crate::llm::{LlmClient, Usage};
 use crate::message::{Message, Role};
 use crate::tool::{ToolCall, ToolResult, execute_shell_command};
 
@@ -47,10 +47,14 @@ pub struct App {
     tool_rounds_this_turn: usize,
     /// Path of the history file currently being continued, if any.
     current_history_file: Option<std::path::PathBuf>,
+    /// Cumulative token usage across all completed LLM requests.
+    pub usage: Usage,
+    /// Number of completed LLM requests in this session.
+    pub request_count: usize,
 }
 
 /// Built-in TUI slash commands offered by command completion.
-const SLASH_COMMANDS: &[&str] = &["/resume"];
+const SLASH_COMMANDS: &[&str] = &["/resume", "/status"];
 
 /// Maximum number of completion candidates shown at once.
 const MAX_CANDIDATES: usize = 8;
@@ -122,6 +126,8 @@ impl App {
             pending_tool_calls: Vec::new(),
             tool_rounds_this_turn: 0,
             current_history_file: None,
+            usage: Usage::default(),
+            request_count: 0,
         }
     }
 
@@ -386,6 +392,38 @@ impl App {
             .unwrap_or(false)
     }
 
+    /// Accumulate token usage reported for one completed LLM request.
+    pub fn record_usage(&mut self, usage: &Usage) {
+        log::info!(
+            "usage recorded: prompt={} completion={} total={} cached={}",
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+            usage.cached_tokens
+        );
+        self.request_count += 1;
+        self.usage.prompt_tokens += usage.prompt_tokens;
+        self.usage.completion_tokens += usage.completion_tokens;
+        self.usage.total_tokens = self
+            .usage
+            .total_tokens
+            .max(self.usage.prompt_tokens + self.usage.completion_tokens);
+        self.usage.cached_tokens += usage.cached_tokens;
+    }
+
+    /// One-line summary of session token consumption, shown by `/status`.
+    pub fn status_summary(&self) -> String {
+        format!(
+            "{} | requests {} | prompt {} (cached {}) | completion {} | total {}",
+            self.config.api.model,
+            self.request_count,
+            self.usage.prompt_tokens,
+            self.usage.cached_tokens,
+            self.usage.completion_tokens,
+            self.usage.total_tokens,
+        )
+    }
+
     pub fn set_error(&mut self, msg: impl Into<String>) {
         self.status = AppStatus::Error;
         self.status_message = msg.into();
@@ -446,7 +484,21 @@ impl App {
     /// message. Returns the formatted tool result message.
     pub fn run_pending_tool(&mut self) -> Option<String> {
         let call = self.pending_tool_calls.first()?.clone();
-        let command = call.shell_command()?;
+
+        let Some(command) = call.shell_command() else {
+            // Malformed arguments: report back to the model and consume the
+            // call instead of leaving it pending forever.
+            log::warn!("malformed tool call: {}", call.arguments);
+            let message = format!(
+                "status=2\nstdout=```\n\n```\nstderr=```\ncatus: tool call format error: arguments must be a single JSON object {{\"command\": \"<shell command>\"}} with exactly one string \"command\" field; got: {}\n```",
+                call.arguments
+            );
+            self.messages
+                .push(Message::tool(message.clone(), call.id.clone()));
+            self.pending_tool_calls.remove(0);
+            self.scroll_to_bottom();
+            return Some(message);
+        };
 
         self.status = AppStatus::RunningTool;
         self.status_message = format!("Running: {}", command);
@@ -693,6 +745,11 @@ impl App {
                     }
                     Err(e) => self.set_error(e.to_string()),
                 }
+                self.record_input_history(input);
+            }
+            "status" => {
+                self.status = AppStatus::Idle;
+                self.status_message = self.status_summary();
                 self.record_input_history(input);
             }
             _ => self.set_error(format!("unknown command: /{}", cmd)),
@@ -1086,6 +1143,113 @@ mod tests {
         assert_eq!(app.input_history, vec!["/resume foo"]);
         app.history_previous();
         assert_eq!(app.input, "/resume foo");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_usage_accumulates_session_totals() {
+        let dir = std::env::temp_dir().join(format!("catus_usage_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert_eq!(app.usage.prompt_tokens, 0);
+
+        app.record_usage(&Usage {
+            prompt_tokens: 19,
+            completion_tokens: 13,
+            total_tokens: 32,
+            cached_tokens: 12,
+        });
+        app.record_usage(&Usage {
+            prompt_tokens: 100,
+            completion_tokens: 5,
+            total_tokens: 105,
+            cached_tokens: 0,
+        });
+
+        assert_eq!(app.request_count, 2);
+        // Prompt tokens accumulate; context size is tracked via totals.
+        assert_eq!(app.usage.prompt_tokens, 119);
+        assert_eq!(app.usage.completion_tokens, 18);
+        assert_eq!(app.usage.cached_tokens, 12);
+        assert_eq!(
+            app.usage.total_tokens,
+            app.usage.prompt_tokens + app.usage.completion_tokens
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_command_shows_token_summary() {
+        let dir = std::env::temp_dir().join(format!("catus_status_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.record_usage(&Usage {
+            prompt_tokens: 19,
+            completion_tokens: 13,
+            total_tokens: 32,
+            cached_tokens: 12,
+        });
+        assert!(app.handle_command("/status"));
+
+        let msg = &app.status_message;
+        assert!(msg.contains("test"), "model name shown: {}", msg);
+        assert!(msg.contains("requests 1"), "{}", msg);
+        assert!(msg.contains("prompt 19"), "{}", msg);
+        assert!(msg.contains("cached 12"), "{}", msg);
+        assert!(msg.contains("completion 13"), "{}", msg);
+        assert!(msg.contains("total 32"), "{}", msg);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_pending_tool_reports_malformed_arguments() {
+        let dir = std::env::temp_dir().join(format!("catus_badargs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.messages.push(Message::assistant(String::new()));
+        app.add_tool_call(ToolCall {
+            id: "call_bad".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"cmd":"ls"}"#.to_string(),
+        });
+
+        let result = app.run_pending_tool();
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(
+            text.contains("tool call format error"),
+            "result should point out the format problem: {}",
+            text
+        );
+        // The call is consumed and the error is fed back as a tool message.
+        assert_eq!(app.pending_tool_calls_count(), 0);
+        assert_eq!(
+            app.messages.last().unwrap().tool_call_id,
+            Some("call_bad".into())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slash_command_completion_offers_status() {
+        let dir = std::env::temp_dir().join(format!("catus_slash_status_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.input = "/st".to_string();
+        app.recompute_candidates();
+        assert_eq!(app.candidates, vec!["/status"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

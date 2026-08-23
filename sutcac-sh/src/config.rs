@@ -32,6 +32,14 @@ pub struct ShellConfig {
     /// Per-command permission overrides. Each command maps to a list of tags
     /// such as `["read"]`, `["read", "network"]` or `["custom_tag"]`.
     pub commands: Option<HashMap<String, Vec<String>>>,
+    /// Shorthand for read-only commands: `read = ["awk", "cat", ...]` is
+    /// equivalent to listing each command under `[shell.commands]` with
+    /// `tags = ["read"]`. Entries in `commands` take precedence.
+    pub read: Option<Vec<String>>,
+    /// Shorthand for writable commands: `write = ["mkdir", "touch", ...]` is
+    /// equivalent to listing each command under `[shell.commands]` with
+    /// `tags = ["write"]`. Entries in `commands` take precedence.
+    pub write: Option<Vec<String>>,
 }
 
 impl Default for ShellConfig {
@@ -42,6 +50,8 @@ impl Default for ShellConfig {
             audit_format: Some("text".to_string()),
             audit_meta: None,
             commands: None,
+            read: None,
+            write: None,
         }
     }
 }
@@ -122,6 +132,19 @@ impl ShellConfig {
 
     fn parse_command_permissions(&self) -> HashMap<String, PermissionSet> {
         let mut map = HashMap::new();
+        // Shorthand lists first so that explicit `commands` entries win.
+        for (names, perm) in [
+            (&self.read, Permission::Read),
+            (&self.write, Permission::Write),
+        ] {
+            if let Some(names) = names {
+                for name in names {
+                    let mut set = PermissionSet::empty();
+                    set.insert(perm.clone());
+                    map.insert(name.clone(), set);
+                }
+            }
+        }
         if let Some(commands) = &self.commands {
             for (name, tags) in commands {
                 let mut set = PermissionSet::empty();
@@ -187,5 +210,44 @@ audit_format = "json"
         assert_eq!(shell.perm_mode.as_deref(), Some("allow_all"));
         assert_eq!(shell.audit_format.as_deref(), Some("text"));
         assert!(shell.audit_log.is_none());
+    }
+
+    #[test]
+    fn shorthand_read_write_lists() {
+        let input = r#"
+[shell]
+perm_mode = "allow:read deny:write"
+read = ["awk", "cat"]
+write = ["mkdir"]
+"#;
+        let file: ConfigFile = toml::from_str(input).unwrap();
+        let shell = file.shell.unwrap();
+        let policy = shell.permission_policy();
+        assert_eq!(
+            policy.permissions_for_command("awk"),
+            Some(&PermissionSet::read())
+        );
+        assert_eq!(
+            policy.permissions_for_command("mkdir"),
+            Some(&PermissionSet::write())
+        );
+        assert!(policy.permissions_for_command("curl").is_none());
+    }
+
+    #[test]
+    fn explicit_commands_override_shorthand() {
+        let input = r#"
+[shell]
+read = ["git"]
+
+[shell.commands]
+git = ["network", "read"]
+"#;
+        let file: ConfigFile = toml::from_str(input).unwrap();
+        let shell = file.shell.unwrap();
+        let policy = shell.permission_policy();
+        let perms = policy.permissions_for_command("git").unwrap();
+        assert!(!perms.contains(&Permission::Write));
+        assert!(perms.contains(&Permission::Custom("NETWORK".to_string())));
     }
 }

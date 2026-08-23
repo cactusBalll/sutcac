@@ -219,6 +219,15 @@ mod tests {
     }
 
     #[test]
+    fn format_token_counts_compactly() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(980), "980");
+        assert_eq!(format_tokens(1_234), "1.23k");
+        assert_eq!(format_tokens(32_100), "32.1k");
+        assert_eq!(format_tokens(1_500_000), "1.5m");
+    }
+
+    #[test]
     fn truncate_wide_chars() {
         // Each CJK character is typically width 2.
         assert_eq!(truncate_to_width("你好世界", 3), "界");
@@ -351,8 +360,37 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
+    // Right-aligned token usage: current context size and session total.
+    if app.usage.prompt_tokens > 0 {
+        let info = format!(
+            "ctx {} tok | total {}",
+            format_tokens(app.usage.context_tokens()),
+            format_tokens(app.usage.total_tokens),
+        );
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        let needed = info.chars().count() + 2; // at least two spaces of padding
+        let pad = (area.width as usize)
+            .saturating_sub(used)
+            .saturating_sub(needed);
+        spans.push(Span::raw(" ".repeat(pad + 2)));
+        spans.push(Span::styled(info, Style::default().fg(Color::Cyan)));
+    }
+
     let line = Line::from(spans).alignment(Alignment::Left);
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Compact token count: `980`, `1.2k`, `12.3k`, `1.5m`.
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 10_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.2}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 /// Maximum number of stdout lines shown for a shell tool result.

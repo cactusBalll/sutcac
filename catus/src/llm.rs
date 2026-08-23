@@ -59,6 +59,65 @@ pub enum StreamEvent {
     Reasoning(String),
     /// A completed tool call.
     ToolCall(ToolCall),
+    /// Token usage reported for the completed request.
+    Usage(Usage),
+}
+
+/// Token usage reported by the API for one completion.
+///
+/// `cached_tokens` covers prompt tokens served from the provider cache; it is
+/// taken from `prompt_tokens_details.cached_tokens` (OpenAI) or a top-level
+/// `cached_tokens` field (some compatible providers).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+impl Usage {
+    /// The most recent prompt size, i.e. the current context consumption.
+    pub fn context_tokens(&self) -> u64 {
+        self.prompt_tokens
+    }
+}
+
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Default, Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            prompt_tokens: u64,
+            #[serde(default)]
+            completion_tokens: u64,
+            #[serde(default)]
+            total_tokens: u64,
+            #[serde(default)]
+            cached_tokens: u64,
+            #[serde(default)]
+            prompt_tokens_details: Option<PromptTokensDetails>,
+        }
+        #[derive(Default, Deserialize)]
+        struct PromptTokensDetails {
+            #[serde(default)]
+            cached_tokens: u64,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Usage {
+            prompt_tokens: raw.prompt_tokens,
+            completion_tokens: raw.completion_tokens,
+            total_tokens: raw.total_tokens,
+            cached_tokens: raw
+                .prompt_tokens_details
+                .map(|d| d.cached_tokens)
+                .unwrap_or(raw.cached_tokens),
+        })
+    }
 }
 
 /// Full assistant reply from a non-streaming completion.
@@ -67,6 +126,7 @@ pub struct ChatReply {
     pub content: String,
     pub reasoning_content: String,
     pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<Usage>,
 }
 
 impl ChatReply {
@@ -115,6 +175,12 @@ struct ApiMessage {
     tool_call_id: Option<String>,
 }
 
+/// Streaming options requesting usage in the final chunk.
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
 /// Chat completion request body.
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -125,6 +191,8 @@ struct ChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
 }
 
 /// Non-streaming chat completion response.
@@ -132,6 +200,8 @@ struct ChatRequest {
 struct ChatResponse {
     #[serde(default)]
     choices: Option<Vec<Choice>>,
+    #[serde(default)]
+    usage: Option<Usage>,
     error: Option<ApiError>,
 }
 
@@ -210,6 +280,9 @@ impl LlmClient {
             stream,
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
+            stream_options: stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
         }
     }
 
@@ -276,6 +349,8 @@ impl LlmClient {
             return Err(LlmError::Api("provider returned empty choices".to_string()));
         }
 
+        reply.usage = parsed.usage;
+
         Ok(reply)
     }
 
@@ -327,6 +402,19 @@ impl LlmClient {
 
             if let Some(err) = parsed.error {
                 return Err(LlmError::Api(err.message));
+            }
+
+            // Providers send a final chunk with empty `choices` carrying only
+            // the token usage.
+            if let Some(usage) = parsed.usage {
+                log::info!(
+                    "sse usage: prompt={} completion={} total={} cached={}",
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.total_tokens,
+                    usage.cached_tokens
+                );
+                let _ = tx.send(StreamEvent::Usage(usage)).await;
             }
 
             let choices = parsed.choices.unwrap_or_default();
@@ -598,5 +686,61 @@ mod tests {
         assert_eq!(api.reasoning_content, "my reasoning");
         let json = serde_json::to_string(&api).unwrap();
         assert!(json.contains("reasoning_content"));
+    }
+
+    #[test]
+    fn parse_usage_with_prompt_tokens_details() {
+        let json = r#"{
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 19,
+                "completion_tokens": 13,
+                "total_tokens": 32,
+                "prompt_tokens_details": { "cached_tokens": 12 }
+            }
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(json).unwrap();
+        let usage = parsed.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 19);
+        assert_eq!(usage.completion_tokens, 13);
+        assert_eq!(usage.total_tokens, 32);
+        assert_eq!(usage.cached_tokens, 12);
+    }
+
+    #[test]
+    fn parse_usage_with_top_level_cached_tokens() {
+        let json = r#"{
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+                "cached_tokens": 40
+            }
+        }"#;
+        let parsed: ChatResponse = serde_json::from_str(json).unwrap();
+        let usage = parsed.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(usage.cached_tokens, 40);
+    }
+
+    #[test]
+    fn response_without_usage_parses() {
+        let json = r#"{ "choices": [{ "message": { "role": "assistant", "content": "hi" } }] }"#;
+        let parsed: ChatResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.usage.is_none());
+    }
+
+    #[test]
+    fn streaming_request_includes_stream_options() {
+        let client = LlmClient::new("https://example.com", "key", "model");
+        let body = client.build_request(&[], true);
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains(r#""stream_options":{"include_usage":true}"#));
+
+        let non_streaming = client.build_request(&[], false);
+        let json = serde_json::to_string(&non_streaming).unwrap();
+        assert!(!json.contains("stream_options"));
     }
 }

@@ -94,22 +94,22 @@ impl<'de> serde::Deserialize<'de> for ToolCall {
 
 impl ToolCall {
     /// Extract the shell command from the `command` argument.
+    ///
+    /// Only the canonical form is accepted: an object with a single string
+    /// `"command"` field. Anything else yields `None` so the caller can report
+    /// a malformed tool call back to the model.
     pub fn shell_command(&self) -> Option<String> {
         if self.name != "shell" {
             return None;
         }
-        match serde_json::from_str::<ShellArguments>(&self.arguments) {
-            Ok(args) => Some(args.command),
-            Err(_) => {
-                // Fallback: if the model produced a bare string, use it as-is.
-                let trimmed = self.arguments.trim();
-                if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
-                    Some(trimmed[1..trimmed.len() - 1].to_string())
-                } else {
-                    Some(self.arguments.clone())
-                }
-            }
-        }
+        serde_json::from_str::<ShellArguments>(&self.arguments)
+            .ok()
+            .map(|args| args.command)
+    }
+
+    /// Whether `arguments` has the canonical `{"command": "..."}` shape.
+    pub fn has_valid_arguments(&self) -> bool {
+        self.name == "shell" && serde_json::from_str::<ShellArguments>(&self.arguments).is_ok()
     }
 }
 
@@ -230,6 +230,58 @@ mod tests {
             arguments: r#"{"command":"ls -la"}"#.to_string(),
         };
         assert_eq!(call.shell_command(), Some("ls -la".to_string()));
+    }
+
+    #[test]
+    fn duplicate_command_keys_are_rejected() {
+        let call = ToolCall {
+            id: "call_abc".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"cat Cargo.toml AGENTS.md","command":"find . -name '*.rs' | head -5"}"#
+                .to_string(),
+        };
+        assert_eq!(call.shell_command(), None);
+        assert!(!call.has_valid_arguments());
+    }
+
+    #[test]
+    fn command_array_value_is_rejected() {
+        let call = ToolCall {
+            id: "call_abc".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":["pwd","ls -la"]}"#.to_string(),
+        };
+        assert_eq!(call.shell_command(), None);
+        assert!(!call.has_valid_arguments());
+    }
+
+    #[test]
+    fn raw_json_is_never_executed_as_a_command() {
+        // A blob with no string "command" field must not reach the shell.
+        let no_command = ToolCall {
+            id: "call_def".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"cmd":"ls"}"#.to_string(),
+        };
+        assert_eq!(no_command.shell_command(), None);
+
+        // A bare quoted string is not the canonical form either.
+        let bare = ToolCall {
+            id: "call_ghi".to_string(),
+            name: "shell".to_string(),
+            arguments: r#""ls -la""#.to_string(),
+        };
+        assert_eq!(bare.shell_command(), None);
+    }
+
+    #[test]
+    fn non_shell_tool_call_is_rejected() {
+        let call = ToolCall {
+            id: "call_abc".to_string(),
+            name: "other".to_string(),
+            arguments: r#"{"command":"ls"}"#.to_string(),
+        };
+        assert_eq!(call.shell_command(), None);
     }
 
     #[test]

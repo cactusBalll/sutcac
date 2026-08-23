@@ -35,43 +35,18 @@ audit_format = "text"
 [shell.audit_meta]
 session = "example-session"
 
-# Per-command permission tags. Any external command not listed here defaults
-# to READ+WRITE. Use this section to mark commands as READ-only, assign custom
-# tags (e.g. network), or override specific commands.
-[shell.commands]
-awk = ["read"]
-basename = ["read"]
-cat = ["read"]
-cmp = ["read"]
-comm = ["read"]
-cut = ["read"]
-diff = ["read"]
-dirname = ["read"]
-file = ["read"]
-find = ["read"]
-git = ["read"]
-grep = ["read"]
-head = ["read"]
-less = ["read"]
-ls = ["read"]
-more = ["read"]
-nl = ["read"]
-printf = ["read"]
-ps = ["read"]
-pwd = ["read"]
-readlink = ["read"]
-realpath = ["read"]
-sed = ["read"]
-sort = ["read"]
-strings = ["read"]
-tail = ["read"]
-tr = ["read"]
-uniq = ["read"]
-wc = ["read"]
-whereis = ["read"]
-which = ["read"]
-xargs = ["read"]
+# Shorthand permission lists: every listed command gets the READ (or WRITE)
+# permission tag, equivalent to listing each one under [shell.commands].
+read = [
+  "awk", "basename", "cat", "cmp", "comm", "cut", "diff", "dirname", "file",
+  "find", "git", "grep", "head", "less", "ls", "more", "nl", "printf", "ps",
+  "pwd", "readlink", "realpath", "sed", "sort", "strings", "tail", "tr",
+  "uniq", "wc", "whereis", "which", "xargs",
+]
+# write = ["mkdir", "touch"]
 
-# Examples of custom tags:
+# Per-command permission tags. Any external command not listed here defaults
+# to READ+WRITE. Entries here override the shorthand lists above.
+[shell.commands]
 curl = ["network", "read"]
 clip = ["clipboard"]
