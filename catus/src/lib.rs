@@ -6,3 +6,4 @@ pub mod llm;
 pub mod message;
 pub mod tool;
 pub mod tui;
+pub mod ui;

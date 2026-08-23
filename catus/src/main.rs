@@ -8,12 +8,13 @@ use log::LevelFilter;
 use simplelog::{Config, WriteLogger};
 use tokio::sync::mpsc;
 
-use catus::app::App;
+use catus::app::{App, AppStatus, OverlayResult};
 use catus::config::AppConfig;
 use catus::llm::{LlmClient, LlmError, StreamEvent};
 use catus::message::Message;
 use catus::tool::{ToolResult, execute_shell_command};
 use catus::tui;
+use catus::ui;
 
 enum UiEvent {
     Key(crossterm::event::KeyEvent),
@@ -175,7 +176,7 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
     let mut should_quit = false;
 
     while !should_quit {
-        terminal.draw(|frame| tui::draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &app))?;
 
         tokio::select! {
             Some(event) = ui_rx.recv() => {
@@ -185,10 +186,32 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                             continue;
                         }
 
-                        match key.code {
-                            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
-                                should_quit = true;
+                        // Ctrl+C always quits, even with an overlay open.
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers == KeyModifiers::CONTROL
+                        {
+                            should_quit = true;
+                            continue;
+                        }
+
+                        // Modal overlays swallow all other keys first.
+                        if app.overlay_active() {
+                            match app.handle_overlay_key(key.code) {
+                                OverlayResult::LoadHistory(name) => {
+                                    match app.resume_history(Some(&name)) {
+                                        Ok(msg) => {
+                                            app.status = AppStatus::Idle;
+                                            app.status_message = msg;
+                                        }
+                                        Err(e) => app.set_error(e.to_string()),
+                                    }
+                                }
+                                OverlayResult::Closed | OverlayResult::Consumed => {}
                             }
+                            continue;
+                        }
+
+                        match key.code {
                             KeyCode::Home => {
                                 app.scroll_to_top();
                             }
@@ -246,10 +269,14 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                     UiEvent::Mouse(mouse) => {
                         match mouse.kind {
                             crossterm::event::MouseEventKind::ScrollUp => {
-                                app.scroll_up(3);
+                                if !app.handle_overlay_scroll(true) {
+                                    app.scroll_up(3);
+                                }
                             }
                             crossterm::event::MouseEventKind::ScrollDown => {
-                                app.scroll_down(3);
+                                if !app.handle_overlay_scroll(false) {
+                                    app.scroll_down(3);
+                                }
                             }
                             _ => {}
                         }

@@ -65,11 +65,11 @@ Checked before every external command and redirection; denials return non-zero a
 
 ## catus TUI specifics
 
+- Rendering lives in `catus/src/ui/` (`chat.rs` = history/input/status bar; `overlay.rs` = modal pages); `tui.rs` only manages terminal raw-mode lifecycle. Interaction logic stays in `app.rs`.
 - Keys: Enter send, Esc/Ctrl+C quit, Up/Down/PageUp/PageDown scroll, Home/End jump.
-- `/resume` lists saved histories; `/resume <name>` loads `<history_dir>/<name>.json`; `/status` shows token usage.
-- Streaming requests set `stream_options.include_usage`; the returned `Usage` (incl. cached tokens) accumulates in `App.usage` and shows right-aligned in the status bar (`ctx <last prompt> tok | total <sum>`).
-- With `agent.history_path` set, sessions save to timestamped JSON on exit; nothing auto-loads at startup.
-- Diagnostics go to `agent.log_path` (default `.sutcac/catus.log`), not stderr, while the TUI runs.
+- `/resume <name>` loads `<history_dir>/<name>.json`; bare `/resume` opens a List-based picker overlay (↑/↓ select, Enter load, Esc cancel); `/status` opens a Table overlay with model/requests/token usage. Overlays swallow keys before the input line (`App::handle_overlay_key`).
+- Status bar keeps a compact right-aligned `ctx N tok | total M`; full details are in the /status page.
+- Streaming requests set `stream_options.include_usage`; the returned `Usage` (incl. cached tokens) accumulates in `App.usage`.
 
 ## Security notes
 

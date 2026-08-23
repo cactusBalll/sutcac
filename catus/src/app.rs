@@ -3,6 +3,8 @@
 use sutcac_sh::config::ShellConfig;
 use sutcac_sh::exec::ShellState;
 
+use crossterm::event::KeyCode;
+
 use crate::config::AppConfig;
 use crate::llm::{LlmClient, Usage};
 use crate::message::{Message, Role};
@@ -15,6 +17,35 @@ pub enum AppStatus {
     Streaming,
     RunningTool,
     Error,
+}
+
+/// Modal page shown on top of the chat view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Overlay {
+    /// No overlay; keys go to the input line.
+    None,
+    /// Interactive history picker. `items` are history file stems (newest
+    /// first), `selected` is the highlighted entry.
+    Resume { items: Vec<String>, selected: usize },
+    /// Token usage details.
+    Status,
+}
+
+impl Overlay {
+    pub fn is_active(&self) -> bool {
+        !matches!(self, Overlay::None)
+    }
+}
+
+/// Result of handling a key press while an overlay is active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayResult {
+    /// The key was consumed by the overlay; nothing else to do.
+    Consumed,
+    /// The overlay was closed without an action.
+    Closed,
+    /// The resume picker confirmed a history name to load.
+    LoadHistory(String),
 }
 
 /// Mutable application state shared between the TUI and async workers.
@@ -51,6 +82,8 @@ pub struct App {
     pub usage: Usage,
     /// Number of completed LLM requests in this session.
     pub request_count: usize,
+    /// Modal overlay currently displayed on top of the chat view.
+    pub overlay: Overlay,
 }
 
 /// Built-in TUI slash commands offered by command completion.
@@ -128,6 +161,7 @@ impl App {
             current_history_file: None,
             usage: Usage::default(),
             request_count: 0,
+            overlay: Overlay::None,
         }
     }
 
@@ -411,17 +445,99 @@ impl App {
         self.usage.cached_tokens += usage.cached_tokens;
     }
 
-    /// One-line summary of session token consumption, shown by `/status`.
-    pub fn status_summary(&self) -> String {
-        format!(
-            "{} | requests {} | prompt {} (cached {}) | completion {} | total {}",
-            self.config.api.model,
-            self.request_count,
-            self.usage.prompt_tokens,
-            self.usage.cached_tokens,
-            self.usage.completion_tokens,
-            self.usage.total_tokens,
-        )
+    /// Whether a modal overlay is currently displayed.
+    pub fn overlay_active(&self) -> bool {
+        self.overlay.is_active()
+    }
+
+    /// Open the history picker overlay with available history names.
+    pub fn open_resume_overlay(&mut self) {
+        let items = self
+            .list_history_files()
+            .iter()
+            .filter_map(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        self.overlay = Overlay::Resume { items, selected: 0 };
+    }
+
+    /// Open the token usage overlay.
+    pub fn open_status_overlay(&mut self) {
+        self.overlay = Overlay::Status;
+    }
+
+    /// Close any active overlay.
+    pub fn close_overlay(&mut self) {
+        self.overlay = Overlay::None;
+    }
+
+    /// Handle a key press while an overlay is active. Keys never reach the
+    /// input line while an overlay is open.
+    pub fn handle_overlay_key(&mut self, code: KeyCode) -> OverlayResult {
+        match self.overlay.clone() {
+            Overlay::None => OverlayResult::Consumed,
+            Overlay::Status => match code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.close_overlay();
+                    OverlayResult::Closed
+                }
+                _ => OverlayResult::Consumed,
+            },
+            Overlay::Resume { items, selected } => match code {
+                KeyCode::Up => {
+                    let next = if items.is_empty() {
+                        0
+                    } else {
+                        (selected + items.len() - 1) % items.len()
+                    };
+                    self.overlay = Overlay::Resume {
+                        items,
+                        selected: next,
+                    };
+                    OverlayResult::Consumed
+                }
+                KeyCode::Down => {
+                    let next = if items.is_empty() {
+                        0
+                    } else {
+                        (selected + 1) % items.len()
+                    };
+                    self.overlay = Overlay::Resume {
+                        items,
+                        selected: next,
+                    };
+                    OverlayResult::Consumed
+                }
+                KeyCode::Enter => {
+                    let chosen = items.get(selected).cloned();
+                    self.close_overlay();
+                    match chosen {
+                        Some(name) => OverlayResult::LoadHistory(name),
+                        None => OverlayResult::Closed,
+                    }
+                }
+                KeyCode::Esc => {
+                    self.close_overlay();
+                    OverlayResult::Closed
+                }
+                _ => OverlayResult::Consumed,
+            },
+        }
+    }
+
+    /// Move the resume picker selection with the mouse wheel. Returns true if
+    /// the scroll was consumed by an overlay.
+    pub fn handle_overlay_scroll(&mut self, up: bool) -> bool {
+        match &self.overlay {
+            Overlay::Resume { .. } => {
+                let _ = self.handle_overlay_key(if up { KeyCode::Up } else { KeyCode::Down });
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn set_error(&mut self, msg: impl Into<String>) {
@@ -737,19 +853,27 @@ impl App {
 
         match cmd {
             "resume" => {
-                let result = self.resume_history(arg);
-                match result {
-                    Ok(msg) => {
+                let arg = arg.map(str::trim).filter(|s| !s.is_empty());
+                match arg {
+                    // `/resume <name>` loads the history directly.
+                    Some(name) => match self.resume_history(Some(name)) {
+                        Ok(msg) => {
+                            self.status = AppStatus::Idle;
+                            self.status_message = msg;
+                        }
+                        Err(e) => self.set_error(e.to_string()),
+                    },
+                    // Bare `/resume` opens the interactive history picker.
+                    None => {
                         self.status = AppStatus::Idle;
-                        self.status_message = msg;
+                        self.open_resume_overlay();
                     }
-                    Err(e) => self.set_error(e.to_string()),
                 }
                 self.record_input_history(input);
             }
             "status" => {
                 self.status = AppStatus::Idle;
-                self.status_message = self.status_summary();
+                self.open_status_overlay();
                 self.record_input_history(input);
             }
             _ => self.set_error(format!("unknown command: /{}", cmd)),
@@ -1183,7 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn status_command_shows_token_summary() {
+    fn status_command_opens_overlay_with_usage() {
         let dir = std::env::temp_dir().join(format!("catus_status_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1196,14 +1320,90 @@ mod tests {
             cached_tokens: 12,
         });
         assert!(app.handle_command("/status"));
+        assert_eq!(app.overlay, Overlay::Status);
+        assert!(app.overlay_active());
+        assert_eq!(app.usage.prompt_tokens, 19);
 
-        let msg = &app.status_message;
-        assert!(msg.contains("test"), "model name shown: {}", msg);
-        assert!(msg.contains("requests 1"), "{}", msg);
-        assert!(msg.contains("prompt 19"), "{}", msg);
-        assert!(msg.contains("cached 12"), "{}", msg);
-        assert!(msg.contains("completion 13"), "{}", msg);
-        assert!(msg.contains("total 32"), "{}", msg);
+        // Esc closes it.
+        assert_eq!(app.handle_overlay_key(KeyCode::Esc), OverlayResult::Closed);
+        assert!(!app.overlay_active());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bare_resume_opens_picker_and_enter_loads_history() {
+        let dir = std::env::temp_dir().join(format!("catus_resume_overlay_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("alpha.json"),
+            serde_json::to_string(&vec![Message::user("hi")]).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("beta.json"), "[]").unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert!(app.handle_command("/resume"));
+        let items = match &app.overlay {
+            Overlay::Resume { items, selected } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(*selected, 0);
+                items.clone()
+            }
+            other => panic!("expected resume overlay, got {:?}", other),
+        };
+
+        // Arrow keys move the selection with wrap-around.
+        app.handle_overlay_key(KeyCode::Down);
+        assert_eq!(app.overlay, Overlay::Resume { items, selected: 1 });
+        app.handle_overlay_key(KeyCode::Down);
+        match &app.overlay {
+            Overlay::Resume { selected, .. } => assert_eq!(*selected, 0),
+            other => panic!("expected resume overlay, got {:?}", other),
+        }
+
+        // Enter loads the selected history and closes the picker.
+        let result = app.handle_overlay_key(KeyCode::Enter);
+        match result {
+            OverlayResult::LoadHistory(name) => {
+                let path = dir.join(format!("{}.json", name));
+                assert!(path.exists());
+            }
+            other => panic!("expected LoadHistory, got {:?}", other),
+        }
+        assert!(!app.overlay_active());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_picker_esc_closes_without_loading() {
+        let dir = std::env::temp_dir().join(format!("catus_resume_esc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.json"), "[]").unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.open_resume_overlay();
+        assert_eq!(app.handle_overlay_key(KeyCode::Esc), OverlayResult::Closed);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.current_history_file.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_with_name_argument_loads_directly_without_overlay() {
+        let dir = std::env::temp_dir().join(format!("catus_resume_arg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.json"), "[]").unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert!(app.handle_command("/resume foo"));
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.status_message, "history loaded");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
