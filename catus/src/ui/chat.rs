@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Paragraph, Wrap},
+    widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::app::{App, AppStatus};
@@ -16,9 +16,9 @@ const PROMPT: &str = "> ";
 const PROMPT_WIDTH: u16 = 2;
 
 /// Draw the chat layout into the provided frame.
-pub fn draw_chat(frame: &mut Frame, app: &App) {
+pub fn draw_chat(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let candidate_height = if app.candidates.is_empty() { 0 } else { 1 };
+    let candidate_height = app.candidates.len().min(crate::app::MAX_CANDIDATES) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -37,22 +37,43 @@ pub fn draw_chat(frame: &mut Frame, app: &App) {
     render_status(frame, app, chunks[3]);
 }
 
-fn render_history(frame: &mut Frame, app: &App, area: Rect) {
+fn render_history(frame: &mut Frame, app: &mut App, area: Rect) {
     let lines: Vec<Line> = app.messages.iter().flat_map(message_to_lines).collect();
 
-    let total_lines = lines.len();
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let total_wrapped_lines = paragraph.line_count(area.width);
     let visible_lines = area.height as usize;
-    let max_scroll = total_lines.saturating_sub(visible_lines.max(1));
 
     // `app.scroll` is an offset from the bottom (0 = latest message).
-    let bottom_offset = app.scroll.min(max_scroll);
-    let top_scroll = max_scroll.saturating_sub(bottom_offset);
+    // Clamp it here so `scroll_to_top()` cannot leave it at usize::MAX,
+    // which would make subsequent scroll-down operations ineffective.
+    let (bottom_offset, top_scroll) =
+        compute_history_scroll(total_wrapped_lines, visible_lines, app.scroll);
+    app.scroll = bottom_offset;
 
-    let paragraph = Paragraph::new(Text::from(lines))
-        .wrap(Wrap { trim: false })
-        .scroll((top_scroll as u16, 0));
+    let paragraph = paragraph.scroll((top_scroll, 0));
 
     frame.render_widget(paragraph, area);
+}
+
+/// Compute the clamped bottom scroll offset and the corresponding Paragraph
+/// top-scroll value.
+///
+/// `total_wrapped_lines` is the number of visual lines the wrapped history
+/// occupies; `visible_lines` is the height of the history area. The returned
+/// `bottom_offset` is always within `[0, max_scroll]` and can be stored back
+/// into `App::scroll` to keep the value bounded.
+fn compute_history_scroll(
+    total_wrapped_lines: usize,
+    visible_lines: usize,
+    scroll: usize,
+) -> (usize, u16) {
+    let max_scroll = total_wrapped_lines.saturating_sub(visible_lines.max(1));
+    let bottom_offset = scroll.min(max_scroll);
+    let top_scroll = max_scroll
+        .saturating_sub(bottom_offset)
+        .min(u16::MAX as usize) as u16;
+    (bottom_offset, top_scroll)
 }
 
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
@@ -138,52 +159,31 @@ fn visible_input_window(s: &str, cursor: usize, max_width: usize) -> (&str, usiz
 }
 
 fn render_candidates(frame: &mut Frame, app: &App, area: Rect) {
-    let line = build_candidate_line(app, area.width as usize);
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-/// Build the one-line candidate strip, truncating with an ellipsis if the
-/// candidates do not fit in the available width.
-fn build_candidate_line(app: &App, max_width: usize) -> Line<'static> {
     let normal_style = Style::default().fg(Color::Cyan);
     let selected_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
         .add_modifier(Modifier::REVERSED);
 
-    let mut spans: Vec<Span> = Vec::new();
-    let mut used_width: usize = 0;
-    let separator_width = 1usize; // space between candidates
+    let items: Vec<ListItem> = app
+        .candidates
+        .iter()
+        .take(crate::app::MAX_CANDIDATES)
+        .enumerate()
+        .map(|(i, candidate)| {
+            let style = if app.selected_candidate == Some(i) {
+                selected_style
+            } else {
+                normal_style
+            };
+            ListItem::new(Line::styled(candidate.clone(), style))
+        })
+        .collect();
 
-    for (i, candidate) in app.candidates.iter().enumerate() {
-        let style = if app.selected_candidate == Some(i) {
-            selected_style
-        } else {
-            normal_style
-        };
-        let width = unicode_width::UnicodeWidthStr::width(candidate.as_str());
-
-        if used_width + width > max_width && !spans.is_empty() {
-            // Not enough room; truncate with an ellipsis.
-            let ellipsis = Span::styled("...", Style::default().fg(Color::DarkGray));
-            spans.push(ellipsis);
-            break;
-        }
-
-        spans.push(Span::styled(candidate.clone(), style));
-        used_width += width;
-
-        if i + 1 < app.candidates.len() {
-            if used_width + separator_width > max_width {
-                // No room for another separator + candidate.
-                break;
-            }
-            spans.push(Span::raw(" "));
-            used_width += separator_width;
-        }
-    }
-
-    Line::from(spans)
+    let list = List::new(items).highlight_symbol("▶ ");
+    let mut state = ListState::default();
+    state.select(app.selected_candidate);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 /// Return the trailing substring of `s` whose display width is at most `max_width`.
@@ -206,7 +206,9 @@ fn truncate_to_width(s: &str, max_width: usize) -> &str {
     &s[start_byte..]
 }
 
-fn render_status(frame: &mut Frame, app: &App, area: Rect) {
+fn render_status(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.maybe_clear_status_message();
+
     let (label, color) = match app.status {
         AppStatus::Idle => ("idle", Color::Gray),
         AppStatus::Streaming => ("streaming", Color::Yellow),
@@ -222,8 +224,16 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     if !app.status_message.is_empty() {
         spans.push(Span::raw(app.status_message.clone()));
     } else {
+        let navigate = if app.input.starts_with('/') {
+            "↑↓:cmd"
+        } else {
+            "↑↓:hist"
+        };
         spans.push(Span::styled(
-            "Enter: send | Tab: complete | ↑/↓ history | PgUp/PgDn scroll | Home: top | End: bottom | Ctrl+L: clear | Esc: quit",
+            format!(
+                "Enter:send Tab:complete {} PgUp/PgDn:scroll /help Ctrl+C:quit",
+                navigate
+            ),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -488,42 +498,6 @@ mod tests {
     }
 
     #[test]
-    fn candidate_line_lists_all_items_when_roomy() {
-        let app = app_with_candidates(&["ls", "cat", "pwd"]);
-        let line = build_candidate_line(&app, 80);
-        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(text.contains("ls"));
-        assert!(text.contains("cat"));
-        assert!(text.contains("pwd"));
-    }
-
-    #[test]
-    fn candidate_line_truncates_when_narrow() {
-        let app = app_with_candidates(&["alpha", "beta", "gamma"]);
-        let line = build_candidate_line(&app, 8);
-        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
-        // "alpha" (5) + space (1) = 6; "beta" would not fit in 8, so it is replaced by "..."
-        assert!(text.contains("alpha"));
-        assert!(!text.contains("beta"));
-        assert!(!text.contains("gamma"));
-        assert!(text.contains("..."));
-    }
-
-    #[test]
-    fn candidate_line_highlights_selected_item() {
-        let mut app = app_with_candidates(&["foo", "bar"]);
-        app.selected_candidate = Some(1);
-        let line = build_candidate_line(&app, 80);
-        assert_eq!(line.spans.len(), 3); // foo + space + bar
-        assert!(
-            line.spans[2]
-                .style
-                .add_modifier
-                .contains(Modifier::REVERSED)
-        );
-    }
-
-    #[test]
     fn visible_window_shows_all_when_input_fits() {
         let (visible, offset) = visible_input_window("hello", 3, 20);
         assert_eq!(visible, "hello");
@@ -551,24 +525,24 @@ mod tests {
         assert_eq!(offset, 4);
     }
 
-    fn app_with_candidates(candidates: &[&str]) -> crate::app::App {
-        use crate::config::{AgentConfig, ApiConfig, AppConfig};
-        let mut app = App::new(AppConfig {
-            api: ApiConfig {
-                base_url: "https://example.com".to_string(),
-                api_key: "test".to_string(),
-                model: "test".to_string(),
-            },
-            agent: AgentConfig {
-                system_prompt: "test".to_string(),
-                max_tool_rounds: 5,
-                history_path: None,
-                log_path: None,
-                log_level: "info".to_string(),
-            },
-            shell: None,
-        });
-        app.candidates = candidates.iter().map(|s| s.to_string()).collect();
-        app
+    #[test]
+    fn scroll_to_top_is_clamped_to_max_scroll() {
+        let (clamped, top_scroll) = compute_history_scroll(100, 20, usize::MAX);
+        assert_eq!(clamped, 80);
+        assert_eq!(top_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_at_bottom_uses_max_top_scroll() {
+        let (clamped, top_scroll) = compute_history_scroll(100, 20, 0);
+        assert_eq!(clamped, 0);
+        assert_eq!(top_scroll, 80);
+    }
+
+    #[test]
+    fn scroll_fits_when_content_shorter_than_area() {
+        let (clamped, top_scroll) = compute_history_scroll(10, 20, 5);
+        assert_eq!(clamped, 0);
+        assert_eq!(top_scroll, 0);
     }
 }

@@ -27,6 +27,7 @@ pub fn draw_overlay(frame: &mut Frame, app: &App) {
         Overlay::None => {}
         Overlay::Resume { items, selected } => draw_resume(frame, items, *selected, popup),
         Overlay::Status => draw_status(frame, app, popup),
+        Overlay::Config { selected } => draw_config(frame, app, *selected, popup),
     }
 }
 
@@ -102,6 +103,47 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
     let help = Paragraph::new(Line::styled(
         "Esc/q close",
+        Style::default().fg(Color::DarkGray),
+    ))
+    .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help, rows[1]);
+}
+
+fn draw_config(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Config ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let fields = app.config_fields();
+    let items: Vec<ListItem> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, (key, value))| {
+            let text = format!("{}: {}", key, value);
+            let style = if i == selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            ListItem::new(Line::styled(text, style))
+        })
+        .collect();
+
+    let list = List::new(items).highlight_symbol("▶ ");
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, rows[0], &mut state);
+
+    let help = Paragraph::new(Line::styled(
+        "↑/↓ select · Enter edit · Esc/q close",
         Style::default().fg(Color::DarkGray),
     ))
     .alignment(ratatui::layout::Alignment::Center);

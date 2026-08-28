@@ -1,5 +1,7 @@
 //! Application state for the catus Agent TUI.
 
+use std::time::{Duration, Instant};
+
 use sutcac_sh::config::ShellConfig;
 use sutcac_sh::exec::ShellState;
 
@@ -29,6 +31,8 @@ pub enum Overlay {
     Resume { items: Vec<String>, selected: usize },
     /// Token usage details.
     Status,
+    /// Config editor.
+    Config { selected: usize },
 }
 
 impl Overlay {
@@ -84,13 +88,22 @@ pub struct App {
     pub request_count: usize,
     /// Modal overlay currently displayed on top of the chat view.
     pub overlay: Overlay,
+    /// Set to true by `/exit` to request a clean shutdown.
+    pub should_quit: bool,
+    /// Instant after which `status_message` should be auto-cleared.
+    pub status_message_clear_at: Option<Instant>,
+    /// Path of the config file currently in use, if one was found.
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 /// Built-in TUI slash commands offered by command completion.
-const SLASH_COMMANDS: &[&str] = &["/resume", "/status"];
+const SLASH_COMMANDS: &[&str] = &["/config", "/exit", "/help", "/resume", "/status"];
 
 /// Maximum number of completion candidates shown at once.
-const MAX_CANDIDATES: usize = 8;
+pub const MAX_CANDIDATES: usize = 8;
+
+/// How long transient status-bar messages remain visible before clearing.
+const STATUS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Return the previous UTF-8 character boundary before `idx`.
 fn prev_char_boundary(s: &str, idx: usize) -> usize {
@@ -162,6 +175,9 @@ impl App {
             usage: Usage::default(),
             request_count: 0,
             overlay: Overlay::None,
+            should_quit: false,
+            status_message_clear_at: None,
+            config_path: AppConfig::find_config_file(),
         }
     }
 
@@ -469,6 +485,87 @@ impl App {
         self.overlay = Overlay::Status;
     }
 
+    /// Open the config editor overlay.
+    pub fn open_config_overlay(&mut self) {
+        self.overlay = Overlay::Config { selected: 0 };
+    }
+
+    /// Return the editable config fields as (key, current_value) pairs.
+    pub fn config_fields(&self) -> Vec<(String, String)> {
+        let mut fields = vec![
+            ("api.base_url".to_string(), self.config.api.base_url.clone()),
+            ("api.api_key".to_string(), self.config.api.api_key.clone()),
+            ("api.model".to_string(), self.config.api.model.clone()),
+            (
+                "agent.max_tool_rounds".to_string(),
+                self.config.agent.max_tool_rounds.to_string(),
+            ),
+            (
+                "agent.log_level".to_string(),
+                self.config.agent.log_level.clone(),
+            ),
+        ];
+        if let Some(shell) = &self.config.shell {
+            fields.push((
+                "shell.perm_mode".to_string(),
+                shell.perm_mode.clone().unwrap_or_default(),
+            ));
+        }
+        fields
+    }
+
+    /// Update a single config field by key, save the config file, and refresh
+    /// any runtime component that depends on the changed value.
+    pub fn set_config_field(
+        &mut self,
+        key: &str,
+        value: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let path = self
+            .config_path
+            .clone()
+            .ok_or("no config file found; cannot save changes")?;
+
+        match key {
+            "api.base_url" => self.config.api.base_url = value.to_string(),
+            "api.api_key" => self.config.api.api_key = value.to_string(),
+            "api.model" => self.config.api.model = value.to_string(),
+            "agent.max_tool_rounds" => {
+                self.config.agent.max_tool_rounds = value.parse()?;
+                self.max_tool_rounds = self.config.agent.max_tool_rounds;
+            }
+            "agent.log_level" => self.config.agent.log_level = value.to_string(),
+            "shell.perm_mode" => {
+                let shell = self.config.shell.get_or_insert_with(ShellConfig::default);
+                shell.perm_mode = Some(value.to_string());
+                let (permissions, audit_logger) = self
+                    .config
+                    .shell
+                    .clone()
+                    .map(|s| (s.permission_policy(), s.audit_logger()))
+                    .unwrap_or_else(|| {
+                        let default = ShellConfig::default();
+                        (default.permission_policy(), default.audit_logger())
+                    });
+                self.shell_state.set_permission_policy(permissions);
+                self.shell_state.set_audit_logger(audit_logger);
+            }
+            _ => return Err(format!("unknown config field: {}", key).into()),
+        }
+
+        // API changes need a refreshed client.
+        if key.starts_with("api.") {
+            self.client = LlmClient::new(
+                self.config.api.base_url.clone(),
+                self.config.api.api_key.clone(),
+                self.config.api.model.clone(),
+            );
+        }
+
+        self.config.save(&path)?;
+        Ok(format!("saved {} to {}", key, path.display()))
+    }
+
     /// Close any active overlay.
     pub fn close_overlay(&mut self) {
         self.overlay = Overlay::None;
@@ -525,6 +622,43 @@ impl App {
                 }
                 _ => OverlayResult::Consumed,
             },
+            Overlay::Config { selected } => {
+                let fields = self.config_fields();
+                match code {
+                    KeyCode::Up => {
+                        let next = if fields.is_empty() {
+                            0
+                        } else {
+                            (selected + fields.len() - 1) % fields.len()
+                        };
+                        self.overlay = Overlay::Config { selected: next };
+                        OverlayResult::Consumed
+                    }
+                    KeyCode::Down => {
+                        let next = if fields.is_empty() {
+                            0
+                        } else {
+                            (selected + 1) % fields.len()
+                        };
+                        self.overlay = Overlay::Config { selected: next };
+                        OverlayResult::Consumed
+                    }
+                    KeyCode::Enter => {
+                        if let Some((key, value)) = fields.get(selected) {
+                            self.input = format!("/config set {} {}", key, value);
+                            self.cursor = self.input.len();
+                            self.recompute_candidates();
+                        }
+                        self.close_overlay();
+                        OverlayResult::Closed
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.close_overlay();
+                        OverlayResult::Closed
+                    }
+                    _ => OverlayResult::Consumed,
+                }
+            }
         }
     }
 
@@ -532,7 +666,7 @@ impl App {
     /// the scroll was consumed by an overlay.
     pub fn handle_overlay_scroll(&mut self, up: bool) -> bool {
         match &self.overlay {
-            Overlay::Resume { .. } => {
+            Overlay::Resume { .. } | Overlay::Config { .. } => {
                 let _ = self.handle_overlay_key(if up { KeyCode::Up } else { KeyCode::Down });
                 true
             }
@@ -540,9 +674,35 @@ impl App {
         }
     }
 
+    /// Set a status-bar message with an optional auto-clear timeout.
+    pub fn set_status_message(&mut self, msg: impl Into<String>, timeout: Option<Duration>) {
+        self.status_message = msg.into();
+        self.status_message_clear_at = timeout.map(|d| Instant::now() + d);
+    }
+
+    /// Set a transient status-bar message that clears after
+    /// `STATUS_MESSAGE_TIMEOUT`.
+    pub fn set_transient_message(&mut self, msg: impl Into<String>) {
+        self.set_status_message(msg, Some(STATUS_MESSAGE_TIMEOUT));
+    }
+
+    /// Clear `status_message` if its auto-clear time has passed, also dropping
+    /// an Error status back to Idle.
+    pub fn maybe_clear_status_message(&mut self) {
+        if let Some(clear_at) = self.status_message_clear_at {
+            if Instant::now() >= clear_at {
+                self.status_message.clear();
+                self.status_message_clear_at = None;
+                if self.status == AppStatus::Error {
+                    self.status = AppStatus::Idle;
+                }
+            }
+        }
+    }
+
     pub fn set_error(&mut self, msg: impl Into<String>) {
         self.status = AppStatus::Error;
-        self.status_message = msg.into();
+        self.set_transient_message(msg);
     }
 
     /// Add a display-only event message to the history (errors, notices) and
@@ -852,6 +1012,54 @@ impl App {
         let arg = parts.next();
 
         match cmd {
+            "help" => {
+                let help_text = format!(
+                    "Commands:\n\
+                     {cmds}\n\
+                     Keys: Enter send, Tab/↑↓ complete, PgUp/PgDn scroll, Ctrl+C quit",
+                    cmds = SLASH_COMMANDS.join(", ")
+                );
+                self.add_event_message(help_text);
+                self.set_transient_message("Help displayed");
+                self.record_input_history(input);
+            }
+            "exit" => {
+                self.should_quit = true;
+            }
+            "config" => {
+                let arg = arg.map(str::trim).filter(|s| !s.is_empty());
+                match arg {
+                    Some(args) => {
+                        let mut set_parts = args.splitn(3, ' ');
+                        let sub = set_parts.next().unwrap_or("");
+                        if sub == "set" {
+                            let key = set_parts.next().unwrap_or("");
+                            let value = set_parts.next().unwrap_or("");
+                            if key.is_empty() {
+                                self.set_error("usage: /config set <key> <value>");
+                            } else {
+                                match self.set_config_field(key, value) {
+                                    Ok(msg) => {
+                                        self.status = AppStatus::Idle;
+                                        self.set_transient_message(msg);
+                                    }
+                                    Err(e) => self.set_error(e.to_string()),
+                                }
+                            }
+                        } else {
+                            self.set_error(format!(
+                                "unknown /config subcommand: {}. Try /config set <key> <value>",
+                                sub
+                            ));
+                        }
+                        self.record_input_history(input);
+                    }
+                    None => {
+                        self.status = AppStatus::Idle;
+                        self.open_config_overlay();
+                    }
+                }
+            }
             "resume" => {
                 let arg = arg.map(str::trim).filter(|s| !s.is_empty());
                 match arg {
@@ -859,7 +1067,7 @@ impl App {
                     Some(name) => match self.resume_history(Some(name)) {
                         Ok(msg) => {
                             self.status = AppStatus::Idle;
-                            self.status_message = msg;
+                            self.set_transient_message(msg);
                         }
                         Err(e) => self.set_error(e.to_string()),
                     },
@@ -1409,6 +1617,83 @@ mod tests {
     }
 
     #[test]
+    fn config_command_opens_overlay() {
+        let dir = std::env::temp_dir().join(format!("catus_config_overlay_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert!(app.handle_command("/config"));
+        assert!(matches!(app.overlay, Overlay::Config { selected: 0 }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_fields_lists_editable_keys() {
+        let dir = std::env::temp_dir().join(format!("catus_config_fields_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let app = App::new(test_config_with_history_dir(&dir));
+        let fields = app.config_fields();
+        let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"api.base_url"));
+        assert!(keys.contains(&"api.model"));
+        assert!(keys.contains(&"agent.max_tool_rounds"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_overlay_enter_prefills_edit_command() {
+        let dir = std::env::temp_dir().join(format!("catus_config_enter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.open_config_overlay();
+        app.handle_overlay_key(KeyCode::Enter);
+        assert!(app.input.starts_with("/config set "));
+        assert_eq!(app.overlay, Overlay::None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_config_field_updates_value_and_saves() {
+        let dir = std::env::temp_dir().join(format!("catus_config_save_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create a config file so there is a path to save to.
+        let config_path = dir.join("config.toml");
+        let initial = r#"
+[api]
+base_url = "https://example.com/v1"
+api_key = "test"
+model = "test-model"
+
+[agent]
+system_prompt = "test prompt"
+max_tool_rounds = 5
+log_level = "info"
+"#;
+        std::fs::write(&config_path, initial).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.config_path = Some(config_path.clone());
+        app.set_config_field("api.model", "gpt-4o")
+            .expect("set_config_field should succeed");
+        assert_eq!(app.config.api.model, "gpt-4o");
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(saved.contains("gpt-4o"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn run_pending_tool_reports_malformed_arguments() {
         let dir = std::env::temp_dir().join(format!("catus_badargs_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1450,6 +1735,91 @@ mod tests {
         app.input = "/st".to_string();
         app.recompute_candidates();
         assert_eq!(app.candidates, vec!["/status"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slash_command_completion_offers_help_and_exit() {
+        let dir = std::env::temp_dir().join(format!("catus_slash_help_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.input = "/".to_string();
+        app.recompute_candidates();
+        assert!(app.candidates.contains(&"/help".to_string()));
+        assert!(app.candidates.contains(&"/exit".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn help_command_shows_help_in_history() {
+        let dir = std::env::temp_dir().join(format!("catus_help_cmd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert!(app.handle_command("/help"));
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.is_event() && m.content.contains("/help"))
+        );
+        assert!(app.status_message.contains("Help"));
+        assert!(app.status_message_clear_at.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exit_command_requests_quit() {
+        let dir = std::env::temp_dir().join(format!("catus_exit_cmd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert!(app.handle_command("/exit"));
+        assert!(app.should_quit);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_status_message_auto_clears() {
+        let dir = std::env::temp_dir().join(format!("catus_status_timeout_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.set_transient_message("test message");
+        assert_eq!(app.status_message, "test message");
+        assert!(app.status_message_clear_at.is_some());
+
+        // Force the clear time into the past.
+        app.status_message_clear_at = Some(Instant::now() - Duration::from_secs(1));
+        app.maybe_clear_status_message();
+        assert!(app.status_message.is_empty());
+        assert!(app.status_message_clear_at.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn error_status_auto_clears_after_timeout() {
+        let dir = std::env::temp_dir().join(format!("catus_error_timeout_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.set_error("something went wrong");
+        assert_eq!(app.status, AppStatus::Error);
+
+        app.status_message_clear_at = Some(Instant::now() - Duration::from_secs(1));
+        app.maybe_clear_status_message();
+        assert_eq!(app.status, AppStatus::Idle);
+        assert!(app.status_message.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

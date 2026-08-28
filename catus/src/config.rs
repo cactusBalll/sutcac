@@ -6,14 +6,14 @@
 //! 2. `$XDG_CONFIG_HOME/catus/config.toml`
 //! 3. `~/.config/catus/config.toml`
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use log::LevelFilter;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sutcac_sh::config::ShellConfig;
 
 /// Full application configuration.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub api: ApiConfig,
@@ -22,7 +22,7 @@ pub struct AppConfig {
 }
 
 /// OpenAI-compatible API configuration.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(default)]
 pub struct ApiConfig {
     pub base_url: String,
@@ -31,7 +31,7 @@ pub struct ApiConfig {
 }
 
 /// Agent behavior configuration.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(default)]
 pub struct AgentConfig {
     pub system_prompt: String,
@@ -116,6 +116,16 @@ impl AppConfig {
             "error" => LevelFilter::Error,
             _ => LevelFilter::Info,
         }
+    }
+
+    /// Save the configuration to the given TOML file path.
+    pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string_pretty(self)?;
+        std::fs::write(path, contents)?;
+        Ok(())
     }
 
     /// Return the path of the config file that would be used.

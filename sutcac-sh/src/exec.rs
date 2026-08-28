@@ -108,6 +108,16 @@ impl ShellState {
         state
     }
 
+    /// Replace the permission policy at runtime.
+    pub fn set_permission_policy(&mut self, permissions: PermissionPolicy) {
+        self.permissions = permissions;
+    }
+
+    /// Replace the audit logger at runtime.
+    pub fn set_audit_logger(&mut self, logger: AuditLogger) {
+        self.audit_logger = logger;
+    }
+
     pub fn expand_context(&self) -> ExpandContext<'_> {
         ExpandContext::new(&self.vars, &self.args, self.last_status, self.pid)
     }

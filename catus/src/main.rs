@@ -176,7 +176,7 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
     let mut should_quit = false;
 
     while !should_quit {
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
         tokio::select! {
             Some(event) = ui_rx.recv() => {
@@ -219,10 +219,10 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                                 app.scroll_to_bottom();
                             }
                             KeyCode::Esc => {
+                                // Esc only dismisses completion candidates or overlays;
+                                // use /exit or Ctrl+C to quit.
                                 if app.selected_candidate.is_some() {
                                     app.clear_candidate_selection();
-                                } else {
-                                    should_quit = true;
                                 }
                             }
                             KeyCode::Enter => {
@@ -252,10 +252,18 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                                 app.cycle_candidate(-1);
                             }
                             KeyCode::Up => {
-                                app.history_previous();
+                                if app.input.starts_with('/') && !app.candidates.is_empty() {
+                                    app.cycle_candidate(-1);
+                                } else {
+                                    app.history_previous();
+                                }
                             }
                             KeyCode::Down => {
-                                app.history_next();
+                                if app.input.starts_with('/') && !app.candidates.is_empty() {
+                                    app.cycle_candidate(1);
+                                } else {
+                                    app.history_next();
+                                }
                             }
                             KeyCode::PageUp => {
                                 app.scroll_up(10);
@@ -264,6 +272,10 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                                 app.scroll_down(10);
                             }
                             _ => {}
+                        }
+
+                        if app.should_quit {
+                            should_quit = true;
                         }
                     }
                     UiEvent::Mouse(mouse) => {

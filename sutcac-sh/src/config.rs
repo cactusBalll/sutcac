@@ -12,13 +12,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditFormat, AuditLogger};
 use crate::permissions::{Permission, PermissionPolicy, PermissionSet};
 
 /// The `[shell]` section of the shared TOML configuration file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ShellConfig {
     /// Permission mode string, e.g. `allow_all`, `deny:write`, `allow:read`.
