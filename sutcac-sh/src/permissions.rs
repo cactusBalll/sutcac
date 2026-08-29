@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// A single permission class.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -159,6 +160,29 @@ impl fmt::Display for PermissionSet {
     }
 }
 
+/// Access mode for a filesystem path referenced by a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathAccess {
+    Read,
+    Write,
+}
+
+/// A filesystem path referenced by a command, classified by intended access.
+#[derive(Debug, Clone)]
+pub struct CommandPath {
+    pub path: PathBuf,
+    pub access: PathAccess,
+}
+
+impl CommandPath {
+    pub fn new(path: impl Into<PathBuf>, access: PathAccess) -> Self {
+        Self {
+            path: path.into(),
+            access,
+        }
+    }
+}
+
 /// Policy mode: how to evaluate a required permission set.
 #[derive(Debug, Clone)]
 pub enum PermissionMode {
@@ -189,6 +213,10 @@ pub struct PermissionPolicy {
     pub allow1: HashSet<String>,
     /// Commands that are always denied, regardless of the mode.
     pub deny1: HashSet<String>,
+    /// Allowed read-only paths. Empty means no path restriction.
+    pub read_paths: Vec<PathBuf>,
+    /// Allowed read-write paths. Empty means no path restriction.
+    pub write_paths: Vec<PathBuf>,
 }
 
 /// Error returned when a required permission is denied.
@@ -240,6 +268,8 @@ impl PermissionPolicy {
             command_permissions: HashMap::new(),
             allow1: HashSet::new(),
             deny1: HashSet::new(),
+            read_paths: Vec::new(),
+            write_paths: Vec::new(),
         }
     }
 
@@ -325,6 +355,8 @@ impl PermissionPolicy {
             command_permissions: HashMap::new(),
             allow1,
             deny1,
+            read_paths: Vec::new(),
+            write_paths: Vec::new(),
         };
         for (name, perms) in command_permissions {
             policy.command_permissions.insert(name, perms);
@@ -388,6 +420,101 @@ impl PermissionPolicy {
         }
         self.check(required)
     }
+
+    /// Check whether the filesystem paths referenced by a command are allowed.
+    /// Empty path lists mean the feature is disabled and all paths are allowed.
+    /// `cwd` is the shell's current working directory, used to resolve relative paths.
+    pub fn check_paths(&self, paths: &[CommandPath], cwd: &Path) -> Result<(), PermissionError> {
+        if self.read_paths.is_empty() && self.write_paths.is_empty() {
+            return Ok(());
+        }
+        for cp in paths {
+            let resolved = resolve_check_path(&cp.path, cwd);
+            let Some(resolved) = resolved else {
+                return Err(PermissionError::with_reason(
+                    match cp.access {
+                        PathAccess::Read => PermissionSet::read(),
+                        PathAccess::Write => PermissionSet::write(),
+                    },
+                    format!("cannot resolve path {:?}", cp.path),
+                ));
+            };
+            match cp.access {
+                PathAccess::Read => {
+                    if !self.is_readable(&resolved, cwd) {
+                        return Err(PermissionError::with_reason(
+                            PermissionSet::read(),
+                            format!("read path {:?} is outside allowed paths", cp.path),
+                        ));
+                    }
+                }
+                PathAccess::Write => {
+                    if !self.is_writable(&resolved, cwd) {
+                        return Err(PermissionError::with_reason(
+                            PermissionSet::write(),
+                            format!("write path {:?} is outside allowed paths", cp.path),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_readable(&self, resolved: &Path, cwd: &Path) -> bool {
+        self.path_within_any(resolved, &[cwd.to_path_buf()])
+            || self.path_within_any(resolved, &self.read_paths)
+            || self.path_within_any(resolved, &self.write_paths)
+    }
+
+    fn is_writable(&self, resolved: &Path, cwd: &Path) -> bool {
+        self.path_within_any(resolved, &[cwd.to_path_buf()])
+            || self.path_within_any(resolved, &self.write_paths)
+    }
+
+    fn path_within_any(&self, resolved: &Path, allowed: &[PathBuf]) -> bool {
+        allowed.iter().any(|base| resolved.starts_with(base))
+    }
+
+    /// Replace the allowed path lists. Paths are canonicalized; entries that fail
+    /// to resolve are silently ignored.
+    pub fn with_paths(mut self, read_paths: &[PathBuf], write_paths: &[PathBuf]) -> Self {
+        self.read_paths = canonicalize_paths(read_paths);
+        self.write_paths = canonicalize_paths(write_paths);
+        self
+    }
+}
+
+/// Canonicalize a list of paths, skipping entries that do not exist.
+fn canonicalize_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    paths.iter().filter_map(|p| p.canonicalize().ok()).collect()
+}
+
+/// Resolve a path for containment checks. Returns the canonical path if it
+/// exists, otherwise canonicalizes the nearest existing ancestor and appends
+/// the remaining suffix. Returns `None` if no ancestor can be resolved.
+fn resolve_check_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+
+    if let Ok(canon) = abs.canonicalize() {
+        return Some(canon);
+    }
+
+    let mut current = abs.as_path();
+    while let Some(parent) = current.parent() {
+        if let Ok(canon_parent) = parent.canonicalize() {
+            if let Ok(suffix) = abs.strip_prefix(parent) {
+                return Some(canon_parent.join(suffix));
+            }
+        }
+        current = parent;
+    }
+
+    None
 }
 
 /// Return true if `name` (or its basename) appears in `set`.
@@ -547,5 +674,128 @@ mod tests {
             Some(&PermissionSet::read())
         );
         assert!(policy.permissions_for_command("unknown").is_none());
+    }
+
+    #[test]
+    fn empty_path_lists_allow_all_paths() {
+        let policy = PermissionPolicy::allow_all();
+        policy
+            .check_paths(
+                &[CommandPath::new("/etc/passwd", PathAccess::Read)],
+                Path::new("/"),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn read_paths_restrict_read_access() {
+        let tmp = std::env::temp_dir();
+        let allowed = tmp.join("sutcac_allowed");
+        let _ = std::fs::create_dir_all(&allowed);
+        let denied = tmp.join("sutcac_denied");
+        let _ = std::fs::create_dir_all(&denied);
+
+        let policy = PermissionPolicy::allow_all().with_paths(&[allowed.clone()], &[]);
+        // Use allowed as cwd so cwd itself is allowed, but denied remains outside.
+        policy
+            .check_paths(&[CommandPath::new(&allowed, PathAccess::Read)], &allowed)
+            .unwrap();
+        assert!(
+            policy
+                .check_paths(&[CommandPath::new(&denied, PathAccess::Read)], &allowed)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn write_paths_require_writable_list() {
+        let tmp = std::env::temp_dir();
+        let read_only = tmp.join("sutcac_readonly");
+        let writable = tmp.join("sutcac_writable");
+        let _ = std::fs::create_dir_all(&read_only);
+        let _ = std::fs::create_dir_all(&writable);
+
+        let policy =
+            PermissionPolicy::allow_all().with_paths(&[read_only.clone()], &[writable.clone()]);
+        // Use writable as cwd so cwd is writable, but read_only remains outside.
+        policy
+            .check_paths(&[CommandPath::new(&read_only, PathAccess::Read)], &writable)
+            .unwrap();
+        assert!(
+            policy
+                .check_paths(
+                    &[CommandPath::new(&read_only, PathAccess::Write)],
+                    &writable
+                )
+                .is_err()
+        );
+        policy
+            .check_paths(&[CommandPath::new(&writable, PathAccess::Write)], &writable)
+            .unwrap();
+    }
+
+    #[test]
+    fn write_paths_are_readable() {
+        let tmp = std::env::temp_dir();
+        let writable = tmp.join("sutcac_rw");
+        let _ = std::fs::create_dir_all(&writable);
+
+        let policy = PermissionPolicy::allow_all().with_paths(&[], &[writable.clone()]);
+        policy
+            .check_paths(&[CommandPath::new(&writable, PathAccess::Read)], &tmp)
+            .unwrap();
+    }
+
+    #[test]
+    fn nonexistent_path_within_allowed_parent_is_ok() {
+        let tmp = std::env::temp_dir();
+        let allowed = tmp.join("sutcac_parent");
+        let _ = std::fs::create_dir_all(&allowed);
+        let child = allowed.join("does_not_exist_yet.txt");
+
+        let policy = PermissionPolicy::allow_all().with_paths(&[], &[allowed.clone()]);
+        policy
+            .check_paths(&[CommandPath::new(&child, PathAccess::Write)], &tmp)
+            .unwrap();
+    }
+
+    #[test]
+    fn cwd_is_always_readable_and_writable() {
+        let tmp = std::env::temp_dir().join("sutcac_cwd_test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file_in_cwd = tmp.join("in_cwd.txt");
+        std::fs::write(&file_in_cwd, "data").unwrap();
+
+        // Allowed paths only include an unrelated directory.
+        let unrelated = std::env::temp_dir().join("sutcac_cwd_unrelated");
+        let outside = std::env::temp_dir().join("sutcac_cwd_outside");
+        let _ = std::fs::remove_dir_all(&unrelated);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let policy = PermissionPolicy::allow_all().with_paths(&[unrelated.clone()], &[]);
+
+        // Reading and writing under cwd is allowed even though cwd is not in
+        // the configured read_paths/write_paths.
+        policy
+            .check_paths(&[CommandPath::new(&file_in_cwd, PathAccess::Read)], &tmp)
+            .unwrap();
+        policy
+            .check_paths(
+                &[CommandPath::new(
+                    tmp.join("new_file.txt"),
+                    PathAccess::Write,
+                )],
+                &tmp,
+            )
+            .unwrap();
+
+        // A path outside both cwd and allowed lists is still blocked.
+        assert!(
+            policy
+                .check_paths(&[CommandPath::new(&outside, PathAccess::Read)], &tmp)
+                .is_err()
+        );
     }
 }

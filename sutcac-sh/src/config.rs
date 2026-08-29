@@ -40,6 +40,12 @@ pub struct ShellConfig {
     /// equivalent to listing each command under `[shell.commands]` with
     /// `tags = ["write"]`. Entries in `commands` take precedence.
     pub write: Option<Vec<String>>,
+    /// Allowed read-only paths. Commands that read files may only access paths
+    /// inside these directories (or inside `write_paths`). Empty means no restriction.
+    pub read_paths: Option<Vec<String>>,
+    /// Allowed read-write paths. Commands that write files may only access paths
+    /// inside these directories. Empty means no restriction.
+    pub write_paths: Option<Vec<String>>,
 }
 
 impl Default for ShellConfig {
@@ -52,6 +58,8 @@ impl Default for ShellConfig {
             commands: None,
             read: None,
             write: None,
+            read_paths: None,
+            write_paths: None,
         }
     }
 }
@@ -117,7 +125,7 @@ impl ShellConfig {
     /// per-command permission overrides.
     pub fn permission_policy(&self) -> PermissionPolicy {
         let command_permissions = self.parse_command_permissions();
-        match &self.perm_mode {
+        let mut policy = match &self.perm_mode {
             Some(s) => PermissionPolicy::parse_with_commands(s, command_permissions)
                 .unwrap_or_else(PermissionPolicy::allow_all),
             None => {
@@ -127,7 +135,22 @@ impl ShellConfig {
                 }
                 policy
             }
-        }
+        };
+        policy.read_paths = self.canonicalize_paths(&self.read_paths);
+        policy.write_paths = self.canonicalize_paths(&self.write_paths);
+        policy
+    }
+
+    fn canonicalize_paths(&self, paths: &Option<Vec<String>>) -> Vec<std::path::PathBuf> {
+        paths
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .map(std::path::PathBuf::from)
+                    .filter_map(|p| p.canonicalize().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn parse_command_permissions(&self) -> HashMap<String, PermissionSet> {

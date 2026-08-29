@@ -50,3 +50,9 @@ read = [
 [shell.commands]
 curl = ["network", "read"]
 clip = ["clipboard"]
+
+# Optional path-based access control. Paths are canonicalized when the config
+# is loaded; relative paths are resolved against the working directory at load
+# time, not at command execution time. Empty lists mean no restriction.
+# read_paths = ["/home/user/data", "/tmp"]
+# write_paths = ["/home/user/projects"]

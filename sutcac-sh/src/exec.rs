@@ -7,11 +7,11 @@ use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::ast::*;
-use crate::audit::{AuditEvent, AuditLogger};
+use crate::audit::{AuditEvent, AuditLogger, AuditScope};
 use crate::builtin;
 use crate::expand::{ExpandContext, expand_single, expand_word};
 use crate::parser::Parser;
-use crate::permissions::{PermissionPolicy, PermissionSet};
+use crate::permissions::{CommandPath, PathAccess, PermissionPolicy, PermissionSet};
 
 /// Return a helpful error message when a command cannot be found.
 fn command_not_found_message(name: &str) -> String {
@@ -254,30 +254,138 @@ fn redirect_permissions_with_path(kind: RedirectKind, path: &str) -> PermissionS
     }
 }
 
-pub fn execute_command(cmd: &Command, state: &mut ShellState) -> CommandOutput {
-    let summary = command_summary(cmd);
-    let required = command_permissions(cmd, &state.permissions, state);
-    state.audit_logger.log(AuditEvent::CommandStart {
-        cmd: summary.clone(),
-        required,
-    });
+/// Return true if a string argument looks like a filesystem path.
+fn looks_like_path(s: &str, cwd: &std::path::Path) -> bool {
+    if s.starts_with('/') || s.starts_with("./") || s.starts_with("../") || s.starts_with('~') {
+        return true;
+    }
+    if s.contains('/') {
+        return true;
+    }
+    // Existing relative file/directory.
+    cwd.join(s).exists()
+}
 
-    let output = match cmd {
-        Command::Simple(c) => execute_simple(c, state),
+/// Extract path arguments from an option-like token such as `-o=/tmp/foo`.
+fn extract_path_from_option(s: &str) -> Option<&str> {
+    let (_, value) = s.split_once('=')?;
+    if value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('~')
+    {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Return the filesystem paths referenced by a simple command's arguments and
+/// redirects, classified by access mode.
+fn simple_command_paths(
+    cmd: &SimpleCommand,
+    argv: &[String],
+    required: &PermissionSet,
+    state: &ShellState,
+) -> Vec<CommandPath> {
+    let mut paths = Vec::new();
+
+    // Redirect targets are always paths.
+    let mut ctx = state.expand_context();
+    for redir in &cmd.redirects {
+        let target = expand_single(&redir.target.value, &mut ctx).unwrap_or_default();
+        let access = match redir.kind {
+            RedirectKind::Read | RedirectKind::Here | RedirectKind::DupInput => PathAccess::Read,
+            RedirectKind::Write
+            | RedirectKind::Append
+            | RedirectKind::ReadWrite
+            | RedirectKind::DupOutput => PathAccess::Write,
+        };
+        paths.push(CommandPath::new(target, access));
+    }
+
+    // Command argument paths.
+    let arg_access = if required.contains(&crate::permissions::Permission::Write) {
+        PathAccess::Write
+    } else {
+        PathAccess::Read
+    };
+
+    for arg in argv.iter().skip(1) {
+        if looks_like_path(arg, &state.cwd) {
+            paths.push(CommandPath::new(arg, arg_access));
+        } else if let Some(path_part) = extract_path_from_option(arg) {
+            paths.push(CommandPath::new(path_part, arg_access));
+        }
+    }
+
+    paths
+}
+
+pub fn execute_command(cmd: &Command, state: &mut ShellState) -> CommandOutput {
+    execute_command_scoped(cmd, state, AuditScope::TopLevel)
+}
+
+fn execute_command_scoped(
+    cmd: &Command,
+    state: &mut ShellState,
+    scope: AuditScope,
+) -> CommandOutput {
+    match cmd {
+        Command::Simple(c) => {
+            let summary = command_summary(cmd);
+            let required = command_permissions(cmd, &state.permissions, state);
+            state.audit_logger.log(AuditEvent::CommandStart {
+                cmd: summary.clone(),
+                required,
+                scope,
+            });
+            let output = execute_simple(c, state, scope);
+            state.last_status = output.status;
+            state.audit_logger.log(AuditEvent::CommandEnd {
+                cmd: summary,
+                status: output.status,
+                stdout: output.stdout.clone(),
+                stderr: output.stderr.clone(),
+                scope,
+            });
+            output
+        }
+        Command::Pipeline(cmds) => {
+            let summary = command_summary(cmd);
+            let required = command_permissions(cmd, &state.permissions, state);
+            state.audit_logger.log(AuditEvent::CommandStart {
+                cmd: summary.clone(),
+                required,
+                scope,
+            });
+            let output = execute_pipeline(cmds, state);
+            state.last_status = output.status;
+            state.audit_logger.log(AuditEvent::CommandEnd {
+                cmd: summary,
+                status: output.status,
+                stdout: output.stdout.clone(),
+                stderr: output.stderr.clone(),
+                scope,
+            });
+            output
+        }
         Command::Connection { left, op, right } => {
-            let left_output = execute_command(left, state);
+            // Connection operators (`&&`, `||`, `;`) are not themselves audited;
+            // their children are recorded as sub-commands.
+            let left_output = execute_command_scoped(left, state, AuditScope::SubCommand);
             let right_output = match op {
-                ListOp::Semi => execute_command(right, state),
+                ListOp::Semi => execute_command_scoped(right, state, AuditScope::SubCommand),
                 ListOp::And => {
                     if left_output.status == 0 {
-                        execute_command(right, state)
+                        execute_command_scoped(right, state, AuditScope::SubCommand)
                     } else {
                         left_output.clone()
                     }
                 }
                 ListOp::Or => {
                     if left_output.status != 0 {
-                        execute_command(right, state)
+                        execute_command_scoped(right, state, AuditScope::SubCommand)
                     } else {
                         left_output.clone()
                     }
@@ -290,40 +398,56 @@ pub fn execute_command(cmd: &Command, state: &mut ShellState) -> CommandOutput {
             stdout.push_str(&right_output.stdout);
             let mut stderr = left_output.stderr;
             stderr.push_str(&right_output.stderr);
-            CommandOutput::with_output(right_output.status, stdout, stderr)
+            let output = CommandOutput::with_output(right_output.status, stdout, stderr);
+            state.last_status = output.status;
+            output
         }
-        Command::Pipeline(cmds) => execute_pipeline(cmds, state),
-        Command::Group(body) => execute_list(body, state),
-        Command::Subshell(body) => execute_subshell(body, state),
+        Command::Group(body) => {
+            let output = execute_list(body, state, AuditScope::SubCommand);
+            state.last_status = output.status;
+            output
+        }
+        Command::Subshell(body) => {
+            let output = execute_subshell(body, state);
+            state.last_status = output.status;
+            output
+        }
         Command::If {
             cond,
             then_part,
             elifs,
             else_part,
-        } => execute_if(cond, then_part, elifs, else_part, state),
-        Command::While { cond, body } => execute_while(cond, body, state),
-        Command::For { var, words, body } => execute_for(var, words, body, state),
-        Command::Case { word, arms } => execute_case(word, arms, state),
+        } => {
+            let output = execute_if(cond, then_part, elifs, else_part, state);
+            state.last_status = output.status;
+            output
+        }
+        Command::While { cond, body } => {
+            let output = execute_while(cond, body, state);
+            state.last_status = output.status;
+            output
+        }
+        Command::For { var, words, body } => {
+            let output = execute_for(var, words, body, state);
+            state.last_status = output.status;
+            output
+        }
+        Command::Case { word, arms } => {
+            let output = execute_case(word, arms, state);
+            state.last_status = output.status;
+            output
+        }
         Command::FunctionDef { name, body } => {
             state.funcs.insert(name.clone(), *body.clone());
             CommandOutput::new(0)
         }
-    };
-
-    state.last_status = output.status;
-    state.audit_logger.log(AuditEvent::CommandEnd {
-        cmd: summary,
-        status: output.status,
-        stdout: output.stdout.clone(),
-        stderr: output.stderr.clone(),
-    });
-    output
+    }
 }
 
-fn execute_list(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
+fn execute_list(cmds: &[Command], state: &mut ShellState, scope: AuditScope) -> CommandOutput {
     let mut output = CommandOutput::new(0);
     for cmd in cmds {
-        let next = execute_command(cmd, state);
+        let next = execute_command_scoped(cmd, state, scope);
         output.status = next.status;
         output.stdout.push_str(&next.stdout);
         output.stderr.push_str(&next.stderr);
@@ -331,7 +455,7 @@ fn execute_list(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
     output
 }
 
-fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState) -> CommandOutput {
+fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState, scope: AuditScope) -> CommandOutput {
     // Expand assignments and words with command substitution support.  We use a
     // cloned shell state for substitutions so they cannot mutate the parent
     // state; the context is scoped so the original state can be used afterwards.
@@ -408,12 +532,28 @@ fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState) -> CommandOutput 
     // Permission check for builtins and external commands. Function bodies are
     // checked recursively when their internal commands execute.
     let required = simple_command_permissions(cmd, &state.permissions, state);
+
+    // Path-based access control: check arguments and redirects before the
+    // command is allowed to run.
+    let command_paths = simple_command_paths(cmd, &argv, &required, state);
+    if let Err(e) = state.permissions.check_paths(&command_paths, &state.cwd) {
+        let msg = e.to_string();
+        state.audit_logger.log(AuditEvent::PermissionDenied {
+            cmd: command_summary(&Command::Simple(cmd.clone())),
+            required,
+            reason: msg.clone(),
+            scope,
+        });
+        return CommandOutput::with_output(126, String::new(), format!("sutcac-sh: {}", msg));
+    }
+
     if let Err(e) = state.permissions.check_command(name, &required) {
         let msg = e.to_string();
         state.audit_logger.log(AuditEvent::PermissionDenied {
             cmd: command_summary(&Command::Simple(cmd.clone())),
             required,
             reason: msg.clone(),
+            scope,
         });
         return CommandOutput::with_output(126, String::new(), format!("sutcac-sh: {}", msg));
     }
@@ -443,7 +583,7 @@ fn execute_substitution(inner: &str, state: &mut ShellState) -> Result<String, S
     })?;
     let mut stdout = String::new();
     for cmd in cmds {
-        let out = execute_command(&cmd, state);
+        let out = execute_command_scoped(&cmd, state, AuditScope::SubCommand);
         state.last_status = out.status;
         stdout.push_str(&out.stdout);
     }
@@ -470,7 +610,7 @@ fn expand_ctx_with_subst<'a>(
 fn execute_function(body: &Command, args: &[String], state: &mut ShellState) -> CommandOutput {
     let saved = std::mem::take(&mut state.args);
     state.args = args.to_vec();
-    let output = execute_command(body, state);
+    let output = execute_command_scoped(body, state, AuditScope::SubCommand);
     state.args = saved;
     output
 }
@@ -784,6 +924,18 @@ fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
                         ),
                     );
                 }
+
+                // Path-based access control for this pipeline segment.
+                let required = simple_command_permissions(c, &state.permissions, state);
+                let command_paths = simple_command_paths(c, &argv, &required, state);
+                if let Err(e) = state.permissions.check_paths(&command_paths, &state.cwd) {
+                    return CommandOutput::with_output(
+                        126,
+                        String::new(),
+                        format!("sutcac-sh: {}", e),
+                    );
+                }
+
                 let name = argv[0].clone();
                 let args = argv[1..].to_vec();
                 externals.push((name, args, c.redirects.clone()));
@@ -1021,7 +1173,7 @@ fn execute_subshell(body: &[Command], state: &mut ShellState) -> CommandOutput {
     // Simulate a subshell by cloning state, executing, and discarding mutations.
     // The audit logger is shared so the trace remains complete.
     let mut subshell_state = state.clone();
-    execute_list(body, &mut subshell_state)
+    execute_list(body, &mut subshell_state, AuditScope::SubCommand)
 }
 
 fn execute_if(
@@ -1031,24 +1183,24 @@ fn execute_if(
     else_part: &[Command],
     state: &mut ShellState,
 ) -> CommandOutput {
-    if execute_command(cond, state).status == 0 {
-        return execute_list(then_part, state);
+    if execute_command_scoped(cond, state, AuditScope::SubCommand).status == 0 {
+        return execute_list(then_part, state, AuditScope::SubCommand);
     }
     for (elif_cond, elif_body) in elifs {
-        if execute_command(elif_cond, state).status == 0 {
-            return execute_list(elif_body, state);
+        if execute_command_scoped(elif_cond, state, AuditScope::SubCommand).status == 0 {
+            return execute_list(elif_body, state, AuditScope::SubCommand);
         }
     }
-    execute_list(else_part, state)
+    execute_list(else_part, state, AuditScope::SubCommand)
 }
 
 fn execute_while(cond: &Command, body: &[Command], state: &mut ShellState) -> CommandOutput {
     let mut output = CommandOutput::new(0);
     loop {
-        if execute_command(cond, state).status != 0 {
+        if execute_command_scoped(cond, state, AuditScope::SubCommand).status != 0 {
             break;
         }
-        let next = execute_list(body, state);
+        let next = execute_list(body, state, AuditScope::SubCommand);
         output.status = next.status;
         output.stdout.push_str(&next.stdout);
         output.stderr.push_str(&next.stderr);
@@ -1090,7 +1242,7 @@ fn execute_for(
     let mut output = CommandOutput::new(0);
     for item in items {
         state.vars.insert(var.to_string(), item);
-        let next = execute_list(body, state);
+        let next = execute_list(body, state, AuditScope::SubCommand);
         output.status = next.status;
         output.stdout.push_str(&next.stdout);
         output.stderr.push_str(&next.stderr);
@@ -1123,7 +1275,7 @@ fn execute_case(word: &Word, arms: &[CaseArm], state: &mut ShellState) -> Comman
             };
             // Bash case patterns are literal unless they contain glob chars.
             if crate::glob::matches(&pat, &value) {
-                return execute_list(&arm.body, state);
+                return execute_list(&arm.body, state, AuditScope::SubCommand);
             }
         }
     }
@@ -1303,6 +1455,105 @@ mod tests {
     }
 
     #[test]
+    fn read_path_blocks_external_read_outside_allowed() {
+        let tmp = std::env::temp_dir().join("sutcac_path_test_read");
+        let allowed = tmp.join("allowed");
+        let denied = tmp.join("denied");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::write(allowed.join("ok.txt"), "ok").unwrap();
+        std::fs::write(denied.join("secret.txt"), "secret").unwrap();
+
+        let mut commands = HashMap::new();
+        commands.insert("cat".to_string(), PermissionSet::read());
+        let policy = PermissionPolicy::parse_with_commands("allow_all", commands)
+            .unwrap()
+            .with_paths(&[allowed.clone()], &[]);
+        let mut state = ShellState::with_policy_and_logger(policy, AuditLogger::null());
+
+        let cmd = Command::Simple(SimpleCommand {
+            words: vec![
+                crate::ast::Word::new("cat"),
+                crate::ast::Word::new(denied.join("secret.txt").to_str().unwrap()),
+            ],
+            ..Default::default()
+        });
+        assert_eq!(execute_command(&cmd, &mut state).status, 126);
+
+        let cmd = Command::Simple(SimpleCommand {
+            words: vec![
+                crate::ast::Word::new("cat"),
+                crate::ast::Word::new(allowed.join("ok.txt").to_str().unwrap()),
+            ],
+            ..Default::default()
+        });
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("ok"));
+    }
+
+    #[test]
+    fn write_path_blocks_redirect_outside_allowed() {
+        let tmp = std::env::temp_dir().join("sutcac_path_test_write");
+        let allowed = tmp.join("allowed");
+        let denied = tmp.join("denied");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&denied).unwrap();
+
+        let policy = PermissionPolicy::allow_all().with_paths(&[], &[allowed.clone()]);
+        let mut state = ShellState::with_policy_and_logger(policy, AuditLogger::null());
+
+        let blocked_cmd = format!(
+            "echo blocked > {}",
+            denied.join("out.txt").to_str().unwrap()
+        );
+        let mut parser = Parser::new(&blocked_cmd).unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        assert_eq!(execute_command(&cmd, &mut state).status, 126);
+
+        let ok_cmd = format!("echo ok > {}", allowed.join("out.txt").to_str().unwrap());
+        let mut parser = Parser::new(&ok_cmd).unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        let contents = std::fs::read_to_string(allowed.join("out.txt")).unwrap();
+        assert!(contents.contains("ok"));
+    }
+
+    #[test]
+    fn read_path_allows_pipeline_read_within_allowed() {
+        let tmp = std::env::temp_dir().join("sutcac_path_test_pipe");
+        let allowed = tmp.join("allowed");
+        let denied = tmp.join("denied");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::write(allowed.join("ok.txt"), "ok").unwrap();
+        std::fs::write(denied.join("secret.txt"), "secret").unwrap();
+
+        let mut commands = HashMap::new();
+        commands.insert("cat".to_string(), PermissionSet::read());
+        let policy = PermissionPolicy::parse_with_commands("allow_all", commands)
+            .unwrap()
+            .with_paths(&[allowed.clone()], &[]);
+        let mut state = ShellState::with_policy_and_logger(policy, AuditLogger::null());
+
+        let allowed_pipe = format!("cat {} | cat", allowed.join("ok.txt").to_str().unwrap());
+        let mut parser = Parser::new(&allowed_pipe).unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("ok"));
+
+        let pipe_cmd = format!("cat {} | cat", denied.join("secret.txt").to_str().unwrap());
+        let mut parser = Parser::new(&pipe_cmd).unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        assert_eq!(execute_command(&cmd, &mut state).status, 126);
+    }
+
+    #[test]
     fn audit_logs_start_and_end() {
         let (logger, buf) = capture_logger(crate::audit::AuditFormat::Text);
         let mut state = ShellState::with_policy_and_logger(PermissionPolicy::allow_all(), logger);
@@ -1312,8 +1563,26 @@ mod tests {
         });
         assert_eq!(execute_command(&cmd, &mut state).status, 0);
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("START cmd=\"true\""));
-        assert!(text.contains("END cmd=\"true\" status=0"));
+        assert!(text.contains("START cmd=\"true\" scope=top"));
+        assert!(text.contains("END cmd=\"true\" scope=top status=0"));
+    }
+
+    #[test]
+    fn connection_operators_are_not_audited_children_are_sub() {
+        let (logger, buf) = capture_logger(crate::audit::AuditFormat::Text);
+        let mut state = ShellState::with_policy_and_logger(PermissionPolicy::allow_all(), logger);
+        let mut parser = Parser::new("echo left && echo right").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !text.contains("connection"),
+            "connection operator should not be audited: {}",
+            text
+        );
+        assert!(text.contains("START cmd=\"echo left\" scope=sub"));
+        assert!(text.contains("START cmd=\"echo right\" scope=sub"));
     }
 
     #[test]

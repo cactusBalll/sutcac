@@ -46,6 +46,7 @@ Checked before every external command and redirection; denials return non-zero a
 - `perm_mode = "allow_all" | allow:<tags> | deny:<tags> | allow:<tags> deny:<tags> | allow1:<cmds> | deny1:<cmds>`
 - Tags are arbitrary custom strings (`read`, `write`, `network`, …); required set must be covered by allow and disjoint from deny. `deny1` beats `allow1`.
 - Per-command tags come from `[shell.commands]`; unlisted external commands default to READ+WRITE. Shorthand `read = [...]` / `write = [...]` under `[shell]` tags whole command lists; explicit `commands` entries win.
+- Path-based access control: `read_paths = ["/home/user/data"]` restricts command arguments and input redirects to those directories; `write_paths = ["/home/user/projects"]` restricts output redirects and the arguments of commands that require WRITE. Empty lists disable the restriction. Commands must be tagged READ to read from `read_paths` without also being in `write_paths`.
 
 ## Non-obvious implementation facts
 

@@ -31,6 +31,25 @@ impl AuditFormat {
     }
 }
 
+/// Execution scope of an audited command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditScope {
+    /// Command executed directly at the top level of a script or input line.
+    TopLevel,
+    /// Command executed as part of a compound construct such as a connection
+    /// (`&&`, `||`, `;`), pipeline, group, subshell, or control-flow body.
+    SubCommand,
+}
+
+impl std::fmt::Display for AuditScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuditScope::TopLevel => write!(f, "top"),
+            AuditScope::SubCommand => write!(f, "sub"),
+        }
+    }
+}
+
 /// An auditable event.
 #[derive(Debug, Clone)]
 pub enum AuditEvent {
@@ -38,6 +57,7 @@ pub enum AuditEvent {
     CommandStart {
         cmd: String,
         required: PermissionSet,
+        scope: AuditScope,
     },
     /// A command finished with a status and captured output.
     CommandEnd {
@@ -45,12 +65,14 @@ pub enum AuditEvent {
         status: i32,
         stdout: String,
         stderr: String,
+        scope: AuditScope,
     },
     /// A command was denied by the permission policy.
     PermissionDenied {
         cmd: String,
         required: PermissionSet,
         reason: String,
+        scope: AuditScope,
     },
     /// A side effect produced by a command (e.g. cd, export, exit).
     SideEffect { cmd: String, description: String },
@@ -70,28 +92,37 @@ impl AuditEvent {
     /// Render the event as a plain-text line, appending optional metadata.
     pub fn to_text(&self, timestamp: &str, meta: &HashMap<String, String>) -> String {
         let base = match self {
-            AuditEvent::CommandStart { cmd, required } => {
-                format!("[{}] START cmd={:?} required={}", timestamp, cmd, required)
+            AuditEvent::CommandStart {
+                cmd,
+                required,
+                scope,
+            } => {
+                format!(
+                    "[{}] START cmd={:?} scope={} required={}",
+                    timestamp, cmd, scope, required
+                )
             }
             AuditEvent::CommandEnd {
                 cmd,
                 status,
                 stdout,
                 stderr,
+                scope,
             } => {
                 format!(
-                    "[{}] END cmd={:?} status={} stdout={:?} stderr={:?}",
-                    timestamp, cmd, status, stdout, stderr
+                    "[{}] END cmd={:?} scope={} status={} stdout={:?} stderr={:?}",
+                    timestamp, cmd, scope, status, stdout, stderr
                 )
             }
             AuditEvent::PermissionDenied {
                 cmd,
                 required,
                 reason,
+                scope,
             } => {
                 format!(
-                    "[{}] DENIED cmd={:?} required={} reason={:?}",
-                    timestamp, cmd, required, reason
+                    "[{}] DENIED cmd={:?} scope={} required={} reason={:?}",
+                    timestamp, cmd, scope, required, reason
                 )
             }
             AuditEvent::SideEffect { cmd, description } => {
@@ -115,8 +146,13 @@ impl AuditEvent {
         ];
 
         match self {
-            AuditEvent::CommandStart { cmd, required } => {
+            AuditEvent::CommandStart {
+                cmd,
+                required,
+                scope,
+            } => {
                 parts.push(format!("\"cmd\":{}", json_string(cmd)));
+                parts.push(format!("\"scope\":\"{}\"", scope));
                 parts.push(format!("\"required\":\"{}\"", required));
             }
             AuditEvent::CommandEnd {
@@ -124,8 +160,10 @@ impl AuditEvent {
                 status,
                 stdout,
                 stderr,
+                scope,
             } => {
                 parts.push(format!("\"cmd\":{}", json_string(cmd)));
+                parts.push(format!("\"scope\":\"{}\"", scope));
                 parts.push(format!("\"status\":{}", status));
                 parts.push(format!("\"stdout\":{}", json_string(stdout)));
                 parts.push(format!("\"stderr\":{}", json_string(stderr)));
@@ -134,8 +172,10 @@ impl AuditEvent {
                 cmd,
                 required,
                 reason,
+                scope,
             } => {
                 parts.push(format!("\"cmd\":{}", json_string(cmd)));
+                parts.push(format!("\"scope\":\"{}\"", scope));
                 parts.push(format!("\"required\":\"{}\"", required));
                 parts.push(format!("\"reason\":{}", json_string(reason)));
             }
@@ -286,16 +326,20 @@ mod tests {
         logger.log(AuditEvent::CommandStart {
             cmd: "echo hi".into(),
             required: PermissionSet::empty(),
+            scope: AuditScope::TopLevel,
         });
         logger.log(AuditEvent::CommandEnd {
             cmd: "echo hi".into(),
             status: 0,
             stdout: "hi\n".into(),
             stderr: "".into(),
+            scope: AuditScope::TopLevel,
         });
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(text.contains("START cmd=\"echo hi\" required=NONE"));
-        assert!(text.contains("END cmd=\"echo hi\" status=0 stdout=\"hi\\n\" stderr=\"\""));
+        assert!(text.contains("START cmd=\"echo hi\" scope=top required=NONE"));
+        assert!(
+            text.contains("END cmd=\"echo hi\" scope=top status=0 stdout=\"hi\\n\" stderr=\"\"")
+        );
     }
 
     #[test]
@@ -306,10 +350,12 @@ mod tests {
             status: 0,
             stdout: "hi\n".into(),
             stderr: "".into(),
+            scope: AuditScope::TopLevel,
         });
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(text.contains("\"event\":\"end\""));
         assert!(text.contains("\"cmd\":\"echo hi\""));
+        assert!(text.contains("\"scope\":\"top\""));
         assert!(text.contains("\"status\":0"));
         assert!(text.contains("\"stdout\":\"hi\\n\""));
         assert!(text.contains("\"stderr\":\"\""));
@@ -328,6 +374,7 @@ mod tests {
         logger.log(AuditEvent::CommandStart {
             cmd: "echo hi".into(),
             required: PermissionSet::empty(),
+            scope: AuditScope::TopLevel,
         });
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(text.contains("meta=[session=abc]"));
@@ -346,6 +393,7 @@ mod tests {
         logger.log(AuditEvent::CommandStart {
             cmd: "echo hi".into(),
             required: PermissionSet::empty(),
+            scope: AuditScope::TopLevel,
         });
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(text.contains("\"session\":\"abc\""));
