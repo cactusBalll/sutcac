@@ -1,0 +1,8 @@
+hello $var
+hello world
+hello "quoted" world
+$var
+hi there world
+xabc
+one two three
+one two three

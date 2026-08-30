@@ -1,0 +1,13 @@
+colon=0
+true=0
+false=1
+pwd=/tmp
+pwd2=/var
+FOO=bar
+BAZ=qux
+sh exists
+tmp is dir
+strings equal
+3 lt 5
+all=1 2 3 4
+after=3 4

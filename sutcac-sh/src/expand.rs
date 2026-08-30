@@ -18,6 +18,12 @@ pub struct ExpandContext<'a> {
     pub last_bg_pid: Option<u32>,
     /// Optional executor for `$(...)` command substitutions.
     pub subst: Option<&'a mut dyn FnMut(&str) -> Result<String, String>>,
+    /// Buffer that accumulates variable side effects produced by `$((...))`
+    /// arithmetic expansion (e.g. `++`/`--` and assignments). The caller is
+    /// responsible for applying these updates to the shell state after expansion.
+    /// `None` means side effects are discarded (used for contexts where the
+    /// caller does not need to apply updates).
+    pub arith_updates: Option<&'a mut Vec<(String, i64)>>,
 }
 
 impl<'a> ExpandContext<'a> {
@@ -34,6 +40,7 @@ impl<'a> ExpandContext<'a> {
             pid,
             last_bg_pid: None,
             subst: None,
+            arith_updates: None,
         }
     }
 }
@@ -199,8 +206,20 @@ fn expand_dollar(
                     chars.next();
                 }
                 let expr = expand_arith_expr(&expr, ctx)?;
-                let val = arith::evaluate(&expr, &mut ctx.vars.clone())
+                let mut arith_vars = ctx.vars.clone();
+                let val = arith::evaluate(&expr, &mut arith_vars)
                     .map_err(|e| format!("arithmetic error: {}. Hint: use integer expressions only and avoid division by zero.", e))?;
+                if let Some(updates) = ctx.arith_updates.as_mut() {
+                    for (name, value) in &arith_vars {
+                        let changed =
+                            ctx.vars.get(name).map(|s| s.as_str()) != Some(value.as_str());
+                        if changed {
+                            if let Ok(n) = value.parse::<i64>() {
+                                updates.push((name.clone(), n));
+                            }
+                        }
+                    }
+                }
                 push_seg(segments, val.to_string(), in_double_quotes);
             } else {
                 let inner = read_balanced(chars, '(', ')');
@@ -653,7 +672,7 @@ fn split_words(segments: Vec<Segment>) -> Vec<Segment> {
         }
         if seg.quoted {
             current.push_str(&seg.value);
-            current_quoted = seg.boundary || current_quoted;
+            current_quoted = true;
         } else {
             let parts: Vec<&str> = seg.value.split(is_ifs).collect();
             for part in parts {
@@ -671,7 +690,7 @@ fn split_words(segments: Vec<Segment>) -> Vec<Segment> {
         }
     }
 
-    if !current.is_empty() {
+    if !current.is_empty() || current_quoted {
         fields.push(Segment {
             value: current,
             quoted: current_quoted,
@@ -716,6 +735,7 @@ mod tests {
             pid: 1234,
             last_bg_pid: None,
             subst: None,
+            arith_updates: None,
         }
     }
 
@@ -727,6 +747,29 @@ mod tests {
         assert_eq!(expand_word("$X", &mut c).unwrap(), vec!["hello"]);
         assert_eq!(expand_word("'$X'", &mut c).unwrap(), vec!["$X"]);
         assert_eq!(expand_word("\"$X\"", &mut c).unwrap(), vec!["hello"]);
+    }
+
+    #[test]
+    fn quoted_glob_is_literal() {
+        let mut c = ctx_with_vars(HashMap::new());
+        assert_eq!(expand_word("'*.txt'", &mut c).unwrap(), vec!["*.txt"]);
+        assert_eq!(expand_word("\"*.txt\"", &mut c).unwrap(), vec!["*.txt"]);
+    }
+
+    #[test]
+    fn quoted_glob_with_matching_files_is_literal() {
+        let dir = std::env::temp_dir().join("sutcac_sh_quoted_glob_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("a.txt")).unwrap();
+        std::fs::File::create(dir.join("b.txt")).unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let mut c = ctx_with_vars(HashMap::new());
+        assert_eq!(expand_word("'*.txt'", &mut c).unwrap(), vec!["*.txt"]);
+        assert_eq!(expand_word("\"*.txt\"", &mut c).unwrap(), vec!["*.txt"]);
+        std::env::set_current_dir(original).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -798,6 +841,7 @@ mod tests {
             pid: 1234,
             last_bg_pid: None,
             subst: Some(&mut executor),
+            arith_updates: None,
         };
         assert_eq!(expand_word("$(echo hi)", &mut c).unwrap(), vec!["hi"]);
         assert_eq!(expand_word("x$(echo hi)y", &mut c).unwrap(), vec!["xhiy"]);

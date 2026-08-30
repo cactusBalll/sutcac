@@ -252,6 +252,15 @@ impl<'a> Parser<'a> {
             return Ok(Command::Continue(n));
         }
 
+        // Negation prefix: `! cmd` inverts the exit status of the following
+        // command. This works at the start of any command position, including
+        // inside `&&`/`||` chains and standalone pipelines.
+        if self.word_is("!") {
+            self.bump();
+            let inner = self.parse_command()?;
+            return Ok(Command::Negation(Box::new(inner)));
+        }
+
         self.parse_simple_command(None)
     }
 

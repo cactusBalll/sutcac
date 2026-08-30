@@ -525,8 +525,9 @@ fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState, scope: AuditScope
     let mut subst_state = state.clone();
     let mut executor =
         |inner: &str| -> Result<String, String> { execute_substitution(inner, &mut subst_state) };
+    let mut arith_updates = Vec::new();
     let (expanded_assignments, expanded) = {
-        let mut ctx = expand_ctx_with_subst(state, &mut executor);
+        let mut ctx = expand_ctx_with_subst(state, &mut executor, &mut arith_updates);
 
         // Expand environment assignments first.
         let mut assignments = Vec::new();
@@ -542,10 +543,6 @@ fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState, scope: AuditScope
                 }
             };
             assignments.push((name.clone(), value));
-        }
-
-        if cmd.words.is_empty() {
-            return CommandOutput::new(0);
         }
 
         let mut expanded_words: Vec<Vec<String>> = Vec::new();
@@ -567,6 +564,10 @@ fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState, scope: AuditScope
     // Apply the expanded assignments now that the expansion context is gone.
     for (name, value) in expanded_assignments {
         state.vars.insert(name, value);
+    }
+    // Apply arithmetic side effects from $((...)) expansions.
+    for (name, value) in arith_updates {
+        state.vars.insert(name, value.to_string());
     }
 
     if cmd.words.is_empty() {
@@ -634,7 +635,8 @@ fn eval_arith_clause(expr: &str, state: &mut ShellState) -> Result<i64, CommandO
     let mut subst_state = state.clone();
     let mut executor =
         |inner: &str| -> Result<String, String> { execute_substitution(inner, &mut subst_state) };
-    let mut ctx = expand_ctx_with_subst(state, &mut executor);
+    let mut arith_updates = Vec::new();
+    let mut ctx = expand_ctx_with_subst(state, &mut executor, &mut arith_updates);
     let expanded = match crate::expand::expand_arith_expr(expr, &mut ctx) {
         Ok(v) => v,
         Err(e) => {
@@ -645,7 +647,7 @@ fn eval_arith_clause(expr: &str, state: &mut ShellState) -> Result<i64, CommandO
             ));
         }
     };
-    arith::evaluate(&expanded, &mut state.vars).map_err(|e| {
+    let result = arith::evaluate(&expanded, &mut state.vars).map_err(|e| {
         CommandOutput::with_output(
             1,
             String::new(),
@@ -654,7 +656,11 @@ fn eval_arith_clause(expr: &str, state: &mut ShellState) -> Result<i64, CommandO
                 e
             ),
         )
-    })
+    });
+    for (name, value) in arith_updates {
+        state.vars.insert(name, value.to_string());
+    }
+    result
 }
 
 /// Evaluate a standalone `((expr))` arithmetic command.
@@ -753,6 +759,7 @@ fn execute_substitution(inner: &str, state: &mut ShellState) -> Result<String, S
 fn expand_ctx_with_subst<'a>(
     state: &'a ShellState,
     executor: &'a mut dyn FnMut(&str) -> Result<String, String>,
+    arith_updates: &'a mut Vec<(String, i64)>,
 ) -> ExpandContext<'a> {
     ExpandContext {
         vars: &state.vars,
@@ -761,6 +768,7 @@ fn expand_ctx_with_subst<'a>(
         pid: state.pid,
         last_bg_pid: state.last_bg_pid,
         subst: Some(executor),
+        arith_updates: Some(arith_updates),
     }
 }
 
@@ -1054,7 +1062,8 @@ fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
     let mut subst_state = state.clone();
     let mut executor =
         |inner: &str| -> Result<String, String> { execute_substitution(inner, &mut subst_state) };
-    let mut ctx = expand_ctx_with_subst(state, &mut executor);
+    let mut arith_updates = Vec::new();
+    let mut ctx = expand_ctx_with_subst(state, &mut executor, &mut arith_updates);
 
     for cmd in cmds {
         match cmd {
@@ -1107,6 +1116,11 @@ fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> CommandOutput {
                 );
             }
         }
+    }
+
+    // Apply arithmetic side effects from expansions inside the pipeline.
+    for (name, value) in arith_updates {
+        state.vars.insert(name, value.to_string());
     }
 
     if externals.is_empty() {
@@ -1402,7 +1416,8 @@ fn execute_for(
         let mut executor = |inner: &str| -> Result<String, String> {
             execute_substitution(inner, &mut subst_state)
         };
-        let mut ctx = expand_ctx_with_subst(state, &mut executor);
+        let mut arith_updates = Vec::new();
+        let mut ctx = expand_ctx_with_subst(state, &mut executor, &mut arith_updates);
         let mut items = Vec::new();
         for word in words {
             match expand_word(&word.value, &mut ctx) {
@@ -1415,6 +1430,9 @@ fn execute_for(
                     );
                 }
             }
+        }
+        for (name, value) in arith_updates {
+            state.vars.insert(name, value.to_string());
         }
         items
     };
@@ -1452,7 +1470,8 @@ fn execute_case(word: &Word, arms: &[CaseArm], state: &mut ShellState) -> Comman
     let mut subst_state = state.clone();
     let mut executor =
         |inner: &str| -> Result<String, String> { execute_substitution(inner, &mut subst_state) };
-    let mut ctx = expand_ctx_with_subst(state, &mut executor);
+    let mut arith_updates = Vec::new();
+    let mut ctx = expand_ctx_with_subst(state, &mut executor, &mut arith_updates);
     let value = match expand_single(&word.value, &mut ctx) {
         Ok(v) => v,
         Err(e) => {
@@ -1473,9 +1492,15 @@ fn execute_case(word: &Word, arms: &[CaseArm], state: &mut ShellState) -> Comman
             };
             // Bash case patterns are literal unless they contain glob chars.
             if crate::glob::matches(&pat, &value) {
+                for (name, value) in arith_updates {
+                    state.vars.insert(name, value.to_string());
+                }
                 return execute_list(&arm.body, state, AuditScope::SubCommand);
             }
         }
+    }
+    for (name, value) in arith_updates {
+        state.vars.insert(name, value.to_string());
     }
     CommandOutput::new(0)
 }

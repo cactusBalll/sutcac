@@ -1,0 +1,14 @@
+true=0
+false=1
+pid_is_numeric
+count=3
+first=alpha
+second=beta
+all=alpha beta gamma
+4 is even
+5 is odd
+before=3
+after=2
+first=two
+last_status_zero
+0

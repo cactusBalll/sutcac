@@ -1,0 +1,9 @@
+apple: red
+banana: yellow
+cherry: small
+date: small
+text: file.txt
+log: file.log
+file.*: file.md
+other: other.dat
+matches .md

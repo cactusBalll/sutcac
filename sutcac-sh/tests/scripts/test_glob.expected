@@ -1,0 +1,11 @@
+file1.txt
+file2.txt
+file1.txt
+file2.txt
+file1.txt
+file2.txt
+literal=nomatch*.xyz
+*.txt
+*.txt
+pre1.txt
+pre2.txt

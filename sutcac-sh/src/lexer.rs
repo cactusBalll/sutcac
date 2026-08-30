@@ -333,12 +333,10 @@ impl<'a> Lexer<'a> {
                                 if c == '(' && is_valid_name(current) {
                                     break;
                                 }
-                                // Include paren inside $-expansions ($((...)), $(...)).
-                                if current.contains('$') {
-                                    self.advance();
-                                } else {
-                                    break;
-                                }
+                                // A paren terminates the current word. Parens that
+                                // belong to $((...)) or $(...) are consumed while
+                                // dollar_state is Arith or Command, not here.
+                                break;
                             }
                             '=' => {
                                 if _eq_pos_valid {
