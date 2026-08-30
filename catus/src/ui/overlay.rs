@@ -28,6 +28,7 @@ pub fn draw_overlay(frame: &mut Frame, app: &App) {
         Overlay::Resume { items, selected } => draw_resume(frame, items, *selected, popup),
         Overlay::Status => draw_status(frame, app, popup),
         Overlay::Config { selected } => draw_config(frame, app, *selected, popup),
+        Overlay::Skills { items, selected } => draw_skills(frame, items, *selected, popup),
     }
 }
 
@@ -103,6 +104,47 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
     let help = Paragraph::new(Line::styled(
         "Esc/q close",
+        Style::default().fg(Color::DarkGray),
+    ))
+    .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help, rows[1]);
+}
+
+fn draw_skills(frame: &mut Frame, items: &[String], selected: usize, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Skills ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let list_items: Vec<ListItem> = if items.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "(no skills discovered)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        items
+            .iter()
+            .map(|name| ListItem::new(Line::from(name.clone())))
+            .collect()
+    };
+
+    let list = List::new(list_items)
+        .highlight_symbol("▶ ")
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, rows[0], &mut state);
+
+    let help = Paragraph::new(Line::styled(
+        "↑/↓ select · Enter activate · Esc cancel",
         Style::default().fg(Color::DarkGray),
     ))
     .alignment(ratatui::layout::Alignment::Center);

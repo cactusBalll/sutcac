@@ -44,6 +44,10 @@ pub struct AgentConfig {
     pub log_path: Option<PathBuf>,
     /// Optional log level: trace, debug, info, warn, error. Defaults to info.
     pub log_level: String,
+    /// Optional additional directories to scan for Agent Skills.
+    pub skill_paths: Option<Vec<PathBuf>>,
+    /// Whether to include discovered skills in the system prompt automatically.
+    pub auto_include_skills: bool,
 }
 
 impl Default for AppConfig {
@@ -81,6 +85,8 @@ impl Default for AgentConfig {
             history_path: None,
             log_path: None,
             log_level: "info".to_string(),
+            skill_paths: None,
+            auto_include_skills: true,
         }
     }
 }

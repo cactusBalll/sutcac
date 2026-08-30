@@ -11,6 +11,27 @@ Rust workspace (edition 2024, needs Rust 1.85+) with two crates:
 
 `bash.md` (Chinese) is the Bash-internals design reference.
 
+## Agent Skills
+
+`catus` supports [Agent Skills](https://agentskills.io/specification): directories containing a `SKILL.md` file with YAML frontmatter (`name`, `description`, plus optional fields) followed by Markdown instructions.
+
+### Search paths
+
+Skills are discovered from directories that mirror the config-file search order:
+
+1. `./.sutcac/skills/`
+2. `$XDG_CONFIG_HOME/catus/skills/`
+3. `~/.config/catus/skills/`
+
+Each search directory should contain skill subdirectories (e.g. `my-skill/SKILL.md`). Additional paths can be added via `[agent].skill_paths` in `config.toml`.
+
+### Runtime behavior
+
+- At startup, only skill metadata (`name` and `description`) is loaded.
+- If `[agent].auto_include_skills` is true (default), the skill catalog is appended to the system prompt.
+- Use `/skill list` to show discovered skills, `/skill use <name>` to activate a skill, or bare `/skill` to open a picker overlay.
+- Activating a skill loads its full `SKILL.md` body and injects it as a system message.
+
 ## Commands
 
 ```bash

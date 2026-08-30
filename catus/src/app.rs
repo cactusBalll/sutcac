@@ -10,6 +10,7 @@ use crossterm::event::KeyCode;
 use crate::config::AppConfig;
 use crate::llm::{LlmClient, Usage};
 use crate::message::{Message, Role};
+use crate::skills::SkillRegistry;
 use crate::tool::{ToolCall, ToolResult, execute_shell_command};
 
 /// Current high-level state of the application.
@@ -33,6 +34,8 @@ pub enum Overlay {
     Status,
     /// Config editor.
     Config { selected: usize },
+    /// Skill picker.
+    Skills { items: Vec<String>, selected: usize },
 }
 
 impl Overlay {
@@ -50,6 +53,8 @@ pub enum OverlayResult {
     Closed,
     /// The resume picker confirmed a history name to load.
     LoadHistory(String),
+    /// The skill picker confirmed a skill name to activate.
+    ActivateSkill(String),
 }
 
 /// Mutable application state shared between the TUI and async workers.
@@ -94,10 +99,14 @@ pub struct App {
     pub status_message_clear_at: Option<Instant>,
     /// Path of the config file currently in use, if one was found.
     pub config_path: Option<std::path::PathBuf>,
+    /// Discovered Agent Skills registry.
+    pub skill_registry: SkillRegistry,
+    /// Names of skills currently active in the conversation.
+    pub active_skills: Vec<String>,
 }
 
 /// Built-in TUI slash commands offered by command completion.
-const SLASH_COMMANDS: &[&str] = &["/config", "/exit", "/help", "/resume", "/status"];
+const SLASH_COMMANDS: &[&str] = &["/config", "/exit", "/help", "/resume", "/skill", "/status"];
 
 /// Maximum number of completion candidates shown at once.
 pub const MAX_CANDIDATES: usize = 8;
@@ -149,7 +158,16 @@ impl App {
         let mut shell_state = ShellState::with_policy_and_logger(permissions, audit_logger);
         shell_state.args = Vec::new();
 
-        let system_prompt = config.agent.system_prompt.clone();
+        let mut search_paths = SkillRegistry::default_paths();
+        if let Some(extra) = &config.agent.skill_paths {
+            search_paths.extend(extra.iter().cloned());
+        }
+        let skill_registry = SkillRegistry::discover(&search_paths).unwrap_or_else(|e| {
+            log::warn!("failed to discover skills: {}", e);
+            SkillRegistry::new()
+        });
+
+        let system_prompt = Self::build_system_prompt(&config, &skill_registry);
         let max_tool_rounds = config.agent.max_tool_rounds;
 
         Self {
@@ -157,6 +175,8 @@ impl App {
             client,
             shell_state,
             messages: vec![Message::system(system_prompt)],
+            skill_registry,
+            active_skills: Vec::new(),
             input: String::new(),
             cursor: 0,
             status: AppStatus::Idle,
@@ -179,6 +199,21 @@ impl App {
             status_message_clear_at: None,
             config_path: AppConfig::find_config_file(),
         }
+    }
+
+    /// Build the initial system prompt, optionally appending the skill catalog.
+    pub fn build_system_prompt(config: &AppConfig, registry: &SkillRegistry) -> String {
+        let mut prompt = config.agent.system_prompt.clone();
+        if config.agent.auto_include_skills && !registry.is_empty() {
+            prompt.push_str("\n\nThe following Agent Skills are available. ");
+            prompt.push_str("When a task matches a skill's description, activate it ");
+            prompt.push_str("by saying 'use_skill:<name>' at the start of your reply, ");
+            prompt.push_str("then follow the skill's instructions.\n\n");
+            for (name, description) in registry.names_and_descriptions() {
+                prompt.push_str(&format!("- {}: {}\n", name, description));
+            }
+        }
+        prompt
     }
 
     pub fn push_char(&mut self, c: char) {
@@ -418,6 +453,14 @@ impl App {
             );
         }
 
+        // Check for a skill activation marker in the assistant's text.
+        if let Some(name) = self.take_skill_activation_marker() {
+            match self.activate_skill(&name) {
+                Ok(msg) => self.set_transient_message(msg),
+                Err(e) => self.set_error(e.to_string()),
+            }
+        }
+
         if self.has_empty_assistant_placeholder() {
             log::warn!("assistant response was empty; dropping placeholder message");
             self.messages.pop();
@@ -426,6 +469,51 @@ impl App {
             ));
             self.scroll_to_bottom();
         }
+    }
+
+    /// If the most recent assistant message starts with `use_skill:<name>`,
+    /// remove that prefix and return the skill name.
+    pub fn take_skill_activation_marker(&mut self) -> Option<String> {
+        let content = self.messages.last().and_then(|last| {
+            if last.role == Role::Assistant {
+                Some(last.content.clone())
+            } else {
+                None
+            }
+        })?;
+
+        let trimmed = content.trim_start();
+        let prefix = "use_skill:";
+        if !trimmed.starts_with(prefix) {
+            return None;
+        }
+        let rest = &trimmed[prefix.len()..];
+        let name = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or(rest)
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            return None;
+        }
+
+        // Remove the marker from the message content.
+        let marker_end = content.find(prefix).unwrap_or(0) + prefix.len() + rest.len()
+            - rest.trim_start().len()
+            + name.len();
+        let after_marker = content[marker_end..].trim_start().to_string();
+
+        if let Some(last) = self.messages.last_mut() {
+            last.content = after_marker;
+        }
+
+        // Ignore re-activation of a skill that is already active.
+        if self.active_skills.contains(&name) {
+            return None;
+        }
+
+        Some(name)
     }
 
     /// Return true if the most recent message is an empty assistant placeholder
@@ -488,6 +576,46 @@ impl App {
     /// Open the config editor overlay.
     pub fn open_config_overlay(&mut self) {
         self.overlay = Overlay::Config { selected: 0 };
+    }
+
+    /// Open the skill picker overlay.
+    pub fn open_skills_overlay(&mut self) {
+        let items = self.skill_registry.iter().map(|s| s.name.clone()).collect();
+        self.overlay = Overlay::Skills { items, selected: 0 };
+    }
+
+    /// Return a human-readable list of discovered skill names.
+    pub fn skill_names_list(&self) -> String {
+        let names: Vec<&str> = self
+            .skill_registry
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        if names.is_empty() {
+            "no skills discovered".to_string()
+        } else {
+            format!("available skills: {}", names.join(", "))
+        }
+    }
+
+    /// Activate a skill by name and inject its instructions into the conversation.
+    pub fn activate_skill(&mut self, name: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let skill = self
+            .skill_registry
+            .activate(name)?
+            .ok_or_else(|| format!("skill not found: {}", name))?;
+        let instructions = skill.instructions().unwrap_or("").to_string();
+        if instructions.trim().is_empty() {
+            return Ok(format!("skill '{}' has no instructions", name));
+        }
+        if !self.active_skills.contains(&name.to_string()) {
+            self.active_skills.push(name.to_string());
+        }
+        self.messages.push(Message::system(format!(
+            "Skill '{}' instructions:\n{}",
+            name, instructions
+        )));
+        Ok(format!("activated skill '{}'", name))
     }
 
     /// Return the editable config fields as (key, current_value) pairs.
@@ -622,6 +750,45 @@ impl App {
                 }
                 _ => OverlayResult::Consumed,
             },
+            Overlay::Skills { items, selected } => match code {
+                KeyCode::Up => {
+                    let next = if items.is_empty() {
+                        0
+                    } else {
+                        (selected + items.len() - 1) % items.len()
+                    };
+                    self.overlay = Overlay::Skills {
+                        items,
+                        selected: next,
+                    };
+                    OverlayResult::Consumed
+                }
+                KeyCode::Down => {
+                    let next = if items.is_empty() {
+                        0
+                    } else {
+                        (selected + 1) % items.len()
+                    };
+                    self.overlay = Overlay::Skills {
+                        items,
+                        selected: next,
+                    };
+                    OverlayResult::Consumed
+                }
+                KeyCode::Enter => {
+                    let chosen = items.get(selected).cloned();
+                    self.close_overlay();
+                    match chosen {
+                        Some(name) => OverlayResult::ActivateSkill(name),
+                        None => OverlayResult::Closed,
+                    }
+                }
+                KeyCode::Esc => {
+                    self.close_overlay();
+                    OverlayResult::Closed
+                }
+                _ => OverlayResult::Consumed,
+            },
             Overlay::Config { selected } => {
                 let fields = self.config_fields();
                 match code {
@@ -666,7 +833,7 @@ impl App {
     /// the scroll was consumed by an overlay.
     pub fn handle_overlay_scroll(&mut self, up: bool) -> bool {
         match &self.overlay {
-            Overlay::Resume { .. } | Overlay::Config { .. } => {
+            Overlay::Resume { .. } | Overlay::Config { .. } | Overlay::Skills { .. } => {
                 let _ = self.handle_overlay_key(if up { KeyCode::Up } else { KeyCode::Down });
                 true
             }
@@ -1084,6 +1251,38 @@ impl App {
                 self.open_status_overlay();
                 self.record_input_history(input);
             }
+            "skill" => {
+                self.status = AppStatus::Idle;
+                let arg = arg.map(str::trim).filter(|s| !s.is_empty());
+                match arg {
+                    Some(args) => {
+                        let mut parts = args.splitn(2, ' ');
+                        let sub = parts.next().unwrap_or("");
+                        let sub_arg = parts.next();
+                        match sub {
+                            "list" => {
+                                self.add_event_message(self.skill_names_list());
+                                self.set_transient_message("Skills listed");
+                            }
+                            "use" => match sub_arg {
+                                Some(name) => match self.activate_skill(name.trim()) {
+                                    Ok(msg) => self.set_transient_message(msg),
+                                    Err(e) => self.set_error(e.to_string()),
+                                },
+                                None => self.set_error("usage: /skill use <name>"),
+                            },
+                            _ => self.set_error(format!(
+                                "unknown /skill subcommand: {}. Try /skill list or /skill use <name>",
+                                sub
+                            )),
+                        }
+                        self.record_input_history(input);
+                    }
+                    None => {
+                        self.open_skills_overlay();
+                    }
+                }
+            }
             _ => self.set_error(format!("unknown command: /{}", cmd)),
         }
         true
@@ -1107,6 +1306,8 @@ mod tests {
                 history_path: Some(dir.to_path_buf()),
                 log_path: None,
                 log_level: "info".to_string(),
+                skill_paths: None,
+                auto_include_skills: false,
             },
             shell: None,
         }
@@ -1820,6 +2021,43 @@ log_level = "info"
         app.maybe_clear_status_message();
         assert_eq!(app.status, AppStatus::Idle);
         assert!(app.status_message.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skill_activation_marker_is_extracted_and_removed() {
+        let dir = std::env::temp_dir().join(format!("catus_skill_marker_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.messages.push(Message::assistant(
+            "use_skill:my-skill\n\ndo it".to_string(),
+        ));
+
+        let name = app.take_skill_activation_marker();
+        assert_eq!(name, Some("my-skill".to_string()));
+        assert_eq!(app.messages.last().unwrap().content, "do it");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repeated_skill_activation_marker_is_ignored_when_already_active() {
+        let dir = std::env::temp_dir().join(format!("catus_skill_repeat_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.active_skills.push("my-skill".to_string());
+        app.messages.push(Message::assistant(
+            "use_skill:my-skill\n\ndo it".to_string(),
+        ));
+
+        let name = app.take_skill_activation_marker();
+        assert_eq!(name, None);
+        assert_eq!(app.messages.last().unwrap().content, "do it");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

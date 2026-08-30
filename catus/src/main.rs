@@ -89,6 +89,22 @@ async fn run_test_mode(
                     app.messages.push(msg);
                 }
 
+                // Handle skill activation markers in the assistant reply.
+                if let Some(name) = app.take_skill_activation_marker() {
+                    match app.activate_skill(&name) {
+                        Ok(msg) => {
+                            app.status = catus::app::AppStatus::Idle;
+                            app.status_message = msg.clone();
+                            println!("SKILL ACTIVATED: {}", msg);
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("catus: failed to activate skill '{}': {}", name, e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
                 if let Some(call) = reply.tool_calls.first() {
                     let command = match call.shell_command() {
                         Some(cmd) => cmd,
@@ -199,6 +215,15 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                             match app.handle_overlay_key(key.code) {
                                 OverlayResult::LoadHistory(name) => {
                                     match app.resume_history(Some(&name)) {
+                                        Ok(msg) => {
+                                            app.status = AppStatus::Idle;
+                                            app.status_message = msg;
+                                        }
+                                        Err(e) => app.set_error(e.to_string()),
+                                    }
+                                }
+                                OverlayResult::ActivateSkill(name) => {
+                                    match app.activate_skill(&name) {
                                         Ok(msg) => {
                                             app.status = AppStatus::Idle;
                                             app.status_message = msg;
