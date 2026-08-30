@@ -3,6 +3,7 @@
 pub mod app;
 pub mod config;
 pub mod llm;
+pub mod mcp;
 pub mod message;
 pub mod skills;
 pub mod tool;

@@ -9,9 +9,10 @@ use crossterm::event::KeyCode;
 
 use crate::config::AppConfig;
 use crate::llm::{LlmClient, Usage};
+use crate::mcp::McpManager;
 use crate::message::{Message, Role};
 use crate::skills::SkillRegistry;
-use crate::tool::{ToolCall, ToolResult, execute_shell_command};
+use crate::tool::{ToolCall, ToolDefinition, ToolResult, execute_shell_command};
 
 /// Current high-level state of the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,10 +104,14 @@ pub struct App {
     pub skill_registry: SkillRegistry,
     /// Names of skills currently active in the conversation.
     pub active_skills: Vec<String>,
+    /// Connected MCP servers, if any.
+    pub mcp_manager: Option<McpManager>,
 }
 
 /// Built-in TUI slash commands offered by command completion.
-const SLASH_COMMANDS: &[&str] = &["/config", "/exit", "/help", "/resume", "/skill", "/status"];
+const SLASH_COMMANDS: &[&str] = &[
+    "/config", "/exit", "/help", "/mcp", "/resume", "/skill", "/status",
+];
 
 /// Maximum number of completion candidates shown at once.
 pub const MAX_CANDIDATES: usize = 8;
@@ -177,6 +182,7 @@ impl App {
             messages: vec![Message::system(system_prompt)],
             skill_registry,
             active_skills: Vec::new(),
+            mcp_manager: None,
             input: String::new(),
             cursor: 0,
             status: AppStatus::Idle,
@@ -214,6 +220,37 @@ impl App {
             }
         }
         prompt
+    }
+
+    /// Connect to configured MCP servers.
+    ///
+    /// Failures are logged and returned as warnings; the manager stays usable
+    /// for any servers that did connect.
+    pub async fn connect_mcp(&mut self) -> Vec<String> {
+        let Some(mcp_config) = self.config.mcp.as_ref() else {
+            return Vec::new();
+        };
+        if mcp_config.servers.is_empty() {
+            return Vec::new();
+        }
+
+        let (manager, warnings) = McpManager::connect(&mcp_config.servers).await;
+        if manager.is_empty() {
+            log::warn!("no mcp servers connected");
+            self.mcp_manager = None;
+        } else {
+            log::info!("{} mcp server(s) connected", manager.len());
+            self.mcp_manager = Some(manager);
+        }
+        warnings
+    }
+
+    /// Return the extra tool definitions advertised by connected MCP servers.
+    pub async fn mcp_tool_definitions(&self) -> Vec<ToolDefinition> {
+        match &self.mcp_manager {
+            Some(manager) => manager.all_tool_definitions().await,
+            None => Vec::new(),
+        }
     }
 
     pub fn push_char(&mut self, c: char) {
@@ -598,6 +635,47 @@ impl App {
         }
     }
 
+    /// Return a human-readable list of configured MCP servers and their tools.
+    pub async fn mcp_server_list(&self) -> String {
+        let configured: Vec<&str> = self
+            .config
+            .mcp
+            .as_ref()
+            .map(|m| m.servers.iter().map(|s| s.name.as_str()).collect())
+            .unwrap_or_default();
+        if configured.is_empty() {
+            return "no mcp servers configured".to_string();
+        }
+
+        let mut lines = vec![format!("configured mcp servers: {}", configured.join(", "))];
+        if let Some(manager) = &self.mcp_manager {
+            let defs = manager.all_tool_definitions().await;
+            if !defs.is_empty() {
+                lines.push("available mcp tools:".to_string());
+                for def in defs {
+                    lines.push(format!("- {}", def.function.name));
+                }
+            } else {
+                lines.push("no mcp tools available".to_string());
+            }
+        } else {
+            lines.push("mcp manager not connected".to_string());
+        }
+        lines.join("\n")
+    }
+
+    /// Return a concise MCP connection status message.
+    pub fn mcp_status_message(&self) -> String {
+        let configured = self
+            .config
+            .mcp
+            .as_ref()
+            .map(|m| m.servers.len())
+            .unwrap_or(0);
+        let connected = self.mcp_manager.as_ref().map(|m| m.len()).unwrap_or(0);
+        format!("mcp: {}/{} servers connected", connected, configured)
+    }
+
     /// Activate a skill by name and inject its instructions into the conversation.
     pub fn activate_skill(&mut self, name: &str) -> Result<String, Box<dyn std::error::Error>> {
         let skill = self
@@ -925,22 +1003,43 @@ impl App {
 
     /// Execute the first pending tool call and append the result as a tool
     /// message. Returns the formatted tool result message.
-    pub fn run_pending_tool(&mut self) -> Option<String> {
+    pub async fn run_pending_tool(&mut self) -> Option<String> {
         let call = self.pending_tool_calls.first()?.clone();
 
+        let result = if call.name == "shell" {
+            self.run_shell_tool(&call).await
+        } else {
+            self.run_mcp_tool(&call).await
+        };
+
+        let message = result.to_message();
+        self.messages
+            .push(Message::tool(message.clone(), call.id.clone()));
+        self.pending_tool_calls.remove(0);
+        self.tool_rounds_this_turn += 1;
+
+        self.status = AppStatus::Idle;
+        self.status_message.clear();
+        self.scroll_to_bottom();
+
+        Some(message)
+    }
+
+    /// Execute the built-in shell tool.
+    async fn run_shell_tool(&mut self, call: &ToolCall) -> ToolResult {
         let Some(command) = call.shell_command() else {
             // Malformed arguments: report back to the model and consume the
             // call instead of leaving it pending forever.
             log::warn!("malformed tool call: {}", call.arguments);
-            let message = format!(
-                "status=2\nstdout=```\n\n```\nstderr=```\ncatus: tool call format error: arguments must be a single JSON object {{\"command\": \"<shell command>\"}} with exactly one string \"command\" field; got: {}\n```",
-                call.arguments
-            );
-            self.messages
-                .push(Message::tool(message.clone(), call.id.clone()));
-            self.pending_tool_calls.remove(0);
-            self.scroll_to_bottom();
-            return Some(message);
+            return ToolResult {
+                call: call.clone(),
+                status: 2,
+                stdout: String::new(),
+                stderr: format!(
+                    "catus: tool call format error: arguments must be a single JSON object {{\"command\": \"<shell command>\"}} with exactly one string \"command\" field; got: {}",
+                    call.arguments
+                ),
+            };
         };
 
         self.status = AppStatus::RunningTool;
@@ -954,23 +1053,51 @@ impl App {
             output.stdout.len(),
             output.stderr.len()
         );
-        let result = ToolResult {
+        ToolResult {
             call: call.clone(),
             status: output.status,
             stdout: output.stdout,
             stderr: output.stderr,
-        };
-        let message = result.to_message();
-        self.messages
-            .push(Message::tool(message.clone(), call.id.clone()));
-        self.pending_tool_calls.remove(0);
-        self.tool_rounds_this_turn += 1;
+        }
+    }
 
-        self.status = AppStatus::Idle;
-        self.status_message.clear();
+    /// Execute an MCP tool through the configured manager.
+    async fn run_mcp_tool(&mut self, call: &ToolCall) -> ToolResult {
+        self.status = AppStatus::RunningTool;
+        self.status_message = format!("Running: {}", call.name);
+        self.messages
+            .push(Message::event(format!("mcp: {}", call.name)));
         self.scroll_to_bottom();
 
-        Some(message)
+        match &self.mcp_manager {
+            Some(manager) => match manager.call_tool(call).await {
+                Ok(result) => {
+                    log::info!(
+                        "mcp tool finished: {} status={} stdout_len={} stderr_len={}",
+                        call.name,
+                        result.status,
+                        result.stdout.len(),
+                        result.stderr.len()
+                    );
+                    result
+                }
+                Err(e) => {
+                    log::warn!("mcp tool failed: {} error={}", call.name, e);
+                    ToolResult {
+                        call: call.clone(),
+                        status: 1,
+                        stdout: String::new(),
+                        stderr: format!("catus: mcp tool failed: {}", e),
+                    }
+                }
+            },
+            None => ToolResult {
+                call: call.clone(),
+                status: 1,
+                stdout: String::new(),
+                stderr: format!("catus: no mcp manager available for tool '{}'", call.name),
+            },
+        }
     }
 
     pub fn scroll_up(&mut self, amount: usize) {
@@ -1168,7 +1295,7 @@ impl App {
 
     /// Handle a TUI slash command. Returns `true` if the input was a command
     /// and should not be sent to the LLM.
-    pub fn handle_command(&mut self, input: &str) -> bool {
+    pub async fn handle_command(&mut self, input: &str) -> bool {
         if !input.starts_with('/') {
             return false;
         }
@@ -1283,6 +1410,35 @@ impl App {
                     }
                 }
             }
+            "mcp" => {
+                self.status = AppStatus::Idle;
+                let arg = arg.map(str::trim).filter(|s| !s.is_empty());
+                match arg {
+                    Some(args) => {
+                        let mut parts = args.splitn(2, ' ');
+                        let sub = parts.next().unwrap_or("");
+                        match sub {
+                            "list" => {
+                                self.add_event_message(self.mcp_server_list().await);
+                                self.set_transient_message("MCP servers listed");
+                            }
+                            "status" => {
+                                self.add_event_message(self.mcp_status_message());
+                                self.set_transient_message("MCP status listed");
+                            }
+                            _ => self.set_error(format!(
+                                "unknown /mcp subcommand: {}. Try /mcp list or /mcp status",
+                                sub
+                            )),
+                        }
+                        self.record_input_history(input);
+                    }
+                    None => {
+                        self.add_event_message(self.mcp_status_message());
+                        self.set_transient_message("MCP status listed");
+                    }
+                }
+            }
             _ => self.set_error(format!("unknown command: /{}", cmd)),
         }
         true
@@ -1310,11 +1466,12 @@ mod tests {
                 auto_include_skills: false,
             },
             shell: None,
+            mcp: None,
         }
     }
 
-    #[test]
-    fn resume_lists_available_histories() {
+    #[tokio::test]
+    async fn resume_lists_available_histories() {
         let dir = std::env::temp_dir().join(format!("catus_resume_list_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1662,8 +1819,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn slash_resume_command_is_recorded_in_history() {
+    #[tokio::test]
+    async fn slash_resume_command_is_recorded_in_history() {
         let dir = std::env::temp_dir().join(format!("catus_cmd_hist_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1671,7 +1828,7 @@ mod tests {
 
         let mut app = App::new(test_config_with_history_dir(&dir));
         app.input = "/resume foo".to_string();
-        app.handle_command("/resume foo");
+        app.handle_command("/resume foo").await;
 
         assert_eq!(app.input_history, vec!["/resume foo"]);
         app.history_previous();
@@ -1715,8 +1872,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn status_command_opens_overlay_with_usage() {
+    #[tokio::test]
+    async fn status_command_opens_overlay_with_usage() {
         let dir = std::env::temp_dir().join(format!("catus_status_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1728,7 +1885,7 @@ mod tests {
             total_tokens: 32,
             cached_tokens: 12,
         });
-        assert!(app.handle_command("/status"));
+        assert!(app.handle_command("/status").await);
         assert_eq!(app.overlay, Overlay::Status);
         assert!(app.overlay_active());
         assert_eq!(app.usage.prompt_tokens, 19);
@@ -1740,8 +1897,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn bare_resume_opens_picker_and_enter_loads_history() {
+    #[tokio::test]
+    async fn bare_resume_opens_picker_and_enter_loads_history() {
         let dir = std::env::temp_dir().join(format!("catus_resume_overlay_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1753,7 +1910,7 @@ mod tests {
         std::fs::write(dir.join("beta.json"), "[]").unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/resume"));
+        assert!(app.handle_command("/resume").await);
         let items = match &app.overlay {
             Overlay::Resume { items, selected } => {
                 assert_eq!(items.len(), 2);
@@ -1802,29 +1959,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn resume_with_name_argument_loads_directly_without_overlay() {
+    #[tokio::test]
+    async fn resume_with_name_argument_loads_directly_without_overlay() {
         let dir = std::env::temp_dir().join(format!("catus_resume_arg_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("foo.json"), "[]").unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/resume foo"));
+        assert!(app.handle_command("/resume foo").await);
         assert_eq!(app.overlay, Overlay::None);
         assert_eq!(app.status_message, "history loaded");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn config_command_opens_overlay() {
+    #[tokio::test]
+    async fn config_command_opens_overlay() {
         let dir = std::env::temp_dir().join(format!("catus_config_overlay_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/config"));
+        assert!(app.handle_command("/config").await);
         assert!(matches!(app.overlay, Overlay::Config { selected: 0 }));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1894,8 +2051,8 @@ log_level = "info"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn run_pending_tool_reports_malformed_arguments() {
+    #[tokio::test]
+    async fn run_pending_tool_reports_malformed_arguments() {
         let dir = std::env::temp_dir().join(format!("catus_badargs_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1908,7 +2065,7 @@ log_level = "info"
             arguments: r#"{"cmd":"ls"}"#.to_string(),
         });
 
-        let result = app.run_pending_tool();
+        let result = app.run_pending_tool().await;
         assert!(result.is_some());
         let text = result.unwrap();
         assert!(
@@ -1956,13 +2113,44 @@ log_level = "info"
     }
 
     #[test]
-    fn help_command_shows_help_in_history() {
+    fn slash_command_completion_offers_mcp() {
+        let dir = std::env::temp_dir().join(format!("catus_slash_mcp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.input = "/mc".to_string();
+        app.recompute_candidates();
+        assert_eq!(app.candidates, vec!["/mcp"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn mcp_status_command_shows_connection_counts() {
+        let dir = std::env::temp_dir().join(format!("catus_mcp_status_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert!(app.handle_command("/mcp status").await);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.is_event() && m.content.contains("mcp: 0/0 servers connected"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn help_command_shows_help_in_history() {
         let dir = std::env::temp_dir().join(format!("catus_help_cmd_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/help"));
+        assert!(app.handle_command("/help").await);
         assert!(
             app.messages
                 .iter()
@@ -1974,14 +2162,14 @@ log_level = "info"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn exit_command_requests_quit() {
+    #[tokio::test]
+    async fn exit_command_requests_quit() {
         let dir = std::env::temp_dir().join(format!("catus_exit_cmd_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/exit"));
+        assert!(app.handle_command("/exit").await);
         assert!(app.should_quit);
 
         let _ = std::fs::remove_dir_all(&dir);

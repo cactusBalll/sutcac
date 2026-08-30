@@ -12,7 +12,6 @@ use catus::app::{App, AppStatus, OverlayResult};
 use catus::config::AppConfig;
 use catus::llm::{LlmClient, LlmError, StreamEvent};
 use catus::message::Message;
-use catus::tool::{ToolResult, execute_shell_command};
 use catus::tui;
 use catus::ui;
 
@@ -61,11 +60,18 @@ async fn run_test_mode(
     let client = app.client.clone();
     let max_rounds = app.max_tool_rounds;
 
+    // Connect to configured MCP servers before starting the conversation.
+    let mcp_warnings = app.connect_mcp().await;
+    for warning in &mcp_warnings {
+        eprintln!("catus: mcp warning: {}", warning);
+    }
+
     println!("USER: {}", prompt);
     app.messages.push(Message::user(prompt));
 
     for round in 0..max_rounds {
-        match client.chat(&app.messages).await {
+        let extra_tools = app.mcp_tool_definitions().await;
+        match client.chat(&app.messages, &extra_tools).await {
             Ok(reply) => {
                 if !reply.content.is_empty() {
                     println!("ASSISTANT: {}", reply.content);
@@ -83,11 +89,11 @@ async fn run_test_mode(
                     );
                 }
 
-                if !reply.content.is_empty() || !reply.reasoning_content.is_empty() {
-                    let mut msg = Message::assistant(reply.content);
-                    msg.reasoning_content = reply.reasoning_content;
-                    app.messages.push(msg);
-                }
+                // Always push an assistant message so tool calls have a parent
+                // message, matching the TUI flow.
+                let mut msg = Message::assistant(reply.content);
+                msg.reasoning_content = reply.reasoning_content;
+                app.messages.push(msg);
 
                 // Handle skill activation markers in the assistant reply.
                 if let Some(name) = app.take_skill_activation_marker() {
@@ -105,33 +111,16 @@ async fn run_test_mode(
                     }
                 }
 
-                if let Some(call) = reply.tool_calls.first() {
-                    let command = match call.shell_command() {
-                        Some(cmd) => cmd,
-                        None => {
-                            log::error!("malformed tool call arguments: {}", call.arguments);
-                            eprintln!(
-                                "catus: tool call format error: expected {{\"command\": \"...\"}}, got: {}",
-                                call.arguments
-                            );
-                            std::process::exit(1);
+                for call in reply.tool_calls {
+                    app.add_tool_call(call);
+                }
+
+                if app.has_pending_tool_call() {
+                    while app.has_pending_tool_call() {
+                        if let Some(message) = app.run_pending_tool().await {
+                            println!("TOOL RESULT:\n{}", message);
                         }
-                    };
-                    log::info!("tool call {} -> {}", call.id, command);
-                    println!("TOOL CALL: {} -> {}", call.id, command);
-                    let output = execute_shell_command(&command, &mut app.shell_state);
-                    let result = ToolResult {
-                        call: call.clone(),
-                        status: output.status,
-                        stdout: output.stdout,
-                        stderr: output.stderr,
-                    };
-                    println!(
-                        "TOOL RESULT: status={}\nstdout=```\n{}\n```\nstderr=```\n{}\n```",
-                        result.status, result.stdout, result.stderr
-                    );
-                    app.messages
-                        .push(Message::tool(result.to_message(), call.id.clone()));
+                    }
                 } else {
                     println!(
                         "[no tool call, conversation complete after {} round(s)]",
@@ -152,7 +141,12 @@ async fn run_test_mode(
 }
 
 async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let app = App::new(config);
+    let mut app = App::new(config);
+    let mcp_warnings = app.connect_mcp().await;
+    for warning in &mcp_warnings {
+        log::warn!("mcp warning: {}", warning);
+    }
+
     let client = app.client.clone();
 
     let mut guard = tui::TerminalGuard::new(tui::init_terminal()?);
@@ -252,10 +246,10 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                             }
                             KeyCode::Enter => {
                                 let input = app.input.trim().to_string();
-                                if app.handle_command(&input) {
+                                if app.handle_command(&input).await {
                                     app.clear_input();
                                 } else if app.submit_user_message().is_some() {
-                                    start_llm_stream(&mut app, &client, &event_tx, &done_tx);
+                                    start_llm_stream(&mut app, &client, &event_tx, &done_tx).await;
                                 }
                             }
                             KeyCode::Char(c) => {
@@ -340,7 +334,7 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                 while let Ok(event) = event_rx.try_recv() {
                     handle_stream_event(event, &mut app);
                 }
-                handle_llm_done(result, &mut app, &client, &event_tx, &done_tx);
+                handle_llm_done(result, &mut app, &client, &event_tx, &done_tx).await;
             }
         }
     }
@@ -382,7 +376,7 @@ fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     Ok(config)
 }
 
-fn start_llm_stream(
+async fn start_llm_stream(
     app: &mut App,
     client: &LlmClient,
     event_tx: &mpsc::Sender<StreamEvent>,
@@ -391,18 +385,19 @@ fn start_llm_stream(
     // Snapshot the conversation *before* adding the assistant placeholder so
     // the API request never contains an empty assistant message.
     let messages = app.messages.clone();
+    let extra_tools = app.mcp_tool_definitions().await;
     app.start_assistant_message();
     let client = client.clone();
     let event_tx = event_tx.clone();
     let done_tx = done_tx.clone();
 
     tokio::spawn(async move {
-        let result = client.stream_chat(&messages, event_tx).await;
+        let result = client.stream_chat(&messages, &extra_tools, event_tx).await;
         let _ = done_tx.send(result).await;
     });
 }
 
-fn handle_llm_done(
+async fn handle_llm_done(
     result: Result<(), LlmError>,
     app: &mut App,
     client: &LlmClient,
@@ -417,8 +412,8 @@ fn handle_llm_done(
                     "{} pending tool call(s); running tool",
                     app.pending_tool_calls_count()
                 );
-                app.run_pending_tool();
-                start_llm_stream(app, client, event_tx, done_tx);
+                app.run_pending_tool().await;
+                start_llm_stream(app, client, event_tx, done_tx).await;
             } else if app.pending_tool_calls_count() > 0 {
                 let count = app.pending_tool_calls_count();
                 if app.is_tool_round_limit_reached() {

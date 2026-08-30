@@ -6,6 +6,7 @@
 //! 2. `$XDG_CONFIG_HOME/catus/config.toml`
 //! 3. `~/.config/catus/config.toml`
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use log::LevelFilter;
@@ -19,6 +20,34 @@ pub struct AppConfig {
     pub api: ApiConfig,
     pub agent: AgentConfig,
     pub shell: Option<ShellConfig>,
+    /// Optional MCP client configuration. When present, catus connects to the
+    /// configured MCP servers and exposes their tools to the LLM alongside the
+    /// built-in `shell` tool.
+    pub mcp: Option<McpConfig>,
+}
+
+/// MCP client configuration.
+#[derive(Debug, Deserialize, Clone, Serialize, Default)]
+#[serde(default)]
+pub struct McpConfig {
+    /// MCP servers to connect to at startup.
+    pub servers: Vec<McpServerConfig>,
+}
+
+/// Configuration for a single MCP server connection.
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct McpServerConfig {
+    /// Human-readable name for this server. Used to prefix tool names, e.g.
+    /// `{name}__read_file`.
+    pub name: String,
+    /// Executable to spawn. Resolved via PATH if not an absolute path.
+    pub command: String,
+    /// Arguments passed to `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional environment variables added to the spawned process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// OpenAI-compatible API configuration.
@@ -56,6 +85,7 @@ impl Default for AppConfig {
             api: ApiConfig::default(),
             agent: AgentConfig::default(),
             shell: None,
+            mcp: None,
         }
     }
 }
@@ -191,5 +221,36 @@ audit_format = "json"
         assert!(cfg.agent.history_path.is_none());
         let shell = cfg.shell.unwrap();
         assert_eq!(shell.perm_mode.as_deref(), Some("deny:write"));
+    }
+
+    #[test]
+    fn parse_mcp_servers_config() {
+        let input = r#"
+[api]
+base_url = "https://api.example.com/v1"
+api_key = "sk-test"
+model = "gpt-4o"
+
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp.servers.env]
+HOME = "/home/user"
+"#;
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        let mcp = cfg.mcp.expect("mcp config should be present");
+        assert_eq!(mcp.servers.len(), 1);
+        assert_eq!(mcp.servers[0].name, "filesystem");
+        assert_eq!(mcp.servers[0].command, "npx");
+        assert_eq!(
+            mcp.servers[0].args,
+            vec!["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+        );
+        assert_eq!(
+            mcp.servers[0].env.get("HOME"),
+            Some(&"/home/user".to_string())
+        );
     }
 }

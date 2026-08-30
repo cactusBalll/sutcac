@@ -34,6 +34,19 @@ history_path = ".sutcac/history"
 # model knows they are available. Defaults to true.
 # auto_include_skills = true
 
+# Optional MCP client configuration. catus connects to the configured MCP
+# servers at startup and exposes their tools to the LLM alongside the built-in
+# `shell` tool. Only stdio child-process servers are supported initially.
+# Tool names are prefixed with `{server_name}__` to avoid collisions, e.g.
+# `filesystem__read_file`.
+# [[mcp.servers]]
+# name = "filesystem"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+#
+# [mcp.servers.env]
+# HOME = "/home/user"
+
 [shell]
 # allow_all | allow:<tags> | deny:<tags> | allow:<tags> deny:<tags> | allow1:<cmds> | deny1:<cmds>
 perm_mode = "allow_all"

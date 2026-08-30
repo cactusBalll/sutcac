@@ -7,7 +7,7 @@ Guide for AI agents working in this repo. All commands run from the workspace ro
 Rust workspace (edition 2024, needs Rust 1.85+) with two crates:
 
 - `sutcac-sh` — simplified Bash-compatible shell: hand-written lexer → recursive-descent parser (`ast.rs`) → word expansion (`expand.rs`, `glob.rs`, `arith.rs`) → execution (`exec.rs`). Also a library consumed by catus.
-- `catus` — Agent TUI binary: OpenAI-compatible streaming client (`llm.rs`), ratatui UI, executes the model's shell tool calls through embedded `sutcac-sh` (`tool.rs`, `app.rs`).
+- `catus` — Agent TUI binary: OpenAI-compatible streaming client (`llm.rs`), ratatui UI, executes the model's shell tool calls through embedded `sutcac-sh` (`tool.rs`, `app.rs`). Also an MCP client: configured MCP servers are connected at startup and their tools are exposed to the LLM (`mcp.rs`).
 
 `bash.md` (Chinese) is the Bash-internals design reference.
 
@@ -48,7 +48,7 @@ cargo run -p catus                        # Agent TUI
 cargo run -p catus -- --test "prompt"     # headless one-shot test prompt
 ```
 
-No CI, lint config, or integration tests exist. Tests currently pass (~64 + 4 in sutcac-sh, 41 in catus).
+No CI, lint config, or integration tests exist. Tests currently pass (~64 + 4 in sutcac-sh, ~87 in catus).
 
 ## Configuration
 
@@ -58,7 +58,17 @@ Both binaries read the same TOML file, first match wins:
 2. `$XDG_CONFIG_HOME/catus/config.toml`
 3. `~/.config/catus/config.toml`
 
-Copy the root-level `config.toml.example` to `.sutcac/config.toml` and fill in `[api].api_key`. Sections: `[api]`/`[agent]` for catus only; `[shell]` shared by both.
+Copy the root-level `config.toml.example` to `.sutcac/config.toml` and fill in `[api].api_key`. Sections: `[api]`/`[agent]` for catus only; `[shell]` shared by both; `[mcp]` for catus only.
+
+### MCP client (`[mcp]`)
+
+`catus` can act as an MCP client and expose tools from external MCP servers to the LLM.
+
+- Configure servers under `[[mcp.servers]]` with `name`, `command`, `args`, and optional `env`.
+- Only stdio child-process servers are supported initially (`rmcp` `transport-child-process`).
+- Tool names are prefixed with `{server_name}__` to avoid collisions and identify the owning server, e.g. `filesystem__read_file`.
+- Connection failures are logged; successful servers are still used.
+- Use `/mcp list` to see configured servers and discovered tools, and `/mcp status` for connection counts.
 
 ### Permission model (`[shell]`)
 
@@ -78,6 +88,7 @@ Checked before every external command and redirection; denials return non-zero a
 - Tilde expansion reads `/etc/passwd` directly; no NSS.
 - `builtin::export` uses `unsafe { std::env::set_var }`.
 - Arithmetic (`arith.rs`) is integer-only with wrapping overflow; div/mod by zero is an error.
+- MCP tool names are prefixed with `{server_name}__` so the LLM can call the right server; `app.rs::run_pending_tool` dispatches `shell` locally and everything else through `McpManager`.
 
 ## Conventions
 
@@ -90,6 +101,7 @@ Checked before every external command and redirection; denials return non-zero a
 - Rendering lives in `catus/src/ui/` (`chat.rs` = history/input/status bar; `overlay.rs` = modal pages); `tui.rs` only manages terminal raw-mode lifecycle. Interaction logic stays in `app.rs`.
 - Keys: Enter send, Esc/Ctrl+C quit, Up/Down/PageUp/PageDown scroll, Home/End jump.
 - `/resume <name>` loads `<history_dir>/<name>.json`; bare `/resume` opens a List-based picker overlay (↑/↓ select, Enter load, Esc cancel); `/status` opens a Table overlay with model/requests/token usage. Overlays swallow keys before the input line (`App::handle_overlay_key`).
+- `/mcp list` shows configured MCP servers and their discovered tools; `/mcp status` shows how many servers are connected.
 - Status bar keeps a compact right-aligned `ctx N tok | total M`; full details are in the /status page.
 - Streaming requests set `stream_options.include_usage`; the returned `Usage` (incl. cached tokens) accumulates in `App.usage`.
 

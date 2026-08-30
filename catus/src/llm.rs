@@ -12,7 +12,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use crate::message::{Message, Role};
-use crate::tool::{ToolCall, shell_tool_definition};
+use crate::tool::{ToolCall, ToolDefinition, shell_tool_definition};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -268,8 +268,16 @@ impl LlmClient {
         }
     }
 
-    fn build_request(&self, messages: &[Message], stream: bool) -> ChatRequest {
-        let tools = vec![serde_json::to_value(shell_tool_definition()).unwrap()];
+    fn build_request(
+        &self,
+        messages: &[Message],
+        extra_tools: &[ToolDefinition],
+        stream: bool,
+    ) -> ChatRequest {
+        let mut tools = vec![serde_json::to_value(shell_tool_definition()).unwrap()];
+        for def in extra_tools {
+            tools.push(serde_json::to_value(def).unwrap());
+        }
         ChatRequest {
             model: self.model.clone(),
             messages: messages
@@ -287,10 +295,14 @@ impl LlmClient {
     }
 
     /// Send a non-streaming chat request and return the full assistant reply.
-    pub async fn chat(&self, messages: &[Message]) -> Result<ChatReply, LlmError> {
+    pub async fn chat(
+        &self,
+        messages: &[Message],
+        extra_tools: &[ToolDefinition],
+    ) -> Result<ChatReply, LlmError> {
         let mut last_error: Option<LlmError> = None;
         for attempt in 0..5 {
-            match self.try_chat_once(messages).await {
+            match self.try_chat_once(messages, extra_tools).await {
                 Ok(reply) => return Ok(reply),
                 Err(e) => {
                     last_error = Some(e);
@@ -301,8 +313,12 @@ impl LlmClient {
         Err(last_error.unwrap_or_else(|| LlmError::Api("all retries exhausted".to_string())))
     }
 
-    async fn try_chat_once(&self, messages: &[Message]) -> Result<ChatReply, LlmError> {
-        let body = self.build_request(messages, false);
+    async fn try_chat_once(
+        &self,
+        messages: &[Message],
+        extra_tools: &[ToolDefinition],
+    ) -> Result<ChatReply, LlmError> {
+        let body = self.build_request(messages, extra_tools, false);
         let response = self
             .client
             .post(&self.url())
@@ -359,9 +375,10 @@ impl LlmClient {
     pub async fn stream_chat(
         &self,
         messages: &[Message],
+        extra_tools: &[ToolDefinition],
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<(), LlmError> {
-        let body = self.build_request(messages, true);
+        let body = self.build_request(messages, extra_tools, true);
         let response = self
             .client
             .post(&self.url())
@@ -735,12 +752,29 @@ mod tests {
     #[test]
     fn streaming_request_includes_stream_options() {
         let client = LlmClient::new("https://example.com", "key", "model");
-        let body = client.build_request(&[], true);
+        let body = client.build_request(&[], &[], true);
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains(r#""stream_options":{"include_usage":true}"#));
 
-        let non_streaming = client.build_request(&[], false);
+        let non_streaming = client.build_request(&[], &[], false);
         let json = serde_json::to_string(&non_streaming).unwrap();
         assert!(!json.contains("stream_options"));
+    }
+
+    #[test]
+    fn build_request_includes_extra_tools() {
+        let client = LlmClient::new("https://example.com", "key", "model");
+        let extra = ToolDefinition {
+            tool_type: "function".to_string(),
+            function: crate::tool::FunctionDefinition {
+                name: "fs__read".to_string(),
+                description: "read".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        };
+        let body = client.build_request(&[], &[extra], false);
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains("shell"));
+        assert!(json.contains("fs__read"));
     }
 }
