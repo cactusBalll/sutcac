@@ -51,6 +51,7 @@ struct Segment {
 /// Expand a single word into zero or more fields.
 pub fn expand_word(word: &str, ctx: &mut ExpandContext<'_>) -> Result<Vec<String>, String> {
     let segments = expand_to_segments(word, ctx)?;
+    let segments = expand_braces_in_segments(segments);
     let fields = split_words(segments);
     Ok(expand_globs(fields))
 }
@@ -393,7 +394,7 @@ fn positional_arg(n: usize, ctx: &ExpandContext<'_>) -> String {
 
 /// Expand $var/${var}/$1/$? etc. inside an arithmetic expression so the
 /// arithmetic evaluator sees literal integers.
-fn expand_arith_expr(expr: &str, ctx: &ExpandContext<'_>) -> Result<String, String> {
+pub(crate) fn expand_arith_expr(expr: &str, ctx: &ExpandContext<'_>) -> Result<String, String> {
     let mut out = String::new();
     let mut chars = expr.chars().peekable();
     while let Some(c) = chars.next() {
@@ -441,6 +442,195 @@ fn is_ifs(c: char) -> bool {
 }
 
 /// Split segments into fields using a simplified IFS (space, tab, newline).
+/// Perform brace expansion on each unquoted segment.
+///
+/// Quoted segments are left untouched so that `echo "{a,b}"` prints the literal
+/// brace string. Each brace expansion result becomes a new segment marked as a
+/// boundary so that splitting preserves the generated words.
+fn expand_braces_in_segments(segments: Vec<Segment>) -> Vec<Segment> {
+    let mut out = Vec::new();
+    for seg in segments {
+        if seg.quoted {
+            out.push(seg);
+            continue;
+        }
+        let expansions = expand_braces(&seg.value);
+        for (i, value) in expansions.into_iter().enumerate() {
+            out.push(Segment {
+                value,
+                quoted: false,
+                boundary: i > 0 || seg.boundary,
+            });
+        }
+    }
+    out
+}
+
+/// Expand brace patterns in a string.
+///
+/// Supports:
+/// - Comma-separated alternatives: `{a,b,c}`
+/// - Integer sequences: `{1..10}`, `{1..10..2}`
+/// - Character sequences: `{a..z}`, `{a..e..2}`
+/// - Nested braces: `{a,{b,c}}`
+fn expand_braces(value: &str) -> Vec<String> {
+    // Find the first top-level opening brace that should be expanded.
+    let mut depth = 0;
+    let mut start = None;
+    for (i, c) in value.char_indices() {
+        match c {
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = start {
+                        let body = &value[start + 1..i];
+                        let has_comma = split_brace_body(body).len() > 1;
+                        let is_sequence = expand_brace_sequence(&value[start..=i]).is_some();
+                        if !body.is_empty() && (has_comma || is_sequence) {
+                            let prefix = &value[..start];
+                            let suffix = &value[i + 1..];
+                            let body_expansions: Vec<String> = if has_comma {
+                                split_brace_body(body)
+                                    .into_iter()
+                                    .flat_map(|part| expand_braces(part))
+                                    .collect()
+                            } else {
+                                expand_brace_sequence(&value[start..=i])
+                                    .unwrap_or_else(|| vec![value.to_string()])
+                            };
+                            let expanded_prefix = expand_braces(prefix);
+                            let expanded_suffix = expand_braces(suffix);
+                            let mut result = Vec::new();
+                            for p in &expanded_prefix {
+                                for b in &body_expansions {
+                                    for s in &expanded_suffix {
+                                        result.push(format!("{}{}{}", p, b, s));
+                                    }
+                                }
+                            }
+                            return result;
+                        }
+                    }
+                    // Not an expandable brace; keep scanning.
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    // No braces to expand; check for `{start..end[..step]}` syntax.
+    if let Some(seq) = expand_brace_sequence(value) {
+        return seq;
+    }
+    vec![value.to_string()]
+}
+
+/// Split a brace body on top-level commas.
+fn split_brace_body(body: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+    for (i, c) in body.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&body[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&body[start..]);
+    parts
+}
+
+/// Expand a single top-level `{start..end[..step]}` pattern.
+fn expand_brace_sequence(value: &str) -> Option<Vec<String>> {
+    let inner = value.strip_prefix('{')?.strip_suffix('}')?;
+    let parts: Vec<&str> = inner.split("..").collect();
+    if parts.len() != 2 && parts.len() != 3 {
+        return None;
+    }
+    let start = parts[0].trim();
+    let end = parts[1].trim();
+    let step = parts.get(2).map(|s| s.trim());
+
+    if start.len() == 1 && end.len() == 1 {
+        let start_ch = start.chars().next()?;
+        let end_ch = end.chars().next()?;
+        let step = step.and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+        expand_char_sequence(start_ch, end_ch, step)
+    } else {
+        let start_n = start.parse::<i64>().ok()?;
+        let end_n = end.parse::<i64>().ok()?;
+        let step = step.and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
+        expand_int_sequence(start_n, end_n, step)
+    }
+}
+
+fn expand_int_sequence(start: i64, end: i64, step: i64) -> Option<Vec<String>> {
+    if step == 0 {
+        return None;
+    }
+    let mut result = Vec::new();
+    if start <= end && step > 0 {
+        let mut i = start;
+        while i <= end {
+            result.push(i.to_string());
+            i = i.checked_add(step)?;
+        }
+    } else if start >= end && step < 0 {
+        let mut i = start;
+        while i >= end {
+            result.push(i.to_string());
+            i = i.checked_add(step)?;
+        }
+    } else {
+        return None;
+    }
+    Some(result)
+}
+
+fn expand_char_sequence(start: char, end: char, step: usize) -> Option<Vec<String>> {
+    if step == 0 {
+        return None;
+    }
+    let start_u = start as u32;
+    let end_u = end as u32;
+    if start_u == end_u {
+        return Some(vec![start.to_string()]);
+    }
+    let mut result = Vec::new();
+    if start_u < end_u {
+        let mut u = start_u;
+        while u <= end_u {
+            if let Some(c) = char::from_u32(u) {
+                result.push(c.to_string());
+            }
+            u = u.checked_add(step as u32)?;
+        }
+    } else {
+        let mut u = start_u;
+        while u >= end_u {
+            if let Some(c) = char::from_u32(u) {
+                result.push(c.to_string());
+            }
+            u = u.saturating_sub(step as u32);
+            if u < end_u {
+                break;
+            }
+        }
+    }
+    Some(result)
+}
+
 fn split_words(segments: Vec<Segment>) -> Vec<Segment> {
     let mut fields: Vec<Segment> = Vec::new();
     let mut current = String::new();
@@ -537,6 +727,28 @@ mod tests {
         assert_eq!(expand_word("$X", &mut c).unwrap(), vec!["hello"]);
         assert_eq!(expand_word("'$X'", &mut c).unwrap(), vec!["$X"]);
         assert_eq!(expand_word("\"$X\"", &mut c).unwrap(), vec!["hello"]);
+    }
+
+    #[test]
+    fn brace_expansion() {
+        let mut c = ctx_with_vars(HashMap::new());
+        assert_eq!(expand_word("{a,b,c}", &mut c).unwrap(), vec!["a", "b", "c"]);
+        assert_eq!(expand_word("{1..3}", &mut c).unwrap(), vec!["1", "2", "3"]);
+        assert_eq!(expand_word("{a..c}", &mut c).unwrap(), vec!["a", "b", "c"]);
+        assert_eq!(
+            expand_word("file{1..3}.txt", &mut c).unwrap(),
+            vec!["file1.txt", "file2.txt", "file3.txt"]
+        );
+        assert_eq!(
+            expand_word("{1..5..2}", &mut c).unwrap(),
+            vec!["1", "3", "5"]
+        );
+        assert_eq!(
+            expand_word("{a,{b,c}}", &mut c).unwrap(),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(expand_word("\"{1..3}\"", &mut c).unwrap(), vec!["{1..3}"]);
+        assert_eq!(expand_word("{}", &mut c).unwrap(), vec!["{}"]);
     }
 
     #[test]

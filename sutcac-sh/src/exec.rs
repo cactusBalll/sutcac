@@ -6,6 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 
+use crate::arith;
 use crate::ast::*;
 use crate::audit::{AuditEvent, AuditLogger, AuditScope};
 use crate::builtin;
@@ -123,12 +124,24 @@ impl ShellState {
     }
 }
 
+/// Control-flow signal produced by a command.
+///
+/// `break` and `continue` propagate outward from nested commands until they are
+/// consumed by an enclosing loop.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Control {
+    Break(usize),
+    Continue(usize),
+}
+
 /// The result of executing a command: exit status plus captured stdout/stderr.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandOutput {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
+    /// Optional control-flow signal (`break`/`continue`) produced by the command.
+    pub control: Option<Control>,
 }
 
 impl CommandOutput {
@@ -137,6 +150,7 @@ impl CommandOutput {
             status,
             stdout: String::new(),
             stderr: String::new(),
+            control: None,
         }
     }
 
@@ -145,6 +159,16 @@ impl CommandOutput {
             status,
             stdout,
             stderr,
+            control: None,
+        }
+    }
+
+    fn with_control(control: Control) -> Self {
+        Self {
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            control: Some(control),
         }
     }
 }
@@ -174,6 +198,11 @@ fn command_summary(cmd: &Command) -> String {
         Command::Pipeline(_) => "pipeline".to_string(),
         Command::Group(_) => "{ ... }".to_string(),
         Command::Subshell(_) => "( ... )".to_string(),
+        Command::Negation(_) => "!".to_string(),
+        Command::ArithEval(_) => "(( ... ))".to_string(),
+        Command::ArithFor { .. } => "for ((...))".to_string(),
+        Command::Break(_) => "break".to_string(),
+        Command::Continue(_) => "continue".to_string(),
         Command::If { .. } => "if".to_string(),
         Command::While { .. } => "while".to_string(),
         Command::For { var, .. } => format!("for {}", var),
@@ -374,6 +403,9 @@ fn execute_command_scoped(
             // Connection operators (`&&`, `||`, `;`) are not themselves audited;
             // their children are recorded as sub-commands.
             let left_output = execute_command_scoped(left, state, AuditScope::SubCommand);
+            if left_output.control.is_some() {
+                return left_output;
+            }
             let right_output = match op {
                 ListOp::Semi => execute_command_scoped(right, state, AuditScope::SubCommand),
                 ListOp::And => {
@@ -398,7 +430,8 @@ fn execute_command_scoped(
             stdout.push_str(&right_output.stdout);
             let mut stderr = left_output.stderr;
             stderr.push_str(&right_output.stderr);
-            let output = CommandOutput::with_output(right_output.status, stdout, stderr);
+            let mut output = CommandOutput::with_output(right_output.status, stdout, stderr);
+            output.control = right_output.control;
             state.last_status = output.status;
             output
         }
@@ -412,6 +445,32 @@ fn execute_command_scoped(
             state.last_status = output.status;
             output
         }
+        Command::Negation(inner) => {
+            let output = execute_command_scoped(inner, state, scope);
+            if output.control.is_some() {
+                return output;
+            }
+            let inverted = if output.status == 0 { 1 } else { 0 };
+            state.last_status = inverted;
+            CommandOutput::with_output(inverted, output.stdout, output.stderr)
+        }
+        Command::ArithEval(expr) => {
+            let output = execute_arith_eval(expr, state);
+            state.last_status = output.status;
+            output
+        }
+        Command::ArithFor {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            let output = execute_arith_for(init, cond, step, body, state);
+            state.last_status = output.status;
+            output
+        }
+        Command::Break(n) => CommandOutput::with_control(Control::Break(n.unwrap_or(1))),
+        Command::Continue(n) => CommandOutput::with_control(Control::Continue(n.unwrap_or(1))),
         Command::If {
             cond,
             then_part,
@@ -451,6 +510,10 @@ fn execute_list(cmds: &[Command], state: &mut ShellState, scope: AuditScope) -> 
         output.status = next.status;
         output.stdout.push_str(&next.stdout);
         output.stderr.push_str(&next.stderr);
+        if next.control.is_some() {
+            output.control = next.control;
+            break;
+        }
     }
     output
 }
@@ -563,6 +626,100 @@ fn execute_simple(cmd: &SimpleCommand, state: &mut ShellState, scope: AuditScope
     }
 
     execute_external(name, args, &cmd.redirects, state)
+}
+
+/// Evaluate one clause of a C-style `for ((...))` loop or a standalone
+/// `((expr))` command. Returns the evaluated integer value.
+fn eval_arith_clause(expr: &str, state: &mut ShellState) -> Result<i64, CommandOutput> {
+    let mut subst_state = state.clone();
+    let mut executor =
+        |inner: &str| -> Result<String, String> { execute_substitution(inner, &mut subst_state) };
+    let mut ctx = expand_ctx_with_subst(state, &mut executor);
+    let expanded = match crate::expand::expand_arith_expr(expr, &mut ctx) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err(CommandOutput::with_output(
+                1,
+                String::new(),
+                format!("sutcac-sh: {}", e),
+            ));
+        }
+    };
+    arith::evaluate(&expanded, &mut state.vars).map_err(|e| {
+        CommandOutput::with_output(
+            1,
+            String::new(),
+            format!(
+                "sutcac-sh: arithmetic error: {}. Hint: use integer expressions only and avoid division by zero.",
+                e
+            ),
+        )
+    })
+}
+
+/// Evaluate a standalone `((expr))` arithmetic command.
+/// The expression value becomes the exit status (non-zero means true).
+fn execute_arith_eval(expr: &str, state: &mut ShellState) -> CommandOutput {
+    match eval_arith_clause(expr, state) {
+        Ok(value) => {
+            // Bash: non-zero value => true (exit 0), zero => false (exit 1).
+            let status = if value == 0 { 1 } else { 0 };
+            CommandOutput::new(status)
+        }
+        Err(e) => e,
+    }
+}
+
+/// Execute a C-style `for ((init; cond; step)); do ... done` loop.
+fn execute_arith_for(
+    init: &str,
+    cond: &str,
+    step: &str,
+    body: &[Command],
+    state: &mut ShellState,
+) -> CommandOutput {
+    if let Err(e) = eval_arith_clause(init, state) {
+        return e;
+    }
+
+    let mut output = CommandOutput::new(0);
+    loop {
+        let cond_value = match eval_arith_clause(cond, state) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        if cond_value == 0 {
+            break;
+        }
+
+        let next = execute_list(body, state, AuditScope::SubCommand);
+        output.status = next.status;
+        output.stdout.push_str(&next.stdout);
+        output.stderr.push_str(&next.stderr);
+        match next.control {
+            Some(Control::Break(1)) => {
+                output.control = None;
+                break;
+            }
+            Some(Control::Break(n)) => {
+                output.control = Some(Control::Break(n - 1));
+                break;
+            }
+            Some(Control::Continue(1)) => {
+                output.control = None;
+            }
+            Some(Control::Continue(n)) => {
+                output.control = Some(Control::Continue(n - 1));
+                break;
+            }
+            None => {}
+        }
+
+        if let Err(e) = eval_arith_clause(step, state) {
+            return e;
+        }
+    }
+    output
 }
 
 /// Execute the commands inside a `$(...)` command substitution and return the
@@ -1197,13 +1354,36 @@ fn execute_if(
 fn execute_while(cond: &Command, body: &[Command], state: &mut ShellState) -> CommandOutput {
     let mut output = CommandOutput::new(0);
     loop {
-        if execute_command_scoped(cond, state, AuditScope::SubCommand).status != 0 {
+        let cond_output = execute_command_scoped(cond, state, AuditScope::SubCommand);
+        if let Some(ctrl) = cond_output.control {
+            output.control = Some(ctrl);
+            break;
+        }
+        if cond_output.status != 0 {
             break;
         }
         let next = execute_list(body, state, AuditScope::SubCommand);
         output.status = next.status;
         output.stdout.push_str(&next.stdout);
         output.stderr.push_str(&next.stderr);
+        match next.control {
+            Some(Control::Break(1)) => {
+                output.control = None;
+                break;
+            }
+            Some(Control::Break(n)) => {
+                output.control = Some(Control::Break(n - 1));
+                break;
+            }
+            Some(Control::Continue(1)) => {
+                output.control = None;
+            }
+            Some(Control::Continue(n)) => {
+                output.control = Some(Control::Continue(n - 1));
+                break;
+            }
+            None => {}
+        }
     }
     output
 }
@@ -1246,6 +1426,24 @@ fn execute_for(
         output.status = next.status;
         output.stdout.push_str(&next.stdout);
         output.stderr.push_str(&next.stderr);
+        match next.control {
+            Some(Control::Break(1)) => {
+                output.control = None;
+                break;
+            }
+            Some(Control::Break(n)) => {
+                output.control = Some(Control::Break(n - 1));
+                break;
+            }
+            Some(Control::Continue(1)) => {
+                output.control = None;
+            }
+            Some(Control::Continue(n)) => {
+                output.control = Some(Control::Continue(n - 1));
+                break;
+            }
+            None => {}
+        }
     }
     output
 }
@@ -1725,6 +1923,49 @@ mod tests {
         assert!(output.stdout.contains("a"));
         assert!(output.stdout.contains("b"));
         assert!(output.stdout.contains("c"));
+    }
+
+    #[test]
+    fn break_exits_for_loop() {
+        let mut state = ShellState::new();
+        let mut parser =
+            Parser::new("for i in 1 2 3; do if [ $i -eq 2 ]; then break; fi; echo $i; done")
+                .unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("1"));
+        assert!(!output.stdout.contains("2"));
+        assert!(!output.stdout.contains("3"));
+    }
+
+    #[test]
+    fn continue_skips_iteration() {
+        let mut state = ShellState::new();
+        let mut parser =
+            Parser::new("for i in 1 2 3; do if [ $i -eq 2 ]; then continue; fi; echo $i; done")
+                .unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("1"));
+        assert!(!output.stdout.contains("2"));
+        assert!(output.stdout.contains("3"));
+    }
+
+    #[test]
+    fn break_n_exits_outer_loop() {
+        let mut state = ShellState::new();
+        let mut parser = Parser::new(
+            "for i in 1 2; do for j in a b; do if [ $j = b ]; then break 2; fi; echo $i$j; done; done",
+        )
+        .unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("1a"));
+        assert!(!output.stdout.contains("1b"));
+        assert!(!output.stdout.contains("2a"));
     }
 
     #[test]

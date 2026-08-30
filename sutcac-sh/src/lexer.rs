@@ -16,6 +16,8 @@ pub enum Token {
     Semi,
     LParen,
     RParen,
+    /// Standalone arithmetic expression: `(( ... ))`.
+    ArithExpr(String),
     Less,
     Greater,
     GreaterGreater,
@@ -78,8 +80,13 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 '(' => {
-                    self.advance();
-                    Token::LParen
+                    self.advance(); // consume '('
+                    if self.peek_char_eq('(') {
+                        self.advance(); // consume second '('
+                        Token::ArithExpr(self.read_arith_expr())
+                    } else {
+                        Token::LParen
+                    }
                 }
                 ')' => {
                     self.advance();
@@ -153,6 +160,76 @@ impl<'a> Lexer<'a> {
                 break;
             }
             self.advance();
+        }
+    }
+
+    /// Read the body of a standalone `(( ... ))` arithmetic command.
+    /// Called after the opening `((` has been consumed.
+    fn read_arith_expr(&mut self) -> String {
+        let start = self.pos;
+        let mut depth = 2;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut escape = false;
+
+        while let Some(&c) = self.chars.peek() {
+            if escape {
+                self.advance();
+                escape = false;
+                continue;
+            }
+            if in_single {
+                self.advance();
+                if c == '\'' {
+                    in_single = false;
+                }
+                continue;
+            }
+            if in_double {
+                self.advance();
+                match c {
+                    '"' => in_double = false,
+                    '\\' => escape = true,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '\\' => {
+                    self.advance();
+                    escape = true;
+                }
+                '\'' => {
+                    self.advance();
+                    in_single = true;
+                }
+                '"' => {
+                    self.advance();
+                    in_double = true;
+                }
+                '(' => {
+                    self.advance();
+                    depth += 1;
+                }
+                ')' => {
+                    self.advance();
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+
+        let raw = &self.input[start..self.pos];
+        // Strip the closing `))`.
+        if raw.len() >= 2 {
+            raw[..raw.len() - 2].to_string()
+        } else {
+            raw.to_string()
         }
     }
 

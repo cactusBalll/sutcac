@@ -17,6 +17,21 @@ pub enum Command {
     Group(Vec<Command>),
     /// Subshell command: `( list )` executed in a subshell.
     Subshell(Vec<Command>),
+    /// Negated command: `! cmd` inverts the exit status.
+    Negation(Box<Command>),
+    /// Standalone arithmetic evaluation: `((expr))`.
+    ArithEval(String),
+    /// C-style for loop: `for ((init; cond; step)); do ... done`.
+    ArithFor {
+        init: String,
+        cond: String,
+        step: String,
+        body: Vec<Command>,
+    },
+    /// Break out of a loop, optionally with a nesting level.
+    Break(Option<usize>),
+    /// Continue to the next iteration, optionally with a nesting level.
+    Continue(Option<usize>),
     /// If statement.
     If {
         cond: Box<Command>,

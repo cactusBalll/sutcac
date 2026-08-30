@@ -224,6 +224,33 @@ impl<'a> Parser<'a> {
         if self.current == Token::LParen {
             return self.parse_subshell();
         }
+        if let Token::ArithExpr(expr) = &self.current {
+            let expr = expr.clone();
+            self.bump();
+            return Ok(Command::ArithEval(expr));
+        }
+        if self.word_is("break") {
+            self.bump();
+            let n = if let Token::Number(n) = &self.current {
+                let v = *n as usize;
+                self.bump();
+                Some(v)
+            } else {
+                None
+            };
+            return Ok(Command::Break(n));
+        }
+        if self.word_is("continue") {
+            self.bump();
+            let n = if let Token::Number(n) = &self.current {
+                let v = *n as usize;
+                self.bump();
+                Some(v)
+            } else {
+                None
+            };
+            return Ok(Command::Continue(n));
+        }
 
         self.parse_simple_command(None)
     }
@@ -328,7 +355,18 @@ impl<'a> Parser<'a> {
 
     fn parse_if(&mut self) -> Result<Command, ParseError> {
         self.bump(); // if
+        let negated = if self.word_is("!") {
+            self.bump();
+            true
+        } else {
+            false
+        };
         let cond = Box::new(self.parse_list_until(&["then"])?);
+        let cond = if negated {
+            Box::new(Command::Negation(cond))
+        } else {
+            cond
+        };
         self.skip_newlines();
         self.expect_word("then")?;
         self.skip_newlines();
@@ -372,6 +410,36 @@ impl<'a> Parser<'a> {
 
     fn parse_for(&mut self) -> Result<Command, ParseError> {
         self.bump(); // for
+
+        // C-style for: for ((init; cond; step)); do ... done
+        if let Token::ArithExpr(expr) = &self.current {
+            let expr = expr.clone();
+            self.bump();
+            let parts: Vec<&str> = expr.split(';').collect();
+            if parts.len() != 3 {
+                return Err(ParseError(
+                    "C-style for requires three semicolon-separated expressions".into(),
+                ));
+            }
+            let init = parts[0].trim().to_string();
+            let cond = parts[1].trim().to_string();
+            let step = parts[2].trim().to_string();
+            if self.current == Token::Semi {
+                self.bump();
+            }
+            self.skip_newlines();
+            self.expect_word("do")?;
+            self.skip_newlines();
+            let body = self.parse_compound_body(&["done"])?;
+            self.expect_word("done")?;
+            return Ok(Command::ArithFor {
+                init,
+                cond,
+                step,
+                body,
+            });
+        }
+
         let var = match &self.current {
             Token::Word(s) => {
                 let v = s.clone();
@@ -559,11 +627,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_if_negation() {
+        let mut p = Parser::new("if ! false; then echo yes; fi").unwrap();
+        let cmds = p.parse().unwrap();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            Command::If { cond, .. } => {
+                assert!(matches!(cond.as_ref(), Command::Negation(_)));
+            }
+            _ => panic!("expected if"),
+        }
+    }
+
+    #[test]
+    fn parse_arith_eval() {
+        let mut p = Parser::new("((2 + 2 == 4))").unwrap();
+        let cmds = p.parse().unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Command::ArithEval(_)));
+    }
+
+    #[test]
     fn parse_for() {
         let mut p = Parser::new("for i in a b c; do echo $i; done").unwrap();
         let cmds = p.parse().unwrap();
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], Command::For { .. }));
+    }
+
+    #[test]
+    fn parse_arith_for() {
+        let mut p = Parser::new("for ((i=0; i<3; i++)); do echo $i; done").unwrap();
+        let cmds = p.parse().unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], Command::ArithFor { .. }));
     }
 
     #[test]

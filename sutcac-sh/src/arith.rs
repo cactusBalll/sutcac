@@ -313,6 +313,24 @@ impl<'a> Parser<'a> {
     fn parse_unary(&mut self) -> Result<i64, String> {
         self.skip_ws();
         match self.peek() {
+            Some('+') if self.peek_next() == Some('+') => {
+                self.advance();
+                self.advance();
+                let name = self.read_name()?;
+                let old = self.get_var(&name);
+                let new = old.wrapping_add(1);
+                self.set_var(&name, new);
+                Ok(new)
+            }
+            Some('-') if self.peek_next() == Some('-') => {
+                self.advance();
+                self.advance();
+                let name = self.read_name()?;
+                let old = self.get_var(&name);
+                let new = old.wrapping_sub(1);
+                self.set_var(&name, new);
+                Ok(new)
+            }
             Some('+') => {
                 self.advance();
                 self.parse_unary()
@@ -352,6 +370,23 @@ impl<'a> Parser<'a> {
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {
                 let name = self.read_name()?;
                 self.skip_ws();
+                // Postfix increment/decrement.
+                if self.peek() == Some('+') && self.peek_next() == Some('+') {
+                    self.advance();
+                    self.advance();
+                    let old = self.get_var(&name);
+                    let new = old.wrapping_add(1);
+                    self.set_var(&name, new);
+                    return Ok(old);
+                }
+                if self.peek() == Some('-') && self.peek_next() == Some('-') {
+                    self.advance();
+                    self.advance();
+                    let old = self.get_var(&name);
+                    let new = old.wrapping_sub(1);
+                    self.set_var(&name, new);
+                    return Ok(old);
+                }
                 // Assignment operators
                 let op = match self.peek() {
                     Some('=') if self.peek_next() != Some('=') => Some('='),
@@ -505,5 +540,19 @@ mod tests {
         assert_eq!(evaluate("x=5", &mut vars).unwrap(), 5);
         assert_eq!(evaluate("x+=3", &mut vars).unwrap(), 8);
         assert_eq!(evaluate("x*2", &mut vars).unwrap(), 16);
+    }
+
+    #[test]
+    fn increment_decrement() {
+        let mut vars = HashMap::new();
+        assert_eq!(evaluate("x=5", &mut vars).unwrap(), 5);
+        assert_eq!(evaluate("x++", &mut vars).unwrap(), 5);
+        assert_eq!(vars.get("x").unwrap(), "6");
+        assert_eq!(evaluate("++x", &mut vars).unwrap(), 7);
+        assert_eq!(vars.get("x").unwrap(), "7");
+        assert_eq!(evaluate("x--", &mut vars).unwrap(), 7);
+        assert_eq!(vars.get("x").unwrap(), "6");
+        assert_eq!(evaluate("--x", &mut vars).unwrap(), 5);
+        assert_eq!(vars.get("x").unwrap(), "5");
     }
 }
