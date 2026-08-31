@@ -4,10 +4,11 @@ Guide for AI agents working in this repo. All commands run from the workspace ro
 
 ## Overview
 
-Rust workspace (edition 2024, needs Rust 1.85+) with two crates:
+Rust workspace (edition 2024, needs Rust 1.85+) with three crates:
 
 - `sutcac-sh` — simplified Bash-compatible shell: hand-written lexer → recursive-descent parser (`ast.rs`) → word expansion (`expand.rs`, `glob.rs`, `arith.rs`) → execution (`exec.rs`). Also a library consumed by catus.
 - `catus` — Agent TUI binary: OpenAI-compatible streaming client (`llm.rs`), ratatui UI, executes the model's shell tool calls through embedded `sutcac-sh` (`tool.rs`, `app.rs`). Also an MCP client: configured MCP servers are connected at startup and their tools are exposed to the LLM (`mcp.rs`).
+- `mcp-calc-server` — standalone stdio MCP server used to test catus's MCP client support. Exposes arithmetic tools (`sum`, `sub`, `mul`, `div`, `modulo`).
 
 `bash.md` (Chinese) is the Bash-internals design reference.
 
@@ -46,9 +47,12 @@ cargo run -p sutcac-sh                   # interactive REPL (rustyline)
 
 cargo run -p catus                        # Agent TUI
 cargo run -p catus -- --test "prompt"     # headless one-shot test prompt
+
+cargo run -p mcp-calc-server              # calculator MCP server (stdio)
+cargo test -p mcp-calc-server             # unit + integration tests against catus MCP client
 ```
 
-No CI, lint config, or integration tests exist. Tests currently pass (~64 + 4 in sutcac-sh, ~87 in catus).
+No CI, lint config, or integration tests exist. Tests currently pass (~64 + 4 in sutcac-sh, ~87 in catus, ~9 in mcp-calc-server).
 
 ## Configuration
 

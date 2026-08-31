@@ -47,6 +47,13 @@ history_path = ".sutcac/history"
 # [mcp.servers.env]
 # HOME = "/home/user"
 
+# Example: local calculator MCP server built from this workspace.
+# Tools are exposed as `calc__sum`, `calc__sub`, `calc__mul`, `calc__div`,
+# and `calc__modulo`.
+# [[mcp.servers]]
+# name = "calc"
+# command = "target/debug/mcp-calc-server"
+
 [shell]
 # allow_all | allow:<tags> | deny:<tags> | allow:<tags> deny:<tags> | allow1:<cmds> | deny1:<cmds>
 perm_mode = "allow_all"
