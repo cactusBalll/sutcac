@@ -11,6 +11,7 @@ use ratatui::{
 
 use crate::app::{App, AppStatus};
 use crate::message::{Message, Role};
+use crossterm::event::KeyCode;
 
 const PROMPT: &str = "> ";
 const PROMPT_WIDTH: u16 = 2;
@@ -18,7 +19,11 @@ const PROMPT_WIDTH: u16 = 2;
 /// Draw the chat layout into the provided frame.
 pub fn draw_chat(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let candidate_height = app.candidates.len().min(crate::app::MAX_CANDIDATES) as u16;
+    let candidate_height = app
+        .input_state
+        .candidates
+        .len()
+        .min(crate::app::MAX_CANDIDATES) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -44,12 +49,12 @@ fn render_history(frame: &mut Frame, app: &mut App, area: Rect) {
     let total_wrapped_lines = paragraph.line_count(area.width);
     let visible_lines = area.height as usize;
 
-    // `app.scroll` is an offset from the bottom (0 = latest message).
+    // `app.chat_state.scroll` is an offset from the bottom (0 = latest message).
     // Clamp it here so `scroll_to_top()` cannot leave it at usize::MAX,
     // which would make subsequent scroll-down operations ineffective.
     let (bottom_offset, top_scroll) =
-        compute_history_scroll(total_wrapped_lines, visible_lines, app.scroll);
-    app.scroll = bottom_offset;
+        compute_history_scroll(total_wrapped_lines, visible_lines, app.chat_state.scroll);
+    app.chat_state.scroll = bottom_offset;
 
     let paragraph = paragraph.scroll((top_scroll, 0));
 
@@ -78,7 +83,8 @@ fn compute_history_scroll(
 
 fn render_input(frame: &mut Frame, app: &App, area: Rect) {
     let max_width = area.width.saturating_sub(PROMPT_WIDTH) as usize;
-    let (visible_input, cursor_offset) = visible_input_window(&app.input, app.cursor, max_width);
+    let (visible_input, cursor_offset) =
+        visible_input_window(&app.input_state.input, app.input_state.cursor, max_width);
 
     let input = Paragraph::new(Text::from(Line::from(vec![
         Span::styled(
@@ -166,12 +172,13 @@ fn render_candidates(frame: &mut Frame, app: &App, area: Rect) {
         .add_modifier(Modifier::REVERSED);
 
     let items: Vec<ListItem> = app
+        .input_state
         .candidates
         .iter()
         .take(crate::app::MAX_CANDIDATES)
         .enumerate()
         .map(|(i, candidate)| {
-            let style = if app.selected_candidate == Some(i) {
+            let style = if app.input_state.selected_candidate == Some(i) {
                 selected_style
             } else {
                 normal_style
@@ -182,7 +189,7 @@ fn render_candidates(frame: &mut Frame, app: &App, area: Rect) {
 
     let list = List::new(items).highlight_symbol("▶ ");
     let mut state = ListState::default();
-    state.select(app.selected_candidate);
+    state.select(app.input_state.selected_candidate);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -224,7 +231,7 @@ fn render_status(frame: &mut Frame, app: &mut App, area: Rect) {
     if !app.status_message.is_empty() {
         spans.push(Span::raw(app.status_message.clone()));
     } else {
-        let navigate = if app.input.starts_with('/') {
+        let navigate = if app.input_state.input.starts_with('/') {
             "↑↓:cmd"
         } else {
             "↑↓:hist"
@@ -273,6 +280,30 @@ pub(crate) fn format_tokens(tokens: u64) -> String {
 
 /// Maximum number of stdout lines shown for a shell tool result.
 const MAX_TOOL_STDOUT_LINES: usize = 20;
+
+/// Handle a key event that scrolls the chat history. Returns `true` if the
+/// key was consumed.
+pub fn handle_chat_key(app: &mut App, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Home => {
+            app.chat_state.scroll_to_top();
+            true
+        }
+        KeyCode::End => {
+            app.chat_state.scroll_to_bottom();
+            true
+        }
+        KeyCode::PageUp => {
+            app.chat_state.scroll_up(10);
+            true
+        }
+        KeyCode::PageDown => {
+            app.chat_state.scroll_down(10);
+            true
+        }
+        _ => false,
+    }
+}
 
 fn message_to_lines(msg: &Message) -> Vec<Line<'static>> {
     match msg.role {

@@ -4,15 +4,23 @@ use std::time::{Duration, Instant};
 
 use sutcac_sh::config::ShellConfig;
 use sutcac_sh::exec::ShellState;
-
-use crossterm::event::KeyCode;
+use tokio::sync::mpsc;
 
 use crate::config::AppConfig;
-use crate::llm::{LlmClient, Usage};
+use crate::llm::{LlmClient, LlmError, StreamEvent, Usage};
 use crate::mcp::McpManager;
 use crate::message::{Message, Role};
 use crate::skills::SkillRegistry;
 use crate::tool::{ToolCall, ToolDefinition, ToolResult, execute_shell_command};
+
+pub mod chat_state;
+pub mod commands;
+pub mod input_state;
+pub mod overlay_state;
+
+pub use chat_state::ChatState;
+pub use input_state::{InputState, MAX_CANDIDATES};
+pub use overlay_state::{Overlay, OverlayState};
 
 /// Current high-level state of the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,39 +31,16 @@ pub enum AppStatus {
     Error,
 }
 
-/// Modal page shown on top of the chat view.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Overlay {
-    /// No overlay; keys go to the input line.
-    None,
-    /// Interactive history picker. `items` are history file stems (newest
-    /// first), `selected` is the highlighted entry.
-    Resume { items: Vec<String>, selected: usize },
-    /// Token usage details.
-    Status,
-    /// Config editor.
-    Config { selected: usize },
-    /// Skill picker.
-    Skills { items: Vec<String>, selected: usize },
-}
-
-impl Overlay {
-    pub fn is_active(&self) -> bool {
-        !matches!(self, Overlay::None)
-    }
-}
-
-/// Result of handling a key press while an overlay is active.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OverlayResult {
-    /// The key was consumed by the overlay; nothing else to do.
-    Consumed,
-    /// The overlay was closed without an action.
-    Closed,
-    /// The resume picker confirmed a history name to load.
-    LoadHistory(String),
-    /// The skill picker confirmed a skill name to activate.
-    ActivateSkill(String),
+/// Result of pressing Enter in the input line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnEnterResult {
+    /// The input was a slash command and has been handled.
+    Handled,
+    /// The input was submitted as a user message; the caller should start
+    /// streaming the assistant reply.
+    Submitted,
+    /// The input was empty; nothing happened.
+    Empty,
 }
 
 /// Mutable application state shared between the TUI and async workers.
@@ -64,26 +49,9 @@ pub struct App {
     pub client: LlmClient,
     pub shell_state: ShellState,
     pub messages: Vec<Message>,
-    pub input: String,
-    /// Byte index of the cursor inside `input`. Always aligned to a UTF-8
-    /// character boundary.
-    pub cursor: usize,
     pub status: AppStatus,
     pub status_message: String,
-    pub scroll: usize,
-    pub auto_scroll: bool,
     pub max_tool_rounds: usize,
-    /// Submitted user inputs in the current session, newest first.
-    pub input_history: Vec<String>,
-    /// Index into `input_history` when recalling a previous input.
-    /// `None` means the user is editing a fresh line.
-    pub input_history_index: Option<usize>,
-    /// The line being typed before history recall started, restored by Down.
-    pub draft_input: String,
-    /// Current completion candidates shown below the input box.
-    pub candidates: Vec<String>,
-    /// Currently selected candidate index, if any.
-    pub selected_candidate: Option<usize>,
     pending_tool_calls: Vec<ToolCall>,
     tool_rounds_this_turn: usize,
     /// Path of the history file currently being continued, if any.
@@ -92,8 +60,6 @@ pub struct App {
     pub usage: Usage,
     /// Number of completed LLM requests in this session.
     pub request_count: usize,
-    /// Modal overlay currently displayed on top of the chat view.
-    pub overlay: Overlay,
     /// Set to true by `/exit` to request a clean shutdown.
     pub should_quit: bool,
     /// Instant after which `status_message` should be auto-cleared.
@@ -106,42 +72,16 @@ pub struct App {
     pub active_skills: Vec<String>,
     /// Connected MCP servers, if any.
     pub mcp_manager: Option<McpManager>,
+    /// Input-line state (cursor, history, completion candidates).
+    pub input_state: InputState,
+    /// Chat viewport state (scroll, auto-scroll).
+    pub chat_state: ChatState,
+    /// Modal overlay state.
+    pub overlay_state: OverlayState,
 }
-
-/// Built-in TUI slash commands offered by command completion.
-const SLASH_COMMANDS: &[&str] = &[
-    "/config", "/exit", "/help", "/mcp", "/resume", "/skill", "/status",
-];
-
-/// Maximum number of completion candidates shown at once.
-pub const MAX_CANDIDATES: usize = 8;
 
 /// How long transient status-bar messages remain visible before clearing.
 const STATUS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Return the previous UTF-8 character boundary before `idx`.
-fn prev_char_boundary(s: &str, idx: usize) -> usize {
-    if idx == 0 {
-        return 0;
-    }
-    let mut pos = idx - 1;
-    while !s.is_char_boundary(pos) {
-        pos -= 1;
-    }
-    pos
-}
-
-/// Return the next UTF-8 character boundary at or after `idx`.
-fn next_char_boundary(s: &str, idx: usize) -> usize {
-    if idx >= s.len() {
-        return s.len();
-    }
-    let mut pos = idx + 1;
-    while pos < s.len() && !s.is_char_boundary(pos) {
-        pos += 1;
-    }
-    pos
-}
 
 impl App {
     pub fn new(config: AppConfig) -> Self {
@@ -183,27 +123,20 @@ impl App {
             skill_registry,
             active_skills: Vec::new(),
             mcp_manager: None,
-            input: String::new(),
-            cursor: 0,
             status: AppStatus::Idle,
             status_message: String::new(),
-            scroll: 0,
-            auto_scroll: true,
             max_tool_rounds,
-            input_history: Vec::new(),
-            input_history_index: None,
-            draft_input: String::new(),
-            candidates: Vec::new(),
-            selected_candidate: None,
             pending_tool_calls: Vec::new(),
             tool_rounds_this_turn: 0,
             current_history_file: None,
             usage: Usage::default(),
             request_count: 0,
-            overlay: Overlay::None,
             should_quit: false,
             status_message_clear_at: None,
             config_path: AppConfig::find_config_file(),
+            input_state: InputState::new(),
+            chat_state: ChatState::new(),
+            overlay_state: OverlayState::new(),
         }
     }
 
@@ -253,185 +186,33 @@ impl App {
         }
     }
 
-    pub fn push_char(&mut self, c: char) {
-        self.input_history_index = None;
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-        self.recompute_candidates();
-    }
-
-    pub fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        self.input_history_index = None;
-        let prev = prev_char_boundary(&self.input, self.cursor);
-        self.input.replace_range(prev..self.cursor, "");
-        self.cursor = prev;
-        self.recompute_candidates();
-    }
-
-    pub fn move_cursor_left(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        self.cursor = prev_char_boundary(&self.input, self.cursor);
-    }
-
-    pub fn move_cursor_right(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        self.cursor = next_char_boundary(&self.input, self.cursor);
-    }
-
-    pub fn move_cursor_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    pub fn move_cursor_end(&mut self) {
-        self.cursor = self.input.len();
-    }
-
-    pub fn clear_input(&mut self) {
-        self.input.clear();
-        self.cursor = 0;
-        self.input_history_index = None;
-        self.draft_input.clear();
-        self.selected_candidate = None;
-        self.recompute_candidates();
-    }
-
     /// Take the current input and append it as a user message.
     pub fn submit_user_message(&mut self) -> Option<String> {
-        let text = self.input.trim();
-        if text.is_empty() {
-            return None;
-        }
-        let text = text.to_string();
+        let text = self.input_state.take_input()?;
         self.messages.push(Message::user(text.clone()));
-        self.record_input_history(&text);
+        self.input_state.record_history(&text);
 
-        self.input.clear();
-        self.cursor = 0;
-        self.input_history_index = None;
-        self.draft_input.clear();
-        self.selected_candidate = None;
-        self.recompute_candidates();
         self.tool_rounds_this_turn = 0;
-        self.scroll_to_bottom();
+        self.chat_state.scroll_to_bottom();
         Some(text)
     }
 
-    /// Remember a submitted line for Up/Down recall.
-    pub fn record_input_history(&mut self, text: &str) {
-        let text = text.trim();
-        if text.is_empty() {
-            return;
-        }
-        if self.input_history.first().map(|s| s.as_str()) != Some(text) {
-            self.input_history.insert(0, text.to_string());
-        }
-    }
-
-    /// Recompute the completion candidate list based on the current input.
-    fn recompute_candidates(&mut self) {
-        self.candidates.clear();
-        self.selected_candidate = None;
-
-        if self.input.is_empty() {
-            return;
+    /// Handle pressing Enter in the input line: slash commands take precedence;
+    /// otherwise submit the user message and signal that streaming should start.
+    pub async fn on_enter(&mut self) -> OnEnterResult {
+        let input = self.input_state.input.trim().to_string();
+        if input.is_empty() {
+            return OnEnterResult::Empty;
         }
 
-        if self.input.starts_with('/') {
-            for &cmd in SLASH_COMMANDS {
-                if cmd.starts_with(&self.input) && !self.candidates.contains(&cmd.to_string()) {
-                    self.candidates.push(cmd.to_string());
-                }
-            }
+        if self.handle_command(&input).await {
+            self.input_state.clear();
+            OnEnterResult::Handled
+        } else if self.submit_user_message().is_some() {
+            OnEnterResult::Submitted
         } else {
-            let prefix = self.input.to_lowercase();
-            for entry in &self.input_history {
-                if entry.to_lowercase().starts_with(&prefix) && !self.candidates.contains(entry) {
-                    self.candidates.push(entry.clone());
-                    if self.candidates.len() >= MAX_CANDIDATES {
-                        break;
-                    }
-                }
-            }
+            OnEnterResult::Empty
         }
-    }
-
-    /// Recall the next older input from the session history (bound to Up).
-    pub fn history_previous(&mut self) {
-        if self.input_history.is_empty() {
-            return;
-        }
-
-        match self.input_history_index {
-            None => {
-                self.draft_input = self.input.clone();
-                self.input_history_index = Some(0);
-            }
-            Some(i) if i + 1 < self.input_history.len() => {
-                self.input_history_index = Some(i + 1);
-            }
-            Some(_) => {}
-        }
-
-        if let Some(i) = self.input_history_index {
-            self.input = self.input_history[i].clone();
-            self.cursor = self.input.len();
-        }
-        self.selected_candidate = None;
-        self.recompute_candidates();
-    }
-
-    /// Recall the next newer input, restoring the draft line at the top (bound to Down).
-    pub fn history_next(&mut self) {
-        match self.input_history_index {
-            None => {}
-            Some(0) => {
-                self.input_history_index = None;
-                self.input = self.draft_input.clone();
-            }
-            Some(i) => {
-                self.input_history_index = Some(i - 1);
-                self.input = self.input_history[i - 1].clone();
-            }
-        }
-        self.cursor = self.input.len();
-        self.selected_candidate = None;
-        self.recompute_candidates();
-    }
-
-    /// Cycle through completion candidates by `delta` positions and fill the
-    /// input box with the selected candidate. Wraps around at both ends.
-    pub fn cycle_candidate(&mut self, delta: isize) {
-        if self.candidates.is_empty() {
-            return;
-        }
-
-        let idx = match self.selected_candidate {
-            None if delta >= 0 => 0usize,
-            None => self.candidates.len() - 1,
-            Some(i) => {
-                let len = self.candidates.len() as isize;
-                let next = (i as isize + delta).rem_euclid(len);
-                next as usize
-            }
-        };
-
-        self.selected_candidate = Some(idx);
-        self.input = self.candidates[idx].clone();
-        self.cursor = self.input.len();
-        self.input_history_index = None;
-        // Candidates stay valid because the new input matches the prefix.
-    }
-
-    /// Clear the active candidate selection without changing the input.
-    pub fn clear_candidate_selection(&mut self) {
-        self.selected_candidate = None;
     }
 
     /// Prepare a fresh assistant message for streaming.
@@ -479,7 +260,7 @@ impl App {
     pub fn finish_stream(&mut self) {
         self.status = AppStatus::Idle;
         self.status_message.clear();
-        self.scroll_to_bottom();
+        self.chat_state.scroll_to_bottom();
 
         if let Some(last) = self.messages.last() {
             log::info!(
@@ -504,7 +285,7 @@ impl App {
             self.messages.push(Message::event(
                 "Assistant returned an empty response".to_string(),
             ));
-            self.scroll_to_bottom();
+            self.chat_state.scroll_to_bottom();
         }
     }
 
@@ -584,41 +365,6 @@ impl App {
             .total_tokens
             .max(self.usage.prompt_tokens + self.usage.completion_tokens);
         self.usage.cached_tokens += usage.cached_tokens;
-    }
-
-    /// Whether a modal overlay is currently displayed.
-    pub fn overlay_active(&self) -> bool {
-        self.overlay.is_active()
-    }
-
-    /// Open the history picker overlay with available history names.
-    pub fn open_resume_overlay(&mut self) {
-        let items = self
-            .list_history_files()
-            .iter()
-            .filter_map(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-        self.overlay = Overlay::Resume { items, selected: 0 };
-    }
-
-    /// Open the token usage overlay.
-    pub fn open_status_overlay(&mut self) {
-        self.overlay = Overlay::Status;
-    }
-
-    /// Open the config editor overlay.
-    pub fn open_config_overlay(&mut self) {
-        self.overlay = Overlay::Config { selected: 0 };
-    }
-
-    /// Open the skill picker overlay.
-    pub fn open_skills_overlay(&mut self) {
-        let items = self.skill_registry.iter().map(|s| s.name.clone()).collect();
-        self.overlay = Overlay::Skills { items, selected: 0 };
     }
 
     /// Return a human-readable list of discovered skill names.
@@ -772,153 +518,6 @@ impl App {
         Ok(format!("saved {} to {}", key, path.display()))
     }
 
-    /// Close any active overlay.
-    pub fn close_overlay(&mut self) {
-        self.overlay = Overlay::None;
-    }
-
-    /// Handle a key press while an overlay is active. Keys never reach the
-    /// input line while an overlay is open.
-    pub fn handle_overlay_key(&mut self, code: KeyCode) -> OverlayResult {
-        match self.overlay.clone() {
-            Overlay::None => OverlayResult::Consumed,
-            Overlay::Status => match code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                    self.close_overlay();
-                    OverlayResult::Closed
-                }
-                _ => OverlayResult::Consumed,
-            },
-            Overlay::Resume { items, selected } => match code {
-                KeyCode::Up => {
-                    let next = if items.is_empty() {
-                        0
-                    } else {
-                        (selected + items.len() - 1) % items.len()
-                    };
-                    self.overlay = Overlay::Resume {
-                        items,
-                        selected: next,
-                    };
-                    OverlayResult::Consumed
-                }
-                KeyCode::Down => {
-                    let next = if items.is_empty() {
-                        0
-                    } else {
-                        (selected + 1) % items.len()
-                    };
-                    self.overlay = Overlay::Resume {
-                        items,
-                        selected: next,
-                    };
-                    OverlayResult::Consumed
-                }
-                KeyCode::Enter => {
-                    let chosen = items.get(selected).cloned();
-                    self.close_overlay();
-                    match chosen {
-                        Some(name) => OverlayResult::LoadHistory(name),
-                        None => OverlayResult::Closed,
-                    }
-                }
-                KeyCode::Esc => {
-                    self.close_overlay();
-                    OverlayResult::Closed
-                }
-                _ => OverlayResult::Consumed,
-            },
-            Overlay::Skills { items, selected } => match code {
-                KeyCode::Up => {
-                    let next = if items.is_empty() {
-                        0
-                    } else {
-                        (selected + items.len() - 1) % items.len()
-                    };
-                    self.overlay = Overlay::Skills {
-                        items,
-                        selected: next,
-                    };
-                    OverlayResult::Consumed
-                }
-                KeyCode::Down => {
-                    let next = if items.is_empty() {
-                        0
-                    } else {
-                        (selected + 1) % items.len()
-                    };
-                    self.overlay = Overlay::Skills {
-                        items,
-                        selected: next,
-                    };
-                    OverlayResult::Consumed
-                }
-                KeyCode::Enter => {
-                    let chosen = items.get(selected).cloned();
-                    self.close_overlay();
-                    match chosen {
-                        Some(name) => OverlayResult::ActivateSkill(name),
-                        None => OverlayResult::Closed,
-                    }
-                }
-                KeyCode::Esc => {
-                    self.close_overlay();
-                    OverlayResult::Closed
-                }
-                _ => OverlayResult::Consumed,
-            },
-            Overlay::Config { selected } => {
-                let fields = self.config_fields();
-                match code {
-                    KeyCode::Up => {
-                        let next = if fields.is_empty() {
-                            0
-                        } else {
-                            (selected + fields.len() - 1) % fields.len()
-                        };
-                        self.overlay = Overlay::Config { selected: next };
-                        OverlayResult::Consumed
-                    }
-                    KeyCode::Down => {
-                        let next = if fields.is_empty() {
-                            0
-                        } else {
-                            (selected + 1) % fields.len()
-                        };
-                        self.overlay = Overlay::Config { selected: next };
-                        OverlayResult::Consumed
-                    }
-                    KeyCode::Enter => {
-                        if let Some((key, value)) = fields.get(selected) {
-                            self.input = format!("/config set {} {}", key, value);
-                            self.cursor = self.input.len();
-                            self.recompute_candidates();
-                        }
-                        self.close_overlay();
-                        OverlayResult::Closed
-                    }
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        self.close_overlay();
-                        OverlayResult::Closed
-                    }
-                    _ => OverlayResult::Consumed,
-                }
-            }
-        }
-    }
-
-    /// Move the resume picker selection with the mouse wheel. Returns true if
-    /// the scroll was consumed by an overlay.
-    pub fn handle_overlay_scroll(&mut self, up: bool) -> bool {
-        match &self.overlay {
-            Overlay::Resume { .. } | Overlay::Config { .. } | Overlay::Skills { .. } => {
-                let _ = self.handle_overlay_key(if up { KeyCode::Up } else { KeyCode::Down });
-                true
-            }
-            _ => false,
-        }
-    }
-
     /// Set a status-bar message with an optional auto-clear timeout.
     pub fn set_status_message(&mut self, msg: impl Into<String>, timeout: Option<Duration>) {
         self.status_message = msg.into();
@@ -956,7 +555,7 @@ impl App {
         let text = msg.into();
         log::warn!("{}", text);
         self.messages.push(Message::event(text));
-        self.scroll_to_bottom();
+        self.chat_state.scroll_to_bottom();
     }
 
     /// Echo a shell command into the history area.
@@ -964,7 +563,7 @@ impl App {
         log::info!("running shell command: {}", command);
         self.messages
             .push(Message::event(format!("shell: {}", command)));
-        self.scroll_to_bottom();
+        self.chat_state.scroll_to_bottom();
     }
 
     pub fn clear_error(&mut self) {
@@ -1020,7 +619,7 @@ impl App {
 
         self.status = AppStatus::Idle;
         self.status_message.clear();
-        self.scroll_to_bottom();
+        self.chat_state.scroll_to_bottom();
 
         Some(message)
     }
@@ -1067,7 +666,7 @@ impl App {
         self.status_message = format!("Running: {}", call.name);
         self.messages
             .push(Message::event(format!("mcp: {}", call.name)));
-        self.scroll_to_bottom();
+        self.chat_state.scroll_to_bottom();
 
         match &self.mcp_manager {
             Some(manager) => match manager.call_tool(call).await {
@@ -1098,28 +697,6 @@ impl App {
                 stderr: format!("catus: no mcp manager available for tool '{}'", call.name),
             },
         }
-    }
-
-    pub fn scroll_up(&mut self, amount: usize) {
-        self.scroll = self.scroll.saturating_add(amount);
-        self.auto_scroll = false;
-    }
-
-    pub fn scroll_down(&mut self, amount: usize) {
-        self.scroll = self.scroll.saturating_sub(amount);
-        if self.scroll == 0 {
-            self.auto_scroll = true;
-        }
-    }
-
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll = 0;
-        self.auto_scroll = true;
-    }
-
-    pub fn scroll_to_top(&mut self) {
-        self.scroll = usize::MAX;
-        self.auto_scroll = false;
     }
 
     /// Load conversation history from a JSON file and append it after the
@@ -1159,7 +736,7 @@ impl App {
             self.messages.insert(0, Message::system(String::new()));
         }
         self.messages.extend(loaded);
-        self.scroll_to_bottom();
+        self.chat_state.scroll_to_bottom();
         Ok(())
     }
 
@@ -1264,7 +841,7 @@ impl App {
         self.messages = vec![Message::system(system_prompt)];
         self.load_history(&path)?;
         self.current_history_file = Some(path);
-        self.scroll_to_bottom();
+        self.chat_state.scroll_to_bottom();
         Ok("history loaded".to_string())
     }
 
@@ -1296,157 +873,93 @@ impl App {
     /// Handle a TUI slash command. Returns `true` if the input was a command
     /// and should not be sent to the LLM.
     pub async fn handle_command(&mut self, input: &str) -> bool {
-        if !input.starts_with('/') {
-            return false;
-        }
+        commands::handle_command(self, input).await
+    }
 
-        let rest = input[1..].trim();
-        let mut parts = rest.splitn(2, ' ');
-        let cmd = parts.next().unwrap_or("");
-        let arg = parts.next();
-
-        match cmd {
-            "help" => {
-                let help_text = format!(
-                    "Commands:\n\
-                     {cmds}\n\
-                     Keys: Enter send, Tab/↑↓ complete, PgUp/PgDn scroll, Ctrl+C quit",
-                    cmds = SLASH_COMMANDS.join(", ")
-                );
-                self.add_event_message(help_text);
-                self.set_transient_message("Help displayed");
-                self.record_input_history(input);
-            }
-            "exit" => {
-                self.should_quit = true;
-            }
-            "config" => {
-                let arg = arg.map(str::trim).filter(|s| !s.is_empty());
-                match arg {
-                    Some(args) => {
-                        let mut set_parts = args.splitn(3, ' ');
-                        let sub = set_parts.next().unwrap_or("");
-                        if sub == "set" {
-                            let key = set_parts.next().unwrap_or("");
-                            let value = set_parts.next().unwrap_or("");
-                            if key.is_empty() {
-                                self.set_error("usage: /config set <key> <value>");
-                            } else {
-                                match self.set_config_field(key, value) {
-                                    Ok(msg) => {
-                                        self.status = AppStatus::Idle;
-                                        self.set_transient_message(msg);
-                                    }
-                                    Err(e) => self.set_error(e.to_string()),
-                                }
-                            }
-                        } else {
-                            self.set_error(format!(
-                                "unknown /config subcommand: {}. Try /config set <key> <value>",
-                                sub
-                            ));
-                        }
-                        self.record_input_history(input);
-                    }
-                    None => {
-                        self.status = AppStatus::Idle;
-                        self.open_config_overlay();
-                    }
-                }
-            }
-            "resume" => {
-                let arg = arg.map(str::trim).filter(|s| !s.is_empty());
-                match arg {
-                    // `/resume <name>` loads the history directly.
-                    Some(name) => match self.resume_history(Some(name)) {
-                        Ok(msg) => {
-                            self.status = AppStatus::Idle;
-                            self.set_transient_message(msg);
-                        }
-                        Err(e) => self.set_error(e.to_string()),
-                    },
-                    // Bare `/resume` opens the interactive history picker.
-                    None => {
-                        self.status = AppStatus::Idle;
-                        self.open_resume_overlay();
-                    }
-                }
-                self.record_input_history(input);
-            }
-            "status" => {
-                self.status = AppStatus::Idle;
-                self.open_status_overlay();
-                self.record_input_history(input);
-            }
-            "skill" => {
-                self.status = AppStatus::Idle;
-                let arg = arg.map(str::trim).filter(|s| !s.is_empty());
-                match arg {
-                    Some(args) => {
-                        let mut parts = args.splitn(2, ' ');
-                        let sub = parts.next().unwrap_or("");
-                        let sub_arg = parts.next();
-                        match sub {
-                            "list" => {
-                                self.add_event_message(self.skill_names_list());
-                                self.set_transient_message("Skills listed");
-                            }
-                            "use" => match sub_arg {
-                                Some(name) => match self.activate_skill(name.trim()) {
-                                    Ok(msg) => self.set_transient_message(msg),
-                                    Err(e) => self.set_error(e.to_string()),
-                                },
-                                None => self.set_error("usage: /skill use <name>"),
-                            },
-                            _ => self.set_error(format!(
-                                "unknown /skill subcommand: {}. Try /skill list or /skill use <name>",
-                                sub
-                            )),
-                        }
-                        self.record_input_history(input);
-                    }
-                    None => {
-                        self.open_skills_overlay();
-                    }
-                }
-            }
-            "mcp" => {
-                self.status = AppStatus::Idle;
-                let arg = arg.map(str::trim).filter(|s| !s.is_empty());
-                match arg {
-                    Some(args) => {
-                        let mut parts = args.splitn(2, ' ');
-                        let sub = parts.next().unwrap_or("");
-                        match sub {
-                            "list" => {
-                                self.add_event_message(self.mcp_server_list().await);
-                                self.set_transient_message("MCP servers listed");
-                            }
-                            "status" => {
-                                self.add_event_message(self.mcp_status_message());
-                                self.set_transient_message("MCP status listed");
-                            }
-                            _ => self.set_error(format!(
-                                "unknown /mcp subcommand: {}. Try /mcp list or /mcp status",
-                                sub
-                            )),
-                        }
-                        self.record_input_history(input);
-                    }
-                    None => {
-                        self.add_event_message(self.mcp_status_message());
-                        self.set_transient_message("MCP status listed");
-                    }
-                }
-            }
-            _ => self.set_error(format!("unknown command: /{}", cmd)),
+    /// Process a streaming event from the LLM worker.
+    pub fn handle_stream_event(&mut self, event: StreamEvent) {
+        match event {
+            StreamEvent::Text(text) => self.append_stream_text(&text),
+            StreamEvent::Reasoning(text) => self.append_stream_reasoning(&text),
+            StreamEvent::ToolCall(call) => self.add_tool_call(call),
+            StreamEvent::Usage(usage) => self.record_usage(&usage),
         }
-        true
+    }
+
+    /// Start an async LLM stream and send events through `event_tx`.
+    ///
+    /// The stream task signals completion through `done_tx`.
+    pub async fn start_llm_stream(
+        &mut self,
+        event_tx: mpsc::Sender<StreamEvent>,
+        done_tx: mpsc::Sender<Result<(), LlmError>>,
+    ) {
+        // Snapshot the conversation *before* adding the assistant placeholder so
+        // the API request never contains an empty assistant message.
+        let messages = self.messages.clone();
+        let extra_tools = self.mcp_tool_definitions().await;
+        self.start_assistant_message();
+        let client = self.client.clone();
+
+        tokio::spawn(async move {
+            let result = client.stream_chat(&messages, &extra_tools, event_tx).await;
+            let _ = done_tx.send(result).await;
+        });
+    }
+
+    /// Handle the completion of an LLM stream, running any pending tool calls
+    /// and scheduling follow-up requests.
+    pub async fn handle_llm_done(
+        &mut self,
+        result: Result<(), LlmError>,
+        event_tx: &mpsc::Sender<StreamEvent>,
+        done_tx: &mpsc::Sender<Result<(), LlmError>>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.finish_stream();
+                if self.has_pending_tool_call() {
+                    log::info!(
+                        "{} pending tool call(s); running tool",
+                        self.pending_tool_calls_count()
+                    );
+                    self.run_pending_tool().await;
+                    self.start_llm_stream(event_tx.clone(), done_tx.clone())
+                        .await;
+                } else if self.pending_tool_calls_count() > 0 {
+                    let count = self.pending_tool_calls_count();
+                    if self.is_tool_round_limit_reached() {
+                        let msg = format!(
+                            "Reached max tool rounds ({}) for this turn; {} pending tool call(s) ignored.",
+                            self.max_tool_rounds(),
+                            count
+                        );
+                        log::warn!("{}", msg);
+                        self.add_event_message(msg);
+                    }
+                    self.clear_pending_tool_calls();
+                } else {
+                    log::info!("no pending tool call; turn complete");
+                }
+            }
+            Err(e) => {
+                // Remove the empty assistant placeholder so a failed request does
+                // not leave an invalid assistant message in the conversation.
+                if self.has_empty_assistant_placeholder() {
+                    self.messages.pop();
+                }
+                log::error!("llm stream error: {}", e);
+                self.add_event_message(format!("LLM request failed: {}", e));
+                self.set_error("LLM request failed".to_string());
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     fn test_config_with_history_dir(dir: &std::path::Path) -> AppConfig {
@@ -1677,19 +1190,22 @@ mod tests {
         submit_message(&mut app, "second");
         submit_message(&mut app, "third");
 
-        assert_eq!(app.input_history, vec!["third", "second", "first"]);
+        assert_eq!(
+            app.input_state.input_history,
+            vec!["third", "second", "first"]
+        );
 
         // Type a new draft line, then use Up/Down to recall history and restore it.
-        app.input = "draft".to_string();
-        app.history_previous();
-        assert_eq!(app.input, "third");
-        app.history_previous();
-        assert_eq!(app.input, "second");
-        app.history_next();
-        assert_eq!(app.input, "third");
-        app.history_next();
-        assert_eq!(app.input, "draft");
-        assert!(app.input_history_index.is_none());
+        app.input_state.input = "draft".to_string();
+        app.input_state.history_previous();
+        assert_eq!(app.input_state.input, "third");
+        app.input_state.history_previous();
+        assert_eq!(app.input_state.input, "second");
+        app.input_state.history_next();
+        assert_eq!(app.input_state.input, "third");
+        app.input_state.history_next();
+        assert_eq!(app.input_state.input, "draft");
+        assert!(app.input_state.input_history_index.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1704,7 +1220,7 @@ mod tests {
         submit_message(&mut app, "same");
         submit_message(&mut app, "same");
 
-        assert_eq!(app.input_history, vec!["same"]);
+        assert_eq!(app.input_state.input_history, vec!["same"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1716,10 +1232,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input = "/res".to_string();
-        app.recompute_candidates();
+        app.input_state.input = "/res".to_string();
+        app.input_state.recompute_candidates();
 
-        assert_eq!(app.candidates, vec!["/resume"]);
+        assert_eq!(app.input_state.candidates, vec!["/resume"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1735,10 +1251,13 @@ mod tests {
         submit_message(&mut app, "hello there");
         submit_message(&mut app, "goodbye");
 
-        app.input = "HEL".to_string();
-        app.recompute_candidates();
+        app.input_state.input = "HEL".to_string();
+        app.input_state.recompute_candidates();
 
-        assert_eq!(app.candidates, vec!["hello there", "Hello World"]);
+        assert_eq!(
+            app.input_state.candidates,
+            vec!["hello there", "Hello World"]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1750,20 +1269,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.candidates = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        app.input_state.candidates =
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
 
-        app.cycle_candidate(1);
-        assert_eq!(app.input, "alpha");
-        assert_eq!(app.selected_candidate, Some(0));
+        app.input_state.cycle_candidate(1);
+        assert_eq!(app.input_state.input, "alpha");
+        assert_eq!(app.input_state.selected_candidate, Some(0));
 
-        app.cycle_candidate(1);
-        assert_eq!(app.input, "beta");
+        app.input_state.cycle_candidate(1);
+        assert_eq!(app.input_state.input, "beta");
 
-        app.cycle_candidate(-1);
-        assert_eq!(app.input, "alpha");
+        app.input_state.cycle_candidate(-1);
+        assert_eq!(app.input_state.input, "alpha");
 
-        app.cycle_candidate(-1);
-        assert_eq!(app.input, "gamma"); // wrap backward
+        app.input_state.cycle_candidate(-1);
+        assert_eq!(app.input_state.input, "gamma"); // wrap backward
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1776,12 +1296,12 @@ mod tests {
 
         let mut app = App::new(test_config_with_history_dir(&dir));
         submit_message(&mut app, "base");
-        app.history_previous();
-        assert!(app.input_history_index.is_some());
+        app.input_state.history_previous();
+        assert!(app.input_state.input_history_index.is_some());
 
-        app.push_char('x');
-        assert!(app.input_history_index.is_none());
-        assert_eq!(app.input, "basex");
+        app.input_state.push_char('x');
+        assert!(app.input_state.input_history_index.is_none());
+        assert_eq!(app.input_state.input, "basex");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1793,28 +1313,28 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.push_char('a');
-        app.push_char('b');
-        app.push_char('c');
-        assert_eq!(app.input, "abc");
-        assert_eq!(app.cursor, 3);
+        app.input_state.push_char('a');
+        app.input_state.push_char('b');
+        app.input_state.push_char('c');
+        assert_eq!(app.input_state.input, "abc");
+        assert_eq!(app.input_state.cursor, 3);
 
-        app.move_cursor_left();
-        app.move_cursor_left();
-        assert_eq!(app.cursor, 1);
+        app.input_state.move_cursor_left();
+        app.input_state.move_cursor_left();
+        assert_eq!(app.input_state.cursor, 1);
 
-        app.push_char('x');
-        assert_eq!(app.input, "axbc");
-        assert_eq!(app.cursor, 2);
+        app.input_state.push_char('x');
+        assert_eq!(app.input_state.input, "axbc");
+        assert_eq!(app.input_state.cursor, 2);
 
-        app.backspace();
-        assert_eq!(app.input, "abc");
-        assert_eq!(app.cursor, 1);
+        app.input_state.backspace();
+        assert_eq!(app.input_state.input, "abc");
+        assert_eq!(app.input_state.cursor, 1);
 
-        app.move_cursor_home();
-        assert_eq!(app.cursor, 0);
-        app.move_cursor_end();
-        assert_eq!(app.cursor, 3);
+        app.input_state.move_cursor_home();
+        assert_eq!(app.input_state.cursor, 0);
+        app.input_state.move_cursor_end();
+        assert_eq!(app.input_state.cursor, 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1827,12 +1347,12 @@ mod tests {
         std::fs::write(dir.join("foo.json"), "[]").unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input = "/resume foo".to_string();
+        app.input_state.input = "/resume foo".to_string();
         app.handle_command("/resume foo").await;
 
-        assert_eq!(app.input_history, vec!["/resume foo"]);
-        app.history_previous();
-        assert_eq!(app.input, "/resume foo");
+        assert_eq!(app.input_state.input_history, vec!["/resume foo"]);
+        app.input_state.history_previous();
+        assert_eq!(app.input_state.input, "/resume foo");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1886,13 +1406,13 @@ mod tests {
             cached_tokens: 12,
         });
         assert!(app.handle_command("/status").await);
-        assert_eq!(app.overlay, Overlay::Status);
-        assert!(app.overlay_active());
+        assert_eq!(app.overlay_state.overlay, Overlay::Status);
+        assert!(app.overlay_state.is_active());
         assert_eq!(app.usage.prompt_tokens, 19);
 
         // Esc closes it.
-        assert_eq!(app.handle_overlay_key(KeyCode::Esc), OverlayResult::Closed);
-        assert!(!app.overlay_active());
+        crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert!(!app.overlay_state.is_active());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1911,7 +1431,7 @@ mod tests {
 
         let mut app = App::new(test_config_with_history_dir(&dir));
         assert!(app.handle_command("/resume").await);
-        let items = match &app.overlay {
+        let items = match &app.overlay_state.overlay {
             Overlay::Resume { items, selected } => {
                 assert_eq!(items.len(), 2);
                 assert_eq!(*selected, 0);
@@ -1921,24 +1441,28 @@ mod tests {
         };
 
         // Arrow keys move the selection with wrap-around.
-        app.handle_overlay_key(KeyCode::Down);
-        assert_eq!(app.overlay, Overlay::Resume { items, selected: 1 });
-        app.handle_overlay_key(KeyCode::Down);
-        match &app.overlay {
+        crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(
+            app.overlay_state.overlay,
+            Overlay::Resume { items, selected: 1 }
+        );
+        crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Down);
+        match &app.overlay_state.overlay {
             Overlay::Resume { selected, .. } => assert_eq!(*selected, 0),
             other => panic!("expected resume overlay, got {:?}", other),
         }
 
         // Enter loads the selected history and closes the picker.
-        let result = app.handle_overlay_key(KeyCode::Enter);
-        match result {
-            OverlayResult::LoadHistory(name) => {
+        let action =
+            crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Enter);
+        match action {
+            crate::ui::OverlayAction::LoadHistory(name) => {
                 let path = dir.join(format!("{}.json", name));
                 assert!(path.exists());
             }
             other => panic!("expected LoadHistory, got {:?}", other),
         }
-        assert!(!app.overlay_active());
+        assert!(!app.overlay_state.is_active());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1951,9 +1475,18 @@ mod tests {
         std::fs::write(dir.join("a.json"), "[]").unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.open_resume_overlay();
-        assert_eq!(app.handle_overlay_key(KeyCode::Esc), OverlayResult::Closed);
-        assert_eq!(app.overlay, Overlay::None);
+        let items = app
+            .list_history_files()
+            .iter()
+            .filter_map(|p| {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        app.overlay_state.open_resume(items);
+        crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert_eq!(app.overlay_state.overlay, Overlay::None);
         assert!(app.current_history_file.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1968,7 +1501,7 @@ mod tests {
 
         let mut app = App::new(test_config_with_history_dir(&dir));
         assert!(app.handle_command("/resume foo").await);
-        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.overlay_state.overlay, Overlay::None);
         assert_eq!(app.status_message, "history loaded");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1982,7 +1515,10 @@ mod tests {
 
         let mut app = App::new(test_config_with_history_dir(&dir));
         assert!(app.handle_command("/config").await);
-        assert!(matches!(app.overlay, Overlay::Config { selected: 0 }));
+        assert!(matches!(
+            app.overlay_state.overlay,
+            Overlay::Config { selected: 0 }
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2010,10 +1546,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.open_config_overlay();
-        app.handle_overlay_key(KeyCode::Enter);
-        assert!(app.input.starts_with("/config set "));
-        assert_eq!(app.overlay, Overlay::None);
+        app.overlay_state.open_config();
+        crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(app.input_state.input.starts_with("/config set "));
+        assert_eq!(app.overlay_state.overlay, Overlay::None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2090,9 +1626,9 @@ log_level = "info"
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input = "/st".to_string();
-        app.recompute_candidates();
-        assert_eq!(app.candidates, vec!["/status"]);
+        app.input_state.input = "/st".to_string();
+        app.input_state.recompute_candidates();
+        assert_eq!(app.input_state.candidates, vec!["/status"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2104,10 +1640,10 @@ log_level = "info"
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input = "/".to_string();
-        app.recompute_candidates();
-        assert!(app.candidates.contains(&"/help".to_string()));
-        assert!(app.candidates.contains(&"/exit".to_string()));
+        app.input_state.input = "/".to_string();
+        app.input_state.recompute_candidates();
+        assert!(app.input_state.candidates.contains(&"/help".to_string()));
+        assert!(app.input_state.candidates.contains(&"/exit".to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2119,9 +1655,9 @@ log_level = "info"
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input = "/mc".to_string();
-        app.recompute_candidates();
-        assert_eq!(app.candidates, vec!["/mcp"]);
+        app.input_state.input = "/mc".to_string();
+        app.input_state.recompute_candidates();
+        assert_eq!(app.input_state.candidates, vec!["/mcp"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2252,7 +1788,7 @@ log_level = "info"
 
     /// Helper that submits a user message directly without going through the TUI.
     fn submit_message(app: &mut App, text: &str) {
-        app.input = text.to_string();
+        app.input_state.input = text.to_string();
         app.submit_user_message();
     }
 }

@@ -1,13 +1,15 @@
 //! Modal overlay pages rendered on top of the chat view.
 //!
-//! Two pages exist:
+//! Pages:
 //! - [`Overlay::Resume`](crate::app::Overlay::Resume): interactive history
 //!   picker backed by a ratatui [`List`].
 //! - [`Overlay::Status`](crate::app::Overlay::Status): token usage details.
+//! - [`Overlay::Config`](crate::app::Overlay::Config): editable config fields.
+//! - [`Overlay::Skills`](crate::app::Overlay::Skills): skill picker.
 //!
-//! Key handling for overlays lives in `crate::app::App::handle_overlay_key`;
-//! this module only renders.
+//! This module renders overlays and handles keyboard navigation for them.
 
+use crossterm::event::KeyCode;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -18,12 +20,167 @@ use ratatui::{
 
 use crate::app::{App, Overlay};
 
+/// Result of handling a key press while an overlay is active.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayAction {
+    /// The key was consumed by the overlay; nothing else to do.
+    Consumed,
+    /// The overlay was closed without an action.
+    Closed,
+    /// The resume picker confirmed a history name to load.
+    LoadHistory(String),
+    /// The skill picker confirmed a skill name to activate.
+    ActivateSkill(String),
+}
+
+/// Handle a key press while an overlay is active. Keys never reach the
+/// input line while an overlay is open.
+pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
+    match app.overlay_state.overlay.clone() {
+        Overlay::None => OverlayAction::Consumed,
+        Overlay::Status => match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                app.overlay_state.close();
+                OverlayAction::Closed
+            }
+            _ => OverlayAction::Consumed,
+        },
+        Overlay::Resume { items, selected } => match code {
+            KeyCode::Up => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + items.len() - 1) % items.len()
+                };
+                app.overlay_state.overlay = Overlay::Resume {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Down => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + 1) % items.len()
+                };
+                app.overlay_state.overlay = Overlay::Resume {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Enter => {
+                let chosen = items.get(selected).cloned();
+                app.overlay_state.close();
+                match chosen {
+                    Some(name) => OverlayAction::LoadHistory(name),
+                    None => OverlayAction::Closed,
+                }
+            }
+            KeyCode::Esc => {
+                app.overlay_state.close();
+                OverlayAction::Closed
+            }
+            _ => OverlayAction::Consumed,
+        },
+        Overlay::Skills { items, selected } => match code {
+            KeyCode::Up => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + items.len() - 1) % items.len()
+                };
+                app.overlay_state.overlay = Overlay::Skills {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Down => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + 1) % items.len()
+                };
+                app.overlay_state.overlay = Overlay::Skills {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Enter => {
+                let chosen = items.get(selected).cloned();
+                app.overlay_state.close();
+                match chosen {
+                    Some(name) => OverlayAction::ActivateSkill(name),
+                    None => OverlayAction::Closed,
+                }
+            }
+            KeyCode::Esc => {
+                app.overlay_state.close();
+                OverlayAction::Closed
+            }
+            _ => OverlayAction::Consumed,
+        },
+        Overlay::Config { selected } => {
+            let fields = app.config_fields();
+            match code {
+                KeyCode::Up => {
+                    let next = if fields.is_empty() {
+                        0
+                    } else {
+                        (selected + fields.len() - 1) % fields.len()
+                    };
+                    app.overlay_state.overlay = Overlay::Config { selected: next };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Down => {
+                    let next = if fields.is_empty() {
+                        0
+                    } else {
+                        (selected + 1) % fields.len()
+                    };
+                    app.overlay_state.overlay = Overlay::Config { selected: next };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Enter => {
+                    if let Some((key, value)) = fields.get(selected) {
+                        app.input_state.input = format!("/config set {} {}", key, value);
+                        app.input_state.cursor = app.input_state.input.len();
+                        app.input_state.recompute_candidates();
+                    }
+                    app.overlay_state.close();
+                    OverlayAction::Closed
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.overlay_state.close();
+                    OverlayAction::Closed
+                }
+                _ => OverlayAction::Consumed,
+            }
+        }
+    }
+}
+
+/// Move the overlay selection with the mouse wheel. Returns true if the
+/// scroll was consumed by an overlay.
+pub fn handle_overlay_scroll(app: &mut App, up: bool) -> bool {
+    match &app.overlay_state.overlay {
+        Overlay::Resume { .. } | Overlay::Config { .. } | Overlay::Skills { .. } => {
+            let _ = handle_overlay_key(app, if up { KeyCode::Up } else { KeyCode::Down });
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Render the active overlay centered over the chat view.
 pub fn draw_overlay(frame: &mut Frame, app: &App) {
     let popup = centered_rect(60, 70, frame.area());
     frame.render_widget(Clear, popup);
 
-    match &app.overlay {
+    match &app.overlay_state.overlay {
         Overlay::None => {}
         Overlay::Resume { items, selected } => draw_resume(frame, items, *selected, popup),
         Overlay::Status => draw_status(frame, app, popup),
