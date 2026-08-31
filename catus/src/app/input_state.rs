@@ -3,7 +3,7 @@
 
 use crate::app::commands::BUILT_IN_REGISTRY;
 
-/// Maximum number of completion candidates shown at once.
+/// Maximum number of rows reserved for the completion candidate strip.
 pub const MAX_CANDIDATES: usize = 8;
 
 /// Mutable state for the one-line input box.
@@ -131,9 +131,6 @@ impl InputState {
             for entry in &self.input_history {
                 if entry.to_lowercase().starts_with(&prefix) && !self.candidates.contains(entry) {
                     self.candidates.push(entry.clone());
-                    if self.candidates.len() >= MAX_CANDIDATES {
-                        break;
-                    }
                 }
             }
         }
@@ -386,5 +383,21 @@ mod tests {
 
         state.cycle_candidate(-1);
         assert_eq!(state.input, "gamma"); // wrap backward
+    }
+
+    #[test]
+    fn history_completion_is_not_capped_to_max_candidates() {
+        let mut state = InputState::new();
+        for i in 0..12 {
+            state.record_history(&format!("cmd{}", i));
+        }
+        state.input = "cmd".to_string();
+        state.recompute_candidates();
+
+        assert_eq!(
+            state.candidates.len(),
+            12,
+            "all matching history entries should be candidates"
+        );
     }
 }

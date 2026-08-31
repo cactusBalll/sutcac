@@ -164,6 +164,23 @@ fn visible_input_window(s: &str, cursor: usize, max_width: usize) -> (&str, usiz
     (visible, cursor_offset)
 }
 
+/// Compute the scroll offset for a candidate list so that `selected` is
+/// visible inside a window of `visible_count` rows. The selection is centered
+/// when possible and clamped at the top and bottom edges.
+fn candidate_scroll_offset(total: usize, selected: usize, visible_count: usize) -> usize {
+    if total <= visible_count {
+        return 0;
+    }
+    let half = visible_count / 2;
+    if selected <= half {
+        0
+    } else if selected + visible_count - half >= total {
+        total - visible_count
+    } else {
+        selected - half
+    }
+}
+
 fn render_candidates(frame: &mut Frame, app: &App, area: Rect) {
     let normal_style = Style::default().fg(Color::Cyan);
     let selected_style = Style::default()
@@ -171,14 +188,29 @@ fn render_candidates(frame: &mut Frame, app: &App, area: Rect) {
         .add_modifier(Modifier::BOLD)
         .add_modifier(Modifier::REVERSED);
 
+    let total = app.input_state.candidates.len();
+    if total == 0 {
+        return;
+    }
+
+    let visible_count = area.height as usize;
+    let selected = app
+        .input_state
+        .selected_candidate
+        .unwrap_or(0)
+        .min(total - 1);
+    let offset = candidate_scroll_offset(total, selected, visible_count);
+
     let items: Vec<ListItem> = app
         .input_state
         .candidates
         .iter()
-        .take(crate::app::MAX_CANDIDATES)
+        .skip(offset)
+        .take(visible_count)
         .enumerate()
         .map(|(i, candidate)| {
-            let style = if app.input_state.selected_candidate == Some(i) {
+            let absolute_i = offset + i;
+            let style = if app.input_state.selected_candidate == Some(absolute_i) {
                 selected_style
             } else {
                 normal_style
@@ -189,7 +221,7 @@ fn render_candidates(frame: &mut Frame, app: &App, area: Rect) {
 
     let list = List::new(items).highlight_symbol("▶ ");
     let mut state = ListState::default();
-    state.select(app.input_state.selected_candidate);
+    state.select(app.input_state.selected_candidate.map(|i| i - offset));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -575,5 +607,19 @@ mod tests {
         let (clamped, top_scroll) = compute_history_scroll(10, 20, 5);
         assert_eq!(clamped, 0);
         assert_eq!(top_scroll, 0);
+    }
+
+    #[test]
+    fn candidate_scroll_offset_clamps_and_centers() {
+        // Short list: no scrolling needed.
+        assert_eq!(candidate_scroll_offset(5, 2, 8), 0);
+        // Long list: selection near top stays at top.
+        assert_eq!(candidate_scroll_offset(20, 1, 8), 0);
+        // Selection centered in the middle.
+        assert_eq!(candidate_scroll_offset(20, 10, 8), 10 - 4);
+        // Selection near bottom clamps to remaining rows.
+        assert_eq!(candidate_scroll_offset(20, 18, 8), 12);
+        // Last item keeps the window at the bottom.
+        assert_eq!(candidate_scroll_offset(20, 19, 8), 12);
     }
 }
