@@ -1,6 +1,8 @@
 //! Input-line state: typed text, cursor, history recall, and completion
 //! candidates.
 
+use crate::app::commands::BUILT_IN_REGISTRY;
+
 /// Maximum number of completion candidates shown at once.
 pub const MAX_CANDIDATES: usize = 8;
 
@@ -118,9 +120,10 @@ impl InputState {
         }
 
         if self.input.starts_with('/') {
-            for &cmd in SLASH_COMMANDS {
-                if cmd.starts_with(&self.input) && !self.candidates.contains(&cmd.to_string()) {
-                    self.candidates.push(cmd.to_string());
+            let candidates = BUILT_IN_REGISTRY.completion_candidates(&self.input);
+            for candidate in candidates {
+                if !self.candidates.contains(&candidate) {
+                    self.candidates.push(candidate);
                 }
             }
         } else {
@@ -209,11 +212,6 @@ impl InputState {
         self.selected_candidate = None;
     }
 }
-
-/// Built-in TUI slash commands offered by command completion.
-const SLASH_COMMANDS: &[&str] = &[
-    "/config", "/exit", "/help", "/mcp", "/resume", "/skill", "/status",
-];
 
 /// Return the previous UTF-8 character boundary before `idx`.
 fn prev_char_boundary(s: &str, idx: usize) -> usize {
@@ -337,11 +335,25 @@ mod tests {
     }
 
     #[test]
-    fn slash_command_completion_offers_mcp() {
+    fn slash_command_completion_offers_mcp_and_subcommands() {
         let mut state = InputState::new();
         state.input = "/mc".to_string();
         state.recompute_candidates();
-        assert_eq!(state.candidates, vec!["/mcp"]);
+        assert_eq!(state.candidates, vec!["/mcp", "/mcp list", "/mcp status"]);
+    }
+
+    #[test]
+    fn slash_command_completion_offers_parameterized_forms() {
+        let mut state = InputState::new();
+        state.input = "/mcp ".to_string();
+        state.recompute_candidates();
+        assert_eq!(state.candidates, vec!["/mcp list", "/mcp status"]);
+
+        state.input = "/help ".to_string();
+        state.recompute_candidates();
+        assert!(state.candidates.contains(&"/help config".to_string()));
+        assert!(state.candidates.contains(&"/help mcp".to_string()));
+        assert!(state.candidates.contains(&"/help mcp list".to_string()));
     }
 
     #[test]

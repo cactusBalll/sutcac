@@ -14,6 +14,7 @@ use crate::skills::SkillRegistry;
 use crate::tool::{ToolCall, ToolDefinition, ToolResult, execute_shell_command};
 
 pub mod chat_state;
+pub mod command;
 pub mod commands;
 pub mod input_state;
 pub mod overlay_state;
@@ -1649,7 +1650,7 @@ log_level = "info"
     }
 
     #[test]
-    fn slash_command_completion_offers_mcp() {
+    fn slash_command_completion_offers_mcp_and_subcommands() {
         let dir = std::env::temp_dir().join(format!("catus_slash_mcp_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1657,7 +1658,10 @@ log_level = "info"
         let mut app = App::new(test_config_with_history_dir(&dir));
         app.input_state.input = "/mc".to_string();
         app.input_state.recompute_candidates();
-        assert_eq!(app.input_state.candidates, vec!["/mcp"]);
+        assert_eq!(
+            app.input_state.candidates,
+            vec!["/mcp", "/mcp list", "/mcp status"]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1694,6 +1698,40 @@ log_level = "info"
         );
         assert!(app.status_message.contains("Help"));
         assert!(app.status_message_clear_at.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn help_command_with_argument_shows_command_help() {
+        let dir = std::env::temp_dir().join(format!("catus_help_arg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert!(app.handle_command("/help mcp list").await);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.is_event() && m.content.contains("/mcp list"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn help_command_reports_unknown_command() {
+        let dir = std::env::temp_dir().join(format!("catus_help_unknown_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert!(app.handle_command("/help nosuch").await);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.is_event() && m.content.contains("unknown command: /nosuch"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
