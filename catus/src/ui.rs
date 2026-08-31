@@ -57,10 +57,15 @@ pub async fn handle_key_event(app: &mut App, key: KeyEvent) -> AppAction {
 
     // Enter is special: it may run a slash command or submit a message.
     if key.code == KeyCode::Enter {
-        return match app.on_enter().await {
-            OnEnterResult::Submitted => AppAction::StartStream,
-            OnEnterResult::Handled | OnEnterResult::Empty => AppAction::None,
-        };
+        match app.on_enter().await {
+            OnEnterResult::Submitted => return AppAction::StartStream,
+            OnEnterResult::Handled | OnEnterResult::Empty => {}
+        }
+        // Slash commands such as /exit may request a clean shutdown.
+        if app.should_quit {
+            return AppAction::Quit;
+        }
+        return AppAction::None;
     }
 
     // Input-line keys take precedence over chat scroll keys.
@@ -95,5 +100,31 @@ fn handle_overlay_result(app: &mut App, result: OverlayAction) -> AppAction {
             Err(e) => AppAction::SetError(e.to_string()),
         },
         OverlayAction::Closed | OverlayAction::Consumed => AppAction::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    use super::*;
+    use crate::config::AppConfig;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        }
+    }
+
+    #[tokio::test]
+    async fn enter_exit_command_returns_quit_action() {
+        let mut app = App::new(AppConfig::default());
+        app.input_state.input = "/exit".to_string();
+        let action = handle_key_event(&mut app, key(KeyCode::Enter)).await;
+        assert_eq!(action, AppAction::Quit);
+        assert!(app.should_quit);
     }
 }
