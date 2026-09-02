@@ -7,7 +7,7 @@ Guide for AI agents working in this repo. All commands run from the workspace ro
 Rust workspace (edition 2024, needs Rust 1.85+) with three crates:
 
 - `sutcac-sh` — simplified Bash-compatible shell: hand-written lexer → recursive-descent parser (`ast.rs`) → word expansion (`expand.rs`, `glob.rs`, `arith.rs`) → execution (`exec.rs`). Also a library consumed by catus.
-- `catus` — Agent TUI binary: OpenAI-compatible streaming client (`llm.rs`), ratatui UI, executes the model's shell tool calls through embedded `sutcac-sh` (`tool.rs`, `app.rs`). Also an MCP client: configured MCP servers are connected at startup and their tools are exposed to the LLM (`mcp.rs`).
+- `catus` — Agent TUI binary: OpenAI-compatible streaming client (`llm.rs`), ratatui UI, executes the model's shell tool calls through embedded `sutcac-sh` (`tool/`, `app.rs`). Also an MCP client: configured MCP servers are connected at startup and their tools are exposed to the LLM (`mcp.rs`).
 - `mcp-calc-server` — standalone stdio MCP server used to test catus's MCP client support. Exposes arithmetic tools (`sum`, `sub`, `mul`, `div`, `modulo`).
 
 `bash.md` (Chinese) is the Bash-internals design reference.
@@ -30,8 +30,8 @@ Each search directory should contain skill subdirectories (e.g. `my-skill/SKILL.
 
 - At startup, only skill metadata (`name` and `description`) is loaded.
 - If `[agent].auto_include_skills` is true (default), the skill catalog is appended to the system prompt.
-- Use `/skill list` to show discovered skills, `/skill use <name>` to activate a skill, or bare `/skill` to open a picker overlay.
-- Activating a skill loads its full `SKILL.md` body and injects it as a system message.
+- The LLM activates a skill by calling the built-in `use_skill` tool (`SkillTool` in `tool/skill.rs`); activation loads the full `SKILL.md` body and injects it as a system message. Re-activation is idempotent.
+- Use `/skill list` to show discovered skills, `/skill use <name>` to activate a skill from the TUI, or bare `/skill` to open a picker overlay.
 
 ## Commands
 
@@ -92,11 +92,14 @@ Checked before every external command and redirection; denials return non-zero a
 - Tilde expansion reads `/etc/passwd` directly; no NSS.
 - `builtin::export` uses `unsafe { std::env::set_var }`.
 - Arithmetic (`arith.rs`) is integer-only with wrapping overflow; div/mod by zero is an error.
-- MCP tool names are prefixed with `{server_name}__` so the LLM can call the right server; `app.rs::run_pending_tool` dispatches `shell` locally and everything else through `McpManager`.
+- MCP tool names are prefixed with `{server_name}__` so the LLM can call the right server; each discovered tool is wrapped in an `McpTool` (`mcp.rs`) holding a shared `Arc<McpManager>`.
+- All LLM-callable tools implement the `Tool` trait defined in `tool.rs` (dyn-safe via a boxed-future `execute`, no `async-trait` dependency) and live in a `Toolbox` on `App`. Two sources: built-ins, one per file under `tool/` (`tool/shell.rs` = `ShellTool`, `tool/skill.rs` = `SkillTool`), and MCP-converted (`McpTool` in `mcp.rs`). `tool.rs` is generic infrastructure — `ToolCall` carries no per-tool semantics (argument parsing lives in each tool, e.g. `parse_command` in `tool/shell.rs`), and `App::new` is the composition root that registers the built-ins. `app.rs::run_pending_tool` dispatches purely by advertised tool name through `Toolbox::get`; `llm.rs` receives the full definition list from the caller and hardcodes nothing.
+- `SkillTool` (`use_skill`) activates skills via tool calls, not text markers: it loads the skill instructions through a `ToolContext` (`shell_state`, `skill_registry`, `active_skills`, `messages`) passed in by `App` at dispatch time.
 
 ## Conventions
 
 - Every source file starts with a `//!` doc comment; unit tests in a `#[cfg(test)] mod tests` in the same file.
+- Multi-file modules use the `foo.rs` + `foo/` layout — never `mod.rs`. The parent file (`app.rs`, `tool.rs`, `ui.rs`) declares `mod bar;` and submodule files live in the matching `foo/` directory (`tool/shell.rs`, `tool/skill.rs`).
 - Shell error messages go to stderr prefixed `sutcac-sh:`.
 - AST nodes derive `Clone`, `Debug`, `PartialEq` where useful; expansion functions take an `ExpandContext`.
 

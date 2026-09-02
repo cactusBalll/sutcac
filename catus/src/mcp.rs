@@ -2,13 +2,15 @@
 //!
 //! Connects to configured MCP servers (stdio child processes) via the `rmcp`
 //! SDK, discovers their tools, and forwards tool calls from the LLM to the
-//! correct server.
+//! correct server. Each discovered tool is wrapped in an [`McpTool`] and
+//! registered in the application's `Toolbox` alongside the built-in tools.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, ContentBlock, Tool},
+    model::{CallToolRequestParams, ContentBlock, Tool as RmcpTool},
     service::{RoleClient, RunningService},
     transport::TokioChildProcess,
 };
@@ -16,7 +18,7 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use crate::config::McpServerConfig;
-use crate::tool::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
+use crate::tool::{FunctionDefinition, Tool, ToolCall, ToolContext, ToolDefinition, ToolResult};
 
 /// Separator used to prefix MCP tool names with their server name.
 const SERVER_PREFIX_SEP: &str = "__";
@@ -87,7 +89,7 @@ impl McpClient {
     }
 
     /// Return all tools advertised by this server.
-    async fn list_tools(&self) -> Result<Vec<Tool>, McpError> {
+    async fn list_tools(&self) -> Result<Vec<RmcpTool>, McpError> {
         Ok(self.peer.list_all_tools().await?)
     }
 
@@ -188,6 +190,75 @@ impl McpManager {
     }
 }
 
+/// A single MCP tool converted into a catus [`Tool`].
+///
+/// Holds the shared manager and the tool's advertised definition; execution
+/// forwards the call to the owning server through the manager.
+pub struct McpTool {
+    manager: Arc<McpManager>,
+    definition: ToolDefinition,
+}
+
+impl McpTool {
+    fn new(manager: Arc<McpManager>, definition: ToolDefinition) -> Self {
+        Self {
+            manager,
+            definition,
+        }
+    }
+}
+
+impl Tool for McpTool {
+    fn name(&self) -> &str {
+        &self.definition.function.name
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        _ctx: &'a mut ToolContext<'_>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+        Box::pin(async move {
+            match self.manager.call_tool(call).await {
+                Ok(result) => {
+                    log::info!(
+                        "mcp tool finished: {} status={} stdout_len={} stderr_len={}",
+                        call.name,
+                        result.status,
+                        result.stdout.len(),
+                        result.stderr.len()
+                    );
+                    result
+                }
+                Err(e) => {
+                    log::warn!("mcp tool failed: {} error={}", call.name, e);
+                    ToolResult {
+                        call: call.clone(),
+                        status: 1,
+                        stdout: String::new(),
+                        stderr: format!("catus: mcp tool failed: {}", e),
+                    }
+                }
+            }
+        })
+    }
+}
+
+/// Wrap every tool advertised by the connected servers as an [`McpTool`].
+///
+/// Servers that fail to list their tools are logged and skipped.
+pub async fn mcp_tools(manager: Arc<McpManager>) -> Vec<McpTool> {
+    let mut tools = Vec::new();
+    for definition in manager.all_tool_definitions().await {
+        tools.push(McpTool::new(manager.clone(), definition));
+    }
+    tools
+}
+
 /// Parse the JSON arguments from a tool call. Empty or non-object input is
 /// treated as an empty object.
 fn parse_arguments(arguments: &str) -> Result<serde_json::Map<String, Value>, McpError> {
@@ -215,7 +286,7 @@ fn split_prefixed_name(prefixed_name: &str) -> Result<(&str, &str), McpError> {
 
 /// Convert an rmcp `Tool` into the OpenAI-compatible `ToolDefinition`, prefixing
 /// the tool name with the server name.
-fn tool_to_definition(server_name: &str, tool: Tool) -> ToolDefinition {
+fn tool_to_definition(server_name: &str, tool: RmcpTool) -> ToolDefinition {
     let name = format!("{}{}{}", server_name, SERVER_PREFIX_SEP, tool.name);
     let description = tool
         .description
@@ -325,7 +396,7 @@ mod tests {
 
     #[test]
     fn tool_definition_gets_prefixed_name() {
-        let tool = Tool::new(
+        let tool = RmcpTool::new(
             "read_file",
             "Read a file",
             serde_json::Map::from_iter([("type".to_string(), json!("object"))]),

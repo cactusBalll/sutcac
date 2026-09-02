@@ -12,7 +12,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use crate::message::{Message, Role};
-use crate::tool::{ToolCall, ToolDefinition, shell_tool_definition};
+use crate::tool::{ToolCall, ToolDefinition};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -271,13 +271,13 @@ impl LlmClient {
     fn build_request(
         &self,
         messages: &[Message],
-        extra_tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
         stream: bool,
     ) -> ChatRequest {
-        let mut tools = vec![serde_json::to_value(shell_tool_definition()).unwrap()];
-        for def in extra_tools {
-            tools.push(serde_json::to_value(def).unwrap());
-        }
+        let tools = tools
+            .iter()
+            .map(|def| serde_json::to_value(def).unwrap())
+            .collect();
         ChatRequest {
             model: self.model.clone(),
             messages: messages
@@ -298,11 +298,11 @@ impl LlmClient {
     pub async fn chat(
         &self,
         messages: &[Message],
-        extra_tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
     ) -> Result<ChatReply, LlmError> {
         let mut last_error: Option<LlmError> = None;
         for attempt in 0..5 {
-            match self.try_chat_once(messages, extra_tools).await {
+            match self.try_chat_once(messages, tools).await {
                 Ok(reply) => return Ok(reply),
                 Err(e) => {
                     last_error = Some(e);
@@ -316,9 +316,9 @@ impl LlmClient {
     async fn try_chat_once(
         &self,
         messages: &[Message],
-        extra_tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
     ) -> Result<ChatReply, LlmError> {
-        let body = self.build_request(messages, extra_tools, false);
+        let body = self.build_request(messages, tools, false);
         let response = self
             .client
             .post(&self.url())
@@ -375,10 +375,10 @@ impl LlmClient {
     pub async fn stream_chat(
         &self,
         messages: &[Message],
-        extra_tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<(), LlmError> {
-        let body = self.build_request(messages, extra_tools, true);
+        let body = self.build_request(messages, tools, true);
         let response = self
             .client
             .post(&self.url())
@@ -762,17 +762,27 @@ mod tests {
     }
 
     #[test]
-    fn build_request_includes_extra_tools() {
+    fn build_request_includes_all_tools() {
         let client = LlmClient::new("https://example.com", "key", "model");
-        let extra = ToolDefinition {
-            tool_type: "function".to_string(),
-            function: crate::tool::FunctionDefinition {
-                name: "fs__read".to_string(),
-                description: "read".to_string(),
-                parameters: serde_json::json!({"type": "object"}),
+        let tools = vec![
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: crate::tool::FunctionDefinition {
+                    name: "shell".to_string(),
+                    description: "run".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
             },
-        };
-        let body = client.build_request(&[], &[extra], false);
+            ToolDefinition {
+                tool_type: "function".to_string(),
+                function: crate::tool::FunctionDefinition {
+                    name: "fs__read".to_string(),
+                    description: "read".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            },
+        ];
+        let body = client.build_request(&[], &tools, false);
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("shell"));
         assert!(json.contains("fs__read"));

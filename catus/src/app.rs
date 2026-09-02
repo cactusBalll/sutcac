@@ -1,5 +1,6 @@
 //! Application state for the catus Agent TUI.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sutcac_sh::config::ShellConfig;
@@ -8,10 +9,10 @@ use tokio::sync::mpsc;
 
 use crate::config::AppConfig;
 use crate::llm::{LlmClient, LlmError, StreamEvent, Usage};
-use crate::mcp::McpManager;
+use crate::mcp::{McpManager, mcp_tools};
 use crate::message::{Message, Role};
 use crate::skills::SkillRegistry;
-use crate::tool::{ToolCall, ToolDefinition, ToolResult, execute_shell_command};
+use crate::tool::{ShellTool, SkillTool, Tool, ToolCall, ToolContext, ToolResult, Toolbox};
 
 pub mod chat_state;
 pub mod command;
@@ -72,7 +73,9 @@ pub struct App {
     /// Names of skills currently active in the conversation.
     pub active_skills: Vec<String>,
     /// Connected MCP servers, if any.
-    pub mcp_manager: Option<McpManager>,
+    pub mcp_manager: Option<Arc<McpManager>>,
+    /// All tools available to the LLM: built-in plus MCP-converted.
+    pub toolbox: Toolbox,
     /// Input-line state (cursor, history, completion candidates).
     pub input_state: InputState,
     /// Chat viewport state (scroll, auto-scroll).
@@ -116,6 +119,12 @@ impl App {
         let system_prompt = Self::build_system_prompt(&config, &skill_registry);
         let max_tool_rounds = config.agent.max_tool_rounds;
 
+        // Composition root: register the built-in tools; MCP tools are added
+        // in `connect_mcp` as servers come online.
+        let mut toolbox = Toolbox::default();
+        toolbox.register(Box::new(ShellTool));
+        toolbox.register(Box::new(SkillTool));
+
         Self {
             config,
             client,
@@ -124,6 +133,7 @@ impl App {
             skill_registry,
             active_skills: Vec::new(),
             mcp_manager: None,
+            toolbox,
             status: AppStatus::Idle,
             status_message: String::new(),
             max_tool_rounds,
@@ -147,7 +157,7 @@ impl App {
         if config.agent.auto_include_skills && !registry.is_empty() {
             prompt.push_str("\n\nThe following Agent Skills are available. ");
             prompt.push_str("When a task matches a skill's description, activate it ");
-            prompt.push_str("by saying 'use_skill:<name>' at the start of your reply, ");
+            prompt.push_str("by calling the `use_skill` tool with the skill name, ");
             prompt.push_str("then follow the skill's instructions.\n\n");
             for (name, description) in registry.names_and_descriptions() {
                 prompt.push_str(&format!("- {}: {}\n", name, description));
@@ -174,17 +184,14 @@ impl App {
             self.mcp_manager = None;
         } else {
             log::info!("{} mcp server(s) connected", manager.len());
+            let manager = Arc::new(manager);
+            for tool in mcp_tools(manager.clone()).await {
+                log::info!("registered mcp tool '{}'", tool.name());
+                self.toolbox.register(Box::new(tool));
+            }
             self.mcp_manager = Some(manager);
         }
         warnings
-    }
-
-    /// Return the extra tool definitions advertised by connected MCP servers.
-    pub async fn mcp_tool_definitions(&self) -> Vec<ToolDefinition> {
-        match &self.mcp_manager {
-            Some(manager) => manager.all_tool_definitions().await,
-            None => Vec::new(),
-        }
     }
 
     /// Take the current input and append it as a user message.
@@ -272,13 +279,8 @@ impl App {
             );
         }
 
-        // Check for a skill activation marker in the assistant's text.
-        if let Some(name) = self.take_skill_activation_marker() {
-            match self.activate_skill(&name) {
-                Ok(msg) => self.set_transient_message(msg),
-                Err(e) => self.set_error(e.to_string()),
-            }
-        }
+        // Skill activation is driven by `use_skill` tool calls handled in
+        // `run_pending_tool`, not by text markers.
 
         if self.has_empty_assistant_placeholder() {
             log::warn!("assistant response was empty; dropping placeholder message");
@@ -288,51 +290,6 @@ impl App {
             ));
             self.chat_state.scroll_to_bottom();
         }
-    }
-
-    /// If the most recent assistant message starts with `use_skill:<name>`,
-    /// remove that prefix and return the skill name.
-    pub fn take_skill_activation_marker(&mut self) -> Option<String> {
-        let content = self.messages.last().and_then(|last| {
-            if last.role == Role::Assistant {
-                Some(last.content.clone())
-            } else {
-                None
-            }
-        })?;
-
-        let trimmed = content.trim_start();
-        let prefix = "use_skill:";
-        if !trimmed.starts_with(prefix) {
-            return None;
-        }
-        let rest = &trimmed[prefix.len()..];
-        let name = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or(rest)
-            .trim()
-            .to_string();
-        if name.is_empty() {
-            return None;
-        }
-
-        // Remove the marker from the message content.
-        let marker_end = content.find(prefix).unwrap_or(0) + prefix.len() + rest.len()
-            - rest.trim_start().len()
-            + name.len();
-        let after_marker = content[marker_end..].trim_start().to_string();
-
-        if let Some(last) = self.messages.last_mut() {
-            last.content = after_marker;
-        }
-
-        // Ignore re-activation of a skill that is already active.
-        if self.active_skills.contains(&name) {
-            return None;
-        }
-
-        Some(name)
     }
 
     /// Return true if the most recent message is an empty assistant placeholder
@@ -559,14 +516,6 @@ impl App {
         self.chat_state.scroll_to_bottom();
     }
 
-    /// Echo a shell command into the history area.
-    pub fn echo_shell_command(&mut self, command: &str) {
-        log::info!("running shell command: {}", command);
-        self.messages
-            .push(Message::event(format!("shell: {}", command)));
-        self.chat_state.scroll_to_bottom();
-    }
-
     pub fn clear_error(&mut self) {
         if self.status == AppStatus::Error {
             self.status = AppStatus::Idle;
@@ -603,13 +552,39 @@ impl App {
 
     /// Execute the first pending tool call and append the result as a tool
     /// message. Returns the formatted tool result message.
+    ///
+    /// Dispatch is driven entirely by the `Toolbox`: the advertised tool name
+    /// selects the implementation (built-in or MCP-converted).
     pub async fn run_pending_tool(&mut self) -> Option<String> {
         let call = self.pending_tool_calls.first()?.clone();
 
-        let result = if call.name == "shell" {
-            self.run_shell_tool(&call).await
-        } else {
-            self.run_mcp_tool(&call).await
+        let result = match self.toolbox.get(&call.name) {
+            Some(tool) => {
+                self.status = AppStatus::RunningTool;
+                let description = tool.describe_call(&call);
+                self.status_message = format!("Running: {}", description);
+                log::info!("running tool: {}", description);
+                self.messages
+                    .push(Message::event(format!("tool: {}", description)));
+                self.chat_state.scroll_to_bottom();
+
+                let mut ctx = ToolContext {
+                    shell_state: &mut self.shell_state,
+                    skill_registry: &mut self.skill_registry,
+                    active_skills: &mut self.active_skills,
+                    messages: &mut self.messages,
+                };
+                tool.execute(&call, &mut ctx).await
+            }
+            None => {
+                log::warn!("unknown tool call: {}", call.name);
+                ToolResult {
+                    call: call.clone(),
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: format!("catus: unknown tool '{}'", call.name),
+                }
+            }
         };
 
         let message = result.to_message();
@@ -623,81 +598,6 @@ impl App {
         self.chat_state.scroll_to_bottom();
 
         Some(message)
-    }
-
-    /// Execute the built-in shell tool.
-    async fn run_shell_tool(&mut self, call: &ToolCall) -> ToolResult {
-        let Some(command) = call.shell_command() else {
-            // Malformed arguments: report back to the model and consume the
-            // call instead of leaving it pending forever.
-            log::warn!("malformed tool call: {}", call.arguments);
-            return ToolResult {
-                call: call.clone(),
-                status: 2,
-                stdout: String::new(),
-                stderr: format!(
-                    "catus: tool call format error: arguments must be a single JSON object {{\"command\": \"<shell command>\"}} with exactly one string \"command\" field; got: {}",
-                    call.arguments
-                ),
-            };
-        };
-
-        self.status = AppStatus::RunningTool;
-        self.status_message = format!("Running: {}", command);
-        self.echo_shell_command(&command);
-
-        let output = execute_shell_command(&command, &mut self.shell_state);
-        log::info!(
-            "shell command finished: status={} stdout_len={} stderr_len={}",
-            output.status,
-            output.stdout.len(),
-            output.stderr.len()
-        );
-        ToolResult {
-            call: call.clone(),
-            status: output.status,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        }
-    }
-
-    /// Execute an MCP tool through the configured manager.
-    async fn run_mcp_tool(&mut self, call: &ToolCall) -> ToolResult {
-        self.status = AppStatus::RunningTool;
-        self.status_message = format!("Running: {}", call.name);
-        self.messages
-            .push(Message::event(format!("mcp: {}", call.name)));
-        self.chat_state.scroll_to_bottom();
-
-        match &self.mcp_manager {
-            Some(manager) => match manager.call_tool(call).await {
-                Ok(result) => {
-                    log::info!(
-                        "mcp tool finished: {} status={} stdout_len={} stderr_len={}",
-                        call.name,
-                        result.status,
-                        result.stdout.len(),
-                        result.stderr.len()
-                    );
-                    result
-                }
-                Err(e) => {
-                    log::warn!("mcp tool failed: {} error={}", call.name, e);
-                    ToolResult {
-                        call: call.clone(),
-                        status: 1,
-                        stdout: String::new(),
-                        stderr: format!("catus: mcp tool failed: {}", e),
-                    }
-                }
-            },
-            None => ToolResult {
-                call: call.clone(),
-                status: 1,
-                stdout: String::new(),
-                stderr: format!("catus: no mcp manager available for tool '{}'", call.name),
-            },
-        }
     }
 
     /// Load conversation history from a JSON file and append it after the
@@ -898,12 +798,12 @@ impl App {
         // Snapshot the conversation *before* adding the assistant placeholder so
         // the API request never contains an empty assistant message.
         let messages = self.messages.clone();
-        let extra_tools = self.mcp_tool_definitions().await;
+        let tools = self.toolbox.definitions();
         self.start_assistant_message();
         let client = self.client.clone();
 
         tokio::spawn(async move {
-            let result = client.stream_chat(&messages, &extra_tools, event_tx).await;
+            let result = client.stream_chat(&messages, &tools, event_tx).await;
             let _ = done_tx.send(result).await;
         });
     }
@@ -1787,39 +1687,65 @@ log_level = "info"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn skill_activation_marker_is_extracted_and_removed() {
-        let dir = std::env::temp_dir().join(format!("catus_skill_marker_{}", std::process::id()));
+    #[tokio::test]
+    async fn run_pending_tool_dispatches_use_skill_through_toolbox() {
+        let dir = std::env::temp_dir().join(format!("catus_app_skill_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("demo")).unwrap();
+        std::fs::write(
+            dir.join("demo/SKILL.md"),
+            "---\nname: demo\ndescription: Demo.\n---\nDo the demo thing.",
+        )
+        .unwrap();
 
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        app.messages.push(Message::assistant(
-            "use_skill:my-skill\n\ndo it".to_string(),
-        ));
+        let mut config = test_config_with_history_dir(&dir);
+        config.agent.skill_paths = Some(vec![dir.clone()]);
+        let mut app = App::new(config);
+        assert!(app.toolbox.get("use_skill").is_some());
 
-        let name = app.take_skill_activation_marker();
-        assert_eq!(name, Some("my-skill".to_string()));
-        assert_eq!(app.messages.last().unwrap().content, "do it");
+        app.messages.push(Message::assistant(String::new()));
+        app.add_tool_call(ToolCall {
+            id: "call_1".to_string(),
+            name: "use_skill".to_string(),
+            arguments: r#"{"name":"demo"}"#.to_string(),
+        });
+
+        let result = app.run_pending_tool().await;
+        assert!(
+            result.unwrap().contains("activated skill 'demo'"),
+            "tool result should confirm activation"
+        );
+        assert_eq!(app.active_skills, vec!["demo".to_string()]);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Skill 'demo' instructions")),
+            "instructions should be injected as a system message"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn repeated_skill_activation_marker_is_ignored_when_already_active() {
-        let dir = std::env::temp_dir().join(format!("catus_skill_repeat_{}", std::process::id()));
+    #[tokio::test]
+    async fn run_pending_tool_reports_unknown_tool() {
+        let dir = std::env::temp_dir().join(format!("catus_app_unknown_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.active_skills.push("my-skill".to_string());
-        app.messages.push(Message::assistant(
-            "use_skill:my-skill\n\ndo it".to_string(),
-        ));
+        app.messages.push(Message::assistant(String::new()));
+        app.add_tool_call(ToolCall {
+            id: "call_1".to_string(),
+            name: "nonexistent".to_string(),
+            arguments: "{}".to_string(),
+        });
 
-        let name = app.take_skill_activation_marker();
-        assert_eq!(name, None);
-        assert_eq!(app.messages.last().unwrap().content, "do it");
+        let result = app.run_pending_tool().await;
+        assert!(
+            result.unwrap().contains("unknown tool 'nonexistent'"),
+            "unknown tools should be reported back"
+        );
+        assert_eq!(app.pending_tool_calls_count(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

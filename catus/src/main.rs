@@ -8,7 +8,7 @@ use log::LevelFilter;
 use simplelog::{Config, WriteLogger};
 use tokio::sync::mpsc;
 
-use catus::app::{App, AppStatus};
+use catus::app::App;
 use catus::config::AppConfig;
 use catus::llm::{LlmError, StreamEvent};
 use catus::message::Message;
@@ -89,8 +89,8 @@ async fn run_test_mode(
     app.messages.push(Message::user(prompt));
 
     for round in 0..max_rounds {
-        let extra_tools = app.mcp_tool_definitions().await;
-        match client.chat(&app.messages, &extra_tools).await {
+        let tools = app.toolbox.definitions();
+        match client.chat(&app.messages, &tools).await {
             Ok(reply) => {
                 if !reply.content.is_empty() {
                     println!("ASSISTANT: {}", reply.content);
@@ -114,21 +114,8 @@ async fn run_test_mode(
                 msg.reasoning_content = reply.reasoning_content;
                 app.messages.push(msg);
 
-                // Handle skill activation markers in the assistant reply.
-                if let Some(name) = app.take_skill_activation_marker() {
-                    match app.activate_skill(&name) {
-                        Ok(msg) => {
-                            app.status = AppStatus::Idle;
-                            app.status_message = msg.clone();
-                            println!("SKILL ACTIVATED: {}", msg);
-                            continue;
-                        }
-                        Err(e) => {
-                            eprintln!("catus: failed to activate skill '{}': {}", name, e);
-                            std::process::exit(1);
-                        }
-                    }
-                }
+                // Skill activation happens through `use_skill` tool calls,
+                // handled by run_pending_tool below.
 
                 for call in reply.tool_calls {
                     app.add_tool_call(call);

@@ -1,33 +1,110 @@
-//! Tool execution for the catus Agent.
+//! Tool infrastructure for the catus Agent.
 //!
-//! Implements the OpenAI-compatible function-calling protocol for a single
-//! tool: `shell`, which runs a command through the embedded `sutcac-sh`
-//! interpreter.
+//! This module defines the OpenAI-compatible function-calling protocol
+//! ([`ToolCall`], [`ToolResult`], [`ToolDefinition`]) and the extensible
+//! [`Tool`] interface with its [`Toolbox`] registry. It is deliberately free
+//! of any concrete tool logic; implementations live in sibling modules:
+//!
+//! - `shell` — the built-in `shell` tool ([`ShellTool`]);
+//! - `skill` — the built-in `use_skill` tool ([`SkillTool`]);
+//! - `crate::mcp` — tools converted from MCP servers (`McpTool`).
+//!
+//! The application (`app.rs`) acts as the composition root: it registers the
+//! built-in tools at startup and MCP tools as servers connect.
+
+mod shell;
+mod skill;
+
+use std::future::Future;
+use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
-use sutcac_sh::exec::{CommandOutput, ShellState, execute_command};
-use sutcac_sh::parser::Parser;
+use sutcac_sh::exec::ShellState;
 
-/// JSON Schema description for the shell tool.
-pub const SHELL_TOOL_SCHEMA: &str = r#"{
-  "type": "function",
-  "function": {
-    "name": "shell",
-    "description": "Execute a shell command via the embedded sutcac-sh interpreter.",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "command": {
-          "type": "string",
-          "description": "The shell command to execute."
-        }
-      },
-      "required": ["command"]
+use crate::message::Message;
+use crate::skills::SkillRegistry;
+
+pub use shell::ShellTool;
+pub use skill::SkillTool;
+
+/// Mutable host state made available to tools while they execute.
+///
+/// Constructed by the application (`app.rs`) for every dispatched call.
+pub struct ToolContext<'a> {
+    pub shell_state: &'a mut ShellState,
+    pub skill_registry: &'a mut SkillRegistry,
+    pub active_skills: &'a mut Vec<String>,
+    pub messages: &'a mut Vec<Message>,
+}
+
+/// A tool the Agent can invoke, identified by its advertised name.
+///
+/// The `execute` method returns a boxed future so the trait stays dyn-safe
+/// without pulling in an `async-trait` dependency.
+pub trait Tool: Send + Sync {
+    /// The tool name as advertised to (and called by) the LLM.
+    fn name(&self) -> &str;
+    /// The OpenAI-compatible definition advertised to the LLM.
+    fn definition(&self) -> ToolDefinition;
+    /// A short human-readable description of one call, used for the status
+    /// bar and history echo. Defaults to the tool name.
+    fn describe_call(&self, call: &ToolCall) -> String {
+        call.name.clone()
     }
-  }
-}"#;
+    /// Execute the call against the host state.
+    fn execute<'a>(
+        &'a self,
+        call: &'a ToolCall,
+        ctx: &'a mut ToolContext<'_>,
+    ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
+}
+
+/// Registry of all tools available to the Agent.
+///
+/// Starts out empty; the application registers the built-in tools at startup
+/// and MCP tools as servers connect. Lookups go through [`Toolbox::get`] so
+/// dispatch is driven entirely by the advertised tool name.
+#[derive(Default)]
+pub struct Toolbox {
+    tools: Vec<Box<dyn Tool>>,
+}
+
+impl Toolbox {
+    /// Register a tool. Re-registering an existing name replaces it.
+    pub fn register(&mut self, tool: Box<dyn Tool>) {
+        self.tools.retain(|t| t.name() != tool.name());
+        self.tools.push(tool);
+    }
+
+    /// Definitions of all registered tools, advertised to the LLM.
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        self.tools.iter().map(|t| t.definition()).collect()
+    }
+
+    /// Find a tool by its advertised name.
+    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|t| t.as_ref())
+    }
+
+    /// Number of registered tools.
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// True if no tools are registered.
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+}
 
 /// A parsed tool invocation returned by the model.
+///
+/// This is a pure protocol type: it carries no per-tool semantics. Argument
+/// interpretation belongs to the tool implementation (e.g. the shell tool's
+/// argument parsing in `shell.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
     pub id: String,
@@ -92,32 +169,6 @@ impl<'de> serde::Deserialize<'de> for ToolCall {
     }
 }
 
-impl ToolCall {
-    /// Extract the shell command from the `command` argument.
-    ///
-    /// Only the canonical form is accepted: an object with a single string
-    /// `"command"` field. Anything else yields `None` so the caller can report
-    /// a malformed tool call back to the model.
-    pub fn shell_command(&self) -> Option<String> {
-        if self.name != "shell" {
-            return None;
-        }
-        serde_json::from_str::<ShellArguments>(&self.arguments)
-            .ok()
-            .map(|args| args.command)
-    }
-
-    /// Whether `arguments` has the canonical `{"command": "..."}` shape.
-    pub fn has_valid_arguments(&self) -> bool {
-        self.name == "shell" && serde_json::from_str::<ShellArguments>(&self.arguments).is_ok()
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ShellArguments {
-    command: String,
-}
-
 /// The result of executing a tool.
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -137,67 +188,6 @@ impl ToolResult {
     }
 }
 
-/// Execute a shell command against the provided `ShellState`.
-///
-/// After execution the shell context is reset to its pre-call state: the
-/// working directory is restored and variable/function state is cleared so
-/// that successive tool calls do not accumulate side effects.
-pub fn execute_shell_command(cmd: &str, state: &mut ShellState) -> CommandOutput {
-    let original_cwd = state.cwd.clone();
-    let original_env_cwd = std::env::current_dir().unwrap_or_else(|_| original_cwd.clone());
-
-    let output = match Parser::new(cmd) {
-        Ok(mut parser) => match parser.parse() {
-            Ok(cmds) => {
-                let mut status = 0;
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                for cmd in cmds {
-                    let out = execute_command(&cmd, state);
-                    status = out.status;
-                    stdout.push_str(&out.stdout);
-                    stderr.push_str(&out.stderr);
-                }
-                CommandOutput::with_output(status, stdout, stderr)
-            }
-            Err(e) => CommandOutput::with_output(
-                2,
-                String::new(),
-                format!(
-                    "parse error: {}. Hint: check shell syntax (quotes, parentheses, and reserved words).",
-                    e
-                ),
-            ),
-        },
-        Err(e) => CommandOutput::with_output(
-            2,
-            String::new(),
-            format!(
-                "lexer error: {}. Hint: check for unclosed quotes or invalid characters.",
-                e
-            ),
-        ),
-    };
-
-    // Restore the working directory so later tool calls start from the same
-    // directory the Agent was launched in.
-    if let Err(e) = std::env::set_current_dir(&original_env_cwd) {
-        log::warn!("failed to restore working directory: {}", e);
-    }
-    state.cwd = original_cwd;
-
-    // Clear mutable shell state so variables, functions and positional
-    // parameters set by one tool call do not leak into the next.
-    state.vars.clear();
-    state.exported.clear();
-    state.args.clear();
-    state.funcs.clear();
-    state.last_status = 0;
-    state.last_bg_pid = None;
-
-    output
-}
-
 /// OpenAI-compatible request tool description.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ToolDefinition {
@@ -213,93 +203,62 @@ pub struct FunctionDefinition {
     pub parameters: serde_json::Value,
 }
 
-/// Return the tool definitions advertised to the LLM.
-pub fn shell_tool_definition() -> ToolDefinition {
-    serde_json::from_str(SHELL_TOOL_SCHEMA).expect("shell tool schema is valid JSON")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_toolbox() -> Toolbox {
+        let mut toolbox = Toolbox::default();
+        toolbox.register(Box::new(ShellTool));
+        toolbox.register(Box::new(SkillTool));
+        toolbox
+    }
+
     #[test]
-    fn parse_shell_tool_call() {
+    fn tool_call_roundtrips_through_json() {
         let call = ToolCall {
             id: "call_abc".to_string(),
             name: "shell".to_string(),
             arguments: r#"{"command":"ls -la"}"#.to_string(),
         };
-        assert_eq!(call.shell_command(), Some("ls -la".to_string()));
+        let json = serde_json::to_string(&call).unwrap();
+        let parsed: ToolCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, call);
     }
 
     #[test]
-    fn duplicate_command_keys_are_rejected() {
-        let call = ToolCall {
-            id: "call_abc".to_string(),
-            name: "shell".to_string(),
-            arguments: r#"{"command":"cat Cargo.toml AGENTS.md","command":"find . -name '*.rs' | head -5"}"#
-                .to_string(),
-        };
-        assert_eq!(call.shell_command(), None);
-        assert!(!call.has_valid_arguments());
+    fn tool_call_rejects_non_function_type() {
+        let json =
+            r#"{"id":"call_abc","type":"custom","function":{"name":"shell","arguments":"{}"}}"#;
+        assert!(serde_json::from_str::<ToolCall>(json).is_err());
     }
 
     #[test]
-    fn command_array_value_is_rejected() {
-        let call = ToolCall {
-            id: "call_abc".to_string(),
-            name: "shell".to_string(),
-            arguments: r#"{"command":["pwd","ls -la"]}"#.to_string(),
-        };
-        assert_eq!(call.shell_command(), None);
-        assert!(!call.has_valid_arguments());
+    fn toolbox_get_and_definitions() {
+        let toolbox = test_toolbox();
+        assert!(toolbox.get("shell").is_some());
+        assert!(toolbox.get("use_skill").is_some());
+        assert!(toolbox.get("nope").is_none());
+        let names: Vec<String> = toolbox
+            .definitions()
+            .into_iter()
+            .map(|d| d.function.name)
+            .collect();
+        assert_eq!(names, vec!["shell", "use_skill"]);
     }
 
     #[test]
-    fn raw_json_is_never_executed_as_a_command() {
-        // A blob with no string "command" field must not reach the shell.
-        let no_command = ToolCall {
-            id: "call_def".to_string(),
-            name: "shell".to_string(),
-            arguments: r#"{"cmd":"ls"}"#.to_string(),
-        };
-        assert_eq!(no_command.shell_command(), None);
-
-        // A bare quoted string is not the canonical form either.
-        let bare = ToolCall {
-            id: "call_ghi".to_string(),
-            name: "shell".to_string(),
-            arguments: r#""ls -la""#.to_string(),
-        };
-        assert_eq!(bare.shell_command(), None);
+    fn toolbox_register_replaces_same_name() {
+        let mut toolbox = test_toolbox();
+        assert_eq!(toolbox.len(), 2);
+        toolbox.register(Box::new(ShellTool));
+        assert_eq!(toolbox.len(), 2);
     }
 
     #[test]
-    fn non_shell_tool_call_is_rejected() {
-        let call = ToolCall {
-            id: "call_abc".to_string(),
-            name: "other".to_string(),
-            arguments: r#"{"command":"ls"}"#.to_string(),
-        };
-        assert_eq!(call.shell_command(), None);
-    }
-
-    #[test]
-    fn shell_tool_definition_valid() {
-        let def = shell_tool_definition();
-        assert_eq!(def.function.name, "shell");
-    }
-
-    #[test]
-    fn command_substitution_executes_inner_command() {
-        let mut state = ShellState::new();
-        state.audit_logger = sutcac_sh::audit::AuditLogger::null();
-        let output = execute_shell_command("echo $(echo hi)", &mut state);
-        assert_eq!(output.status, 0);
-        assert!(
-            output.stdout.contains("hi"),
-            "stdout should contain substituted output, got: {:?}",
-            output.stdout
-        );
+    fn toolbox_starts_empty() {
+        let toolbox = Toolbox::default();
+        assert!(toolbox.is_empty());
+        assert!(toolbox.definitions().is_empty());
     }
 }
