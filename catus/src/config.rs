@@ -36,18 +36,50 @@ pub struct McpConfig {
 
 /// Configuration for a single MCP server connection.
 #[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(default)]
 pub struct McpServerConfig {
     /// Human-readable name for this server. Used to prefix tool names, e.g.
     /// `{name}__read_file`.
     pub name: String,
-    /// Executable to spawn. Resolved via PATH if not an absolute path.
+    /// How to reach this server. Defaults to spawning a local stdio child.
+    pub transport: McpTransport,
+    /// Executable to spawn. Resolved via PATH if not an absolute path. Only
+    /// used for `transport = "stdio"`; may be omitted for remote servers.
     pub command: String,
     /// Arguments passed to `command`.
-    #[serde(default)]
     pub args: Vec<String>,
     /// Optional environment variables added to the spawned process.
-    #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Server endpoint URL. Required for `transport = "streamable-http"`.
+    pub url: Option<String>,
+    /// Custom HTTP headers sent with every request, e.g.
+    /// `Authorization = "Bearer sk-..."`. Only used for streamable-http.
+    pub headers: HashMap<String, String>,
+}
+
+/// Transport used to reach an MCP server.
+#[derive(Debug, Deserialize, Clone, Copy, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpTransport {
+    /// Spawn a local child process and talk stdio (default).
+    #[default]
+    Stdio,
+    /// Connect to a remote Streamable HTTP endpoint (`url`).
+    StreamableHttp,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            transport: McpTransport::default(),
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+        }
+    }
 }
 
 /// OpenAI-compatible API configuration.
@@ -243,6 +275,7 @@ HOME = "/home/user"
         let mcp = cfg.mcp.expect("mcp config should be present");
         assert_eq!(mcp.servers.len(), 1);
         assert_eq!(mcp.servers[0].name, "filesystem");
+        assert_eq!(mcp.servers[0].transport, McpTransport::Stdio);
         assert_eq!(mcp.servers[0].command, "npx");
         assert_eq!(
             mcp.servers[0].args,
@@ -251,6 +284,37 @@ HOME = "/home/user"
         assert_eq!(
             mcp.servers[0].env.get("HOME"),
             Some(&"/home/user".to_string())
+        );
+        assert!(mcp.servers[0].url.is_none());
+    }
+
+    #[test]
+    fn parse_remote_streamable_http_server_config() {
+        let input = r#"
+[api]
+base_url = "https://api.example.com/v1"
+api_key = "sk-test"
+model = "gpt-4o"
+
+[[mcp.servers]]
+name = "remote-calc"
+transport = "streamable-http"
+url = "https://mcp.example.com/calc"
+
+[mcp.servers.headers]
+Authorization = "Bearer sk-remote"
+"#;
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        let mcp = cfg.mcp.expect("mcp config should be present");
+        assert_eq!(mcp.servers.len(), 1);
+        let server = &mcp.servers[0];
+        assert_eq!(server.name, "remote-calc");
+        assert_eq!(server.transport, McpTransport::StreamableHttp);
+        assert_eq!(server.url.as_deref(), Some("https://mcp.example.com/calc"));
+        assert!(server.command.is_empty());
+        assert_eq!(
+            server.headers.get("Authorization"),
+            Some(&"Bearer sk-remote".to_string())
         );
     }
 }

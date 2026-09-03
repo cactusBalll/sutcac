@@ -36,9 +36,9 @@ history_path = ".sutcac/history"
 
 # Optional MCP client configuration. catus connects to the configured MCP
 # servers at startup and exposes their tools to the LLM alongside the built-in
-# `shell` tool. Only stdio child-process servers are supported initially.
-# Tool names are prefixed with `{server_name}__` to avoid collisions, e.g.
-# `filesystem__read_file`.
+# `shell` tool. Two transports are supported: stdio child processes (default)
+# and remote Streamable HTTP servers. Tool names are prefixed with
+# `{server_name}__` to avoid collisions, e.g. `filesystem__read_file`.
 # [[mcp.servers]]
 # name = "filesystem"
 # command = "npx"
@@ -53,6 +53,18 @@ history_path = ".sutcac/history"
 # [[mcp.servers]]
 # name = "calc"
 # command = "target/debug/mcp-calc-server"
+
+# Example: remote MCP server over Streamable HTTP. `transport` defaults to
+# "stdio"; `command` may be omitted for remote servers. `headers` are sent
+# with every request (e.g. for Bearer authentication). The legacy SSE
+# transport is not supported.
+# [[mcp.servers]]
+# name = "remote-calc"
+# transport = "streamable-http"
+# url = "https://mcp.example.com/calc"
+#
+# [mcp.servers.headers]
+# Authorization = "Bearer sk-xxxxxxxx"
 
 [shell]
 # allow_all | allow:<tags> | deny:<tags> | allow:<tags> deny:<tags> | allow1:<cmds> | deny1:<cmds>

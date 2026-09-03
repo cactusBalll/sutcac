@@ -8,7 +8,7 @@ Rust workspace (edition 2024, needs Rust 1.85+) with three crates:
 
 - `sutcac-sh` — simplified Bash-compatible shell: hand-written lexer → recursive-descent parser (`ast.rs`) → word expansion (`expand.rs`, `glob.rs`, `arith.rs`) → execution (`exec.rs`). Also a library consumed by catus.
 - `catus` — Agent TUI binary: OpenAI-compatible streaming client (`llm.rs`), ratatui UI, executes the model's shell tool calls through embedded `sutcac-sh` (`tool/`, `app.rs`). Also an MCP client: configured MCP servers are connected at startup and their tools are exposed to the LLM (`mcp.rs`).
-- `mcp-calc-server` — standalone stdio MCP server used to test catus's MCP client support. Exposes arithmetic tools (`sum`, `sub`, `mul`, `div`, `modulo`).
+- `mcp-calc-server` — standalone calculator MCP server used to test catus's MCP client support. Exposes arithmetic tools (`sum`, `sub`, `mul`, `div`, `modulo`). Serves stdio by default, or Streamable HTTP with `--http <addr>`.
 
 `bash.md` (Chinese) is the Bash-internals design reference.
 
@@ -68,8 +68,8 @@ Copy the root-level `config.toml.example` to `.sutcac/config.toml` and fill in `
 
 `catus` can act as an MCP client and expose tools from external MCP servers to the LLM.
 
-- Configure servers under `[[mcp.servers]]` with `name`, `command`, `args`, and optional `env`.
-- Only stdio child-process servers are supported initially (`rmcp` `transport-child-process`).
+- Configure servers under `[[mcp.servers]]` with `name` plus either stdio settings (`command`, `args`, `env`) or remote settings (`transport = "streamable-http"`, `url`, optional `headers` for e.g. `Authorization`).
+- Two transports: stdio child processes (`rmcp` `transport-child-process`, default) and remote Streamable HTTP endpoints (`rmcp` `transport-streamable-http-client-reqwest`). The legacy SSE transport was removed in `rmcp` 3.x and is not supported.
 - Tool names are prefixed with `{server_name}__` to avoid collisions and identify the owning server, e.g. `filesystem__read_file`.
 - Connection failures are logged; successful servers are still used.
 - Use `/mcp list` to see configured servers and discovered tools, and `/mcp status` for connection counts.

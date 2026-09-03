@@ -3,8 +3,6 @@
 //! Spawns the calculator MCP server as a stdio child process and exercises
 //! catus's `McpManager` end-to-end: connection, tool discovery, and tool calls.
 
-use std::collections::HashMap;
-
 use catus::config::McpServerConfig;
 use catus::mcp::McpManager;
 use catus::tool::ToolCall;
@@ -18,8 +16,7 @@ fn calc_server_config() -> McpServerConfig {
     McpServerConfig {
         name: "calc".to_string(),
         command: server_binary_path().to_string(),
-        args: Vec::new(),
-        env: HashMap::new(),
+        ..Default::default()
     }
 }
 
@@ -158,8 +155,7 @@ async fn manager_survives_when_server_command_is_missing() {
     let bad_config = McpServerConfig {
         name: "missing".to_string(),
         command: "/no/such/binary".to_string(),
-        args: Vec::new(),
-        env: HashMap::new(),
+        ..Default::default()
     };
     let good_config = calc_server_config();
 

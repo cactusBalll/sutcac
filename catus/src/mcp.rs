@@ -1,23 +1,25 @@
 //! MCP client support for catus.
 //!
-//! Connects to configured MCP servers (stdio child processes) via the `rmcp`
-//! SDK, discovers their tools, and forwards tool calls from the LLM to the
-//! correct server. Each discovered tool is wrapped in an [`McpTool`] and
-//! registered in the application's `Toolbox` alongside the built-in tools.
+//! Connects to configured MCP servers via the `rmcp` SDK — either local stdio
+//! child processes or remote Streamable HTTP endpoints — discovers their tools,
+//! and forwards tool calls from the LLM to the correct server. Each discovered
+//! tool is wrapped in an [`McpTool`] and registered in the application's
+//! `Toolbox` alongside the built-in tools.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use http::{HeaderName, HeaderValue};
 use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, ContentBlock, Tool as RmcpTool},
     service::{RoleClient, RunningService},
-    transport::TokioChildProcess,
+    transport::{TokioChildProcess, streamable_http_client::StreamableHttpClientTransportConfig},
 };
 use serde_json::Value;
 use tokio::process::Command;
 
-use crate::config::McpServerConfig;
+use crate::config::{McpServerConfig, McpTransport};
 use crate::tool::{FunctionDefinition, Tool, ToolCall, ToolContext, ToolDefinition, ToolResult};
 
 /// Separator used to prefix MCP tool names with their server name.
@@ -75,16 +77,39 @@ pub struct McpClient {
 }
 
 impl McpClient {
-    /// Spawn a stdio MCP server and initialize the rmcp client.
+    /// Connect to a configured MCP server using its configured transport.
     async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
-        let mut command = Command::new(&config.command);
-        command.args(&config.args);
-        for (key, value) in &config.env {
-            command.env(key, value);
-        }
+        let peer = match config.transport {
+            McpTransport::Stdio => {
+                if config.command.is_empty() {
+                    return Err(McpError::Connect(format!(
+                        "mcp server '{}' has no command",
+                        config.name
+                    )));
+                }
+                let mut command = Command::new(&config.command);
+                command.args(&config.args);
+                for (key, value) in &config.env {
+                    command.env(key, value);
+                }
 
-        let transport = TokioChildProcess::new(command)?;
-        let peer = ().serve(transport).await?;
+                let transport = TokioChildProcess::new(command)?;
+                ().serve(transport).await?
+            }
+            McpTransport::StreamableHttp => {
+                let url = config.url.as_deref().ok_or_else(|| {
+                    McpError::Connect(format!(
+                        "mcp server '{}' has no url for streamable-http transport",
+                        config.name
+                    ))
+                })?;
+                let transport_config = StreamableHttpClientTransportConfig::with_uri(url)
+                    .custom_headers(build_headers(&config.headers)?);
+                let transport =
+                    rmcp::transport::StreamableHttpClientTransport::from_config(transport_config);
+                ().serve(transport).await?
+            }
+        };
         Ok(Self { peer })
     }
 
@@ -259,6 +284,24 @@ pub async fn mcp_tools(manager: Arc<McpManager>) -> Vec<McpTool> {
     tools
 }
 
+/// Convert configured header strings into the `http` crate types expected by
+/// the Streamable HTTP transport config.
+fn build_headers(
+    headers: &HashMap<String, String>,
+) -> Result<HashMap<HeaderName, HeaderValue>, McpError> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| McpError::Connect(format!("invalid header name {:?}: {}", name, e)))?;
+            let value = HeaderValue::from_str(value).map_err(|e| {
+                McpError::Connect(format!("invalid header value for {:?}: {}", name, e))
+            })?;
+            Ok((name, value))
+        })
+        .collect()
+}
+
 /// Parse the JSON arguments from a tool call. Empty or non-object input is
 /// treated as an empty object.
 fn parse_arguments(arguments: &str) -> Result<serde_json::Map<String, Value>, McpError> {
@@ -378,6 +421,38 @@ mod tests {
         assert!(matches!(
             split_prefixed_name("filesystem__").unwrap_err(),
             McpError::InvalidToolName(_)
+        ));
+    }
+
+    #[test]
+    fn build_headers_converts_entries() {
+        let headers = HashMap::from_iter([
+            ("Authorization".to_string(), "Bearer sk-test".to_string()),
+            ("X-Custom".to_string(), "value".to_string()),
+        ]);
+        let built = build_headers(&headers).unwrap();
+        assert_eq!(built.len(), 2);
+        assert_eq!(
+            built.get(&HeaderName::from_static("authorization")),
+            Some(&HeaderValue::from_static("Bearer sk-test"))
+        );
+    }
+
+    #[test]
+    fn build_headers_rejects_invalid_name() {
+        let headers = HashMap::from_iter([("bad name".to_string(), "v".to_string())]);
+        assert!(matches!(
+            build_headers(&headers).unwrap_err(),
+            McpError::Connect(_)
+        ));
+    }
+
+    #[test]
+    fn build_headers_rejects_invalid_value() {
+        let headers = HashMap::from_iter([("x-ok".to_string(), "bad\nvalue".to_string())]);
+        assert!(matches!(
+            build_headers(&headers).unwrap_err(),
+            McpError::Connect(_)
         ));
     }
 

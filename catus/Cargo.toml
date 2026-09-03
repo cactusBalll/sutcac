@@ -9,10 +9,15 @@ crossterm = "0.29.0"
 dirs = "6.0.0"
 eventsource-stream = "0.2.3"
 futures = "0.3.34"
+http = "1"
 log = "0.4"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.13.4", features = ["json", "stream", "cookies"] }
-rmcp = { version = "3.1.4", features = ["client", "transport-child-process"] }
+rmcp = { version = "3.1.4", features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde-saphyr = "1.2.0"
 serde_json = "1.0.151"
