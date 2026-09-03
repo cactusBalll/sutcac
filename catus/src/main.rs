@@ -8,7 +8,7 @@ use log::LevelFilter;
 use simplelog::{Config, WriteLogger};
 use tokio::sync::mpsc;
 
-use catus::app::App;
+use catus::app::{App, AppStatus};
 use catus::config::AppConfig;
 use catus::llm::{LlmError, StreamEvent};
 use catus::message::Message;
@@ -186,8 +186,31 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
 
     let mut should_quit = false;
 
+    // Track the status shown in the terminal tab title and taskbar progress so
+    // they are rewritten only on real transitions. The bell rings when a busy
+    // turn settles to Idle; intermediate Idle blips between tool rounds never
+    // become visible here.
+    let mut last_status = app.status;
+    tui::set_tab_title(tui::title_for_status(app.status));
+
     while !should_quit {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
+
+        let status = app.status;
+        if status != last_status {
+            let was_busy = matches!(last_status, AppStatus::Streaming | AppStatus::RunningTool);
+            let is_busy = matches!(status, AppStatus::Streaming | AppStatus::RunningTool);
+            if is_busy && !was_busy {
+                tui::show_indeterminate_progress();
+            } else if was_busy && !is_busy {
+                tui::hide_taskbar_progress();
+            }
+            if was_busy && status == AppStatus::Idle {
+                tui::alert();
+            }
+            tui::set_tab_title(tui::title_for_status(status));
+            last_status = status;
+        }
 
         tokio::select! {
             Some(event) = ui_rx.recv() => {

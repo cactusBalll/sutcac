@@ -105,7 +105,7 @@ Checked before every external command and redirection; denials return non-zero a
 
 ## catus TUI specifics
 
-- Rendering lives in `catus/src/ui/` (`chat.rs` = history/input/status bar; `overlay.rs` = modal pages); `tui.rs` only manages terminal raw-mode lifecycle. Interaction logic stays in `app.rs`.
+- Rendering lives in `catus/src/ui/` (`chat.rs` = history/input/status bar; `overlay.rs` = modal pages); `tui.rs` manages the terminal raw-mode lifecycle and emits OSC sequences: the tab title tracks app status (`catus · 正在输出`/`空闲`/`错误`), the taskbar shows an indeterminate ConEmu `OSC 9;4;3` animation while busy and hides on completion, and a BEL alert rings when a busy turn returns to idle. Interaction logic stays in `app.rs`.
 - Keys: Enter send, Esc/Ctrl+C quit, Up/Down/PageUp/PageDown scroll, Home/End jump.
 - `/resume <name>` loads `<history_dir>/<name>.json`; bare `/resume` opens a List-based picker overlay (↑/↓ select, Enter load, Esc cancel); `/status` opens a Table overlay with model/requests/token usage. Overlays swallow keys before the input line (`App::handle_overlay_key`).
 - `/mcp list` shows configured MCP servers and their discovered tools; `/mcp status` shows how many servers are connected.
