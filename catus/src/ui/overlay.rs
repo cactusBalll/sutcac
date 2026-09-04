@@ -6,6 +6,8 @@
 //! - [`Overlay::Status`](crate::app::Overlay::Status): token usage details.
 //! - [`Overlay::Config`](crate::app::Overlay::Config): editable config fields.
 //! - [`Overlay::Skills`](crate::app::Overlay::Skills): skill picker.
+//! - [`Overlay::Ask`](crate::app::Overlay::Ask): question dialog opened by
+//!   the `ask_user` tool.
 //!
 //! This module renders overlays and handles keyboard navigation for them.
 
@@ -14,11 +16,12 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table},
 };
 
 use crate::app::{App, Overlay};
+use crate::tool::{AskAnswer, AskQuestion, collect_answer};
 
 /// Result of handling a key press while an overlay is active.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +34,10 @@ pub enum OverlayAction {
     LoadHistory(String),
     /// The skill picker confirmed a skill name to activate.
     ActivateSkill(String),
+    /// The ask overlay collected answers for every question.
+    Answered(Vec<AskAnswer>),
+    /// The ask overlay was dismissed without answering.
+    CancelInteraction,
 }
 
 /// Handle a key press while an overlay is active. Keys never reach the
@@ -123,6 +130,118 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
             }
             _ => OverlayAction::Consumed,
         },
+        Overlay::Ask {
+            questions,
+            current,
+            focus,
+            mut selections,
+            mut other,
+            mut answers,
+        } => {
+            let Some(question) = questions.get(current).cloned() else {
+                app.overlay_state.close();
+                return OverlayAction::CancelInteraction;
+            };
+            // Focus rows: `0..options.len()` are the options, the row after
+            // them is the pseudo-option "Other".
+            let rows = question.options.len() + 1;
+            let other_row = question.options.len();
+            let current_selections: &[bool] =
+                selections.get(current).map(Vec::as_slice).unwrap_or(&[]);
+            match code {
+                KeyCode::Up => {
+                    app.overlay_state.overlay = Overlay::Ask {
+                        questions,
+                        current,
+                        focus: (focus + rows - 1) % rows,
+                        selections,
+                        other,
+                        answers,
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Down => {
+                    app.overlay_state.overlay = Overlay::Ask {
+                        questions,
+                        current,
+                        focus: (focus + 1) % rows,
+                        selections,
+                        other,
+                        answers,
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Char(c) if focus == other_row => {
+                    other.push(c);
+                    app.overlay_state.overlay = Overlay::Ask {
+                        questions,
+                        current,
+                        focus,
+                        selections,
+                        other,
+                        answers,
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Backspace if focus == other_row => {
+                    other.pop();
+                    app.overlay_state.overlay = Overlay::Ask {
+                        questions,
+                        current,
+                        focus,
+                        selections,
+                        other,
+                        answers,
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Char(' ') if question.multi_select && focus < other_row => {
+                    if let Some(slot) = selections
+                        .get_mut(current)
+                        .and_then(|sel| sel.get_mut(focus))
+                    {
+                        *slot = !*slot;
+                    }
+                    app.overlay_state.overlay = Overlay::Ask {
+                        questions,
+                        current,
+                        focus,
+                        selections,
+                        other,
+                        answers,
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Enter => {
+                    match collect_answer(&question, current_selections, focus, &other) {
+                        Some(answer) => {
+                            answers.push(answer);
+                            if current + 1 < questions.len() {
+                                app.overlay_state.overlay = Overlay::Ask {
+                                    questions,
+                                    current: current + 1,
+                                    focus: 0,
+                                    selections,
+                                    other: String::new(),
+                                    answers,
+                                };
+                                OverlayAction::Consumed
+                            } else {
+                                app.overlay_state.close();
+                                OverlayAction::Answered(answers)
+                            }
+                        }
+                        // Nothing answered yet; wait for a selection.
+                        None => OverlayAction::Consumed,
+                    }
+                }
+                KeyCode::Esc => {
+                    app.overlay_state.close();
+                    OverlayAction::CancelInteraction
+                }
+                _ => OverlayAction::Consumed,
+            }
+        }
         Overlay::Config { selected } => {
             let fields = app.config_fields();
             match code {
@@ -167,7 +286,10 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
 /// scroll was consumed by an overlay.
 pub fn handle_overlay_scroll(app: &mut App, up: bool) -> bool {
     match &app.overlay_state.overlay {
-        Overlay::Resume { .. } | Overlay::Config { .. } | Overlay::Skills { .. } => {
+        Overlay::Resume { .. }
+        | Overlay::Config { .. }
+        | Overlay::Skills { .. }
+        | Overlay::Ask { .. } => {
             let _ = handle_overlay_key(app, if up { KeyCode::Up } else { KeyCode::Down });
             true
         }
@@ -186,6 +308,14 @@ pub fn draw_overlay(frame: &mut Frame, app: &App) {
         Overlay::Status => draw_status(frame, app, popup),
         Overlay::Config { selected } => draw_config(frame, app, *selected, popup),
         Overlay::Skills { items, selected } => draw_skills(frame, items, *selected, popup),
+        Overlay::Ask {
+            questions,
+            current,
+            focus,
+            selections,
+            other,
+            ..
+        } => draw_ask(frame, questions, *current, *focus, selections, other, popup),
     }
 }
 
@@ -349,6 +479,98 @@ fn draw_config(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     frame.render_widget(help, rows[1]);
 }
 
+/// Render the ask-user question dialog: the current question's prompt, its
+/// options (with checkbox markers for multi-select), the "Other" free-text
+/// row, and a context-sensitive help footer.
+fn draw_ask(
+    frame: &mut Frame,
+    questions: &[AskQuestion],
+    current: usize,
+    focus: usize,
+    selections: &[Vec<bool>],
+    other: &str,
+    area: Rect,
+) {
+    let Some(question) = questions.get(current) else {
+        return;
+    };
+    let title = format!(" {} ({}/{}) ", question.title, current + 1, questions.len());
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let prompt = Paragraph::new(question.prompt.as_str())
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    frame.render_widget(prompt, rows[0]);
+
+    let current_selections = selections.get(current).cloned().unwrap_or_default();
+    let marker = |checked: bool| if checked { "[x] " } else { "[ ] " };
+    let mut items: Vec<ListItem> = question
+        .options
+        .iter()
+        .enumerate()
+        .map(|(i, option)| {
+            let prefix = if question.multi_select {
+                marker(current_selections.get(i).copied().unwrap_or(false))
+            } else {
+                ""
+            };
+            let mut spans = vec![Span::raw(format!("{}{}", prefix, option.label))];
+            if let Some(description) = &option.description {
+                spans.push(Span::styled(
+                    format!("  — {}", description),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let other_row = question.options.len();
+    let other_prefix = if question.multi_select {
+        marker(!other.trim().is_empty())
+    } else {
+        ""
+    };
+    let other_style = if focus == other_row {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    items.push(ListItem::new(Line::styled(
+        format!("{}Other: {}", other_prefix, other),
+        other_style,
+    )));
+
+    let list = List::new(items).highlight_symbol("▶ ").highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut state = ListState::default();
+    state.select(Some(focus.min(other_row)));
+    frame.render_stateful_widget(list, rows[1], &mut state);
+
+    let help = if question.multi_select {
+        "↑/↓ move · Space toggle · Enter confirm · Esc cancel"
+    } else {
+        "↑/↓ move · Enter choose · Esc cancel"
+    };
+    let help = Paragraph::new(Line::styled(help, Style::default().fg(Color::DarkGray)))
+        .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help, rows[2]);
+}
+
 fn label_value_row(label: &str, value: &str) -> Row<'static> {
     Row::new(vec![
         Line::styled(
@@ -424,5 +646,125 @@ mod tests {
             Line::from("gpt-test".to_string()),
         ]);
         assert_eq!(format!("{:?}", row), format!("{:?}", expected));
+    }
+
+    mod ask {
+        use super::*;
+        use crate::app::Overlay;
+        use crate::config::AppConfig;
+        use crate::tool::{Answer, AskAnswer, AskQuestion};
+
+        fn question(multi_select: bool) -> AskQuestion {
+            serde_json::from_str(&format!(
+                r#"{{"prompt":"Pick","title":"Pick","options":[{{"label":"a"}},{{"label":"b"}}],"multiSelect":{}}}"#,
+                multi_select
+            ))
+            .unwrap()
+        }
+
+        fn app_with_ask(questions: Vec<AskQuestion>) -> App {
+            let mut app = App::new(AppConfig::default());
+            app.overlay_state.open_ask(questions);
+            app
+        }
+
+        #[test]
+        fn single_select_enter_picks_focused_option() {
+            let mut app = app_with_ask(vec![question(false)]);
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Down),
+                OverlayAction::Consumed
+            );
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Enter),
+                OverlayAction::Answered(vec![AskAnswer {
+                    prompt: "Pick".to_string(),
+                    answer: Answer::One("b".to_string()),
+                }])
+            );
+            assert!(!app.overlay_state.is_active());
+        }
+
+        #[test]
+        fn single_select_other_row_uses_typed_text() {
+            let mut app = app_with_ask(vec![question(false)]);
+            // Focus row 2 is the pseudo-option "Other" (after options a, b).
+            handle_overlay_key(&mut app, KeyCode::Down);
+            handle_overlay_key(&mut app, KeyCode::Down);
+            handle_overlay_key(&mut app, KeyCode::Char('x'));
+            handle_overlay_key(&mut app, KeyCode::Char('y'));
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Enter),
+                OverlayAction::Answered(vec![AskAnswer {
+                    prompt: "Pick".to_string(),
+                    answer: Answer::One("xy".to_string()),
+                }])
+            );
+        }
+
+        #[test]
+        fn multi_select_toggles_and_collects() {
+            let mut app = app_with_ask(vec![question(true)]);
+            // Check option "a" with Space, then confirm.
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Char(' ')),
+                OverlayAction::Consumed
+            );
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Enter),
+                OverlayAction::Answered(vec![AskAnswer {
+                    prompt: "Pick".to_string(),
+                    answer: Answer::Many(vec!["a".to_string()]),
+                }])
+            );
+        }
+
+        #[test]
+        fn multi_select_requires_at_least_one_answer() {
+            let mut app = app_with_ask(vec![question(true)]);
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Enter),
+                OverlayAction::Consumed,
+                "Enter without any selection must not submit"
+            );
+            assert!(app.overlay_state.is_active());
+        }
+
+        #[test]
+        fn multiple_questions_advance_then_answer() {
+            let mut app = app_with_ask(vec![question(false), question(false)]);
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Enter),
+                OverlayAction::Consumed,
+                "first Enter advances to the next question"
+            );
+            match &app.overlay_state.overlay {
+                Overlay::Ask { current, .. } => assert_eq!(*current, 1),
+                other => panic!("expected ask overlay, got {:?}", other),
+            }
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Enter),
+                OverlayAction::Answered(vec![
+                    AskAnswer {
+                        prompt: "Pick".to_string(),
+                        answer: Answer::One("a".to_string()),
+                    },
+                    AskAnswer {
+                        prompt: "Pick".to_string(),
+                        answer: Answer::One("a".to_string()),
+                    },
+                ])
+            );
+        }
+
+        #[test]
+        fn esc_cancels_the_interaction() {
+            let mut app = app_with_ask(vec![question(false)]);
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Esc),
+                OverlayAction::CancelInteraction
+            );
+            assert!(!app.overlay_state.is_active());
+        }
     }
 }

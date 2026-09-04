@@ -52,7 +52,7 @@ cargo run -p mcp-calc-server              # calculator MCP server (stdio)
 cargo test -p mcp-calc-server             # unit + integration tests against catus MCP client
 ```
 
-No CI, lint config, or integration tests exist. Tests currently pass (~64 + 4 in sutcac-sh, ~87 in catus, ~9 in mcp-calc-server).
+No CI, lint config, or integration tests exist. Tests currently pass (~64 + 4 in sutcac-sh, ~144 in catus, ~9 in mcp-calc-server).
 
 ## Configuration
 
@@ -95,6 +95,7 @@ Checked before every external command and redirection; denials return non-zero a
 - MCP tool names are prefixed with `{server_name}__` so the LLM can call the right server; each discovered tool is wrapped in an `McpTool` (`mcp.rs`) holding a shared `Arc<McpManager>`.
 - All LLM-callable tools implement the `Tool` trait defined in `tool.rs` (dyn-safe via a boxed-future `execute`, no `async-trait` dependency) and live in a `Toolbox` on `App`. Two sources: built-ins, one per file under `tool/` (`tool/shell.rs` = `ShellTool`, `tool/skill.rs` = `SkillTool`), and MCP-converted (`McpTool` in `mcp.rs`). `tool.rs` is generic infrastructure — `ToolCall` carries no per-tool semantics (argument parsing lives in each tool, e.g. `parse_command` in `tool/shell.rs`), and `App::new` is the composition root that registers the built-ins. `app.rs::run_pending_tool` dispatches purely by advertised tool name through `Toolbox::get`; `llm.rs` receives the full definition list from the caller and hardcodes nothing.
 - `SkillTool` (`use_skill`) activates skills via tool calls, not text markers: it loads the skill instructions through a `ToolContext` (`shell_state`, `skill_registry`, `active_skills`, `messages`) passed in by `App` at dispatch time.
+- `AskUserTool` (`ask_user`, `tool/ask_user.rs`) never blocks on user input — `run_pending_tool` awaits tools inline in the event loop, so a blocking tool would deadlock. Instead `execute` validates the questions and returns a `ToolResult` whose `interaction` field is `Some(InteractionRequest)`; `run_pending_tool` then stashes the call in `App.pending_interaction`, opens `Overlay::Ask`, and returns without pushing a result message. The overlay collects answers (one question at a time; the last row is always an "Other" free-text option), and `App::complete_interaction` / `cancel_interaction` append the final `ToolResult` message and resume the turn via `AppAction::StartStream`.
 
 ## Conventions
 
@@ -108,6 +109,7 @@ Checked before every external command and redirection; denials return non-zero a
 - Rendering lives in `catus/src/ui/` (`chat.rs` = history/input/status bar; `overlay.rs` = modal pages); `tui.rs` manages the terminal raw-mode lifecycle and emits OSC sequences: the tab title tracks app status (`catus · 正在输出`/`空闲`/`错误`), the taskbar shows an indeterminate ConEmu `OSC 9;4;3` animation while busy and hides on completion, and a BEL alert rings when a busy turn returns to idle. Interaction logic stays in `app.rs`.
 - Keys: Enter send, Esc/Ctrl+C quit, Up/Down/PageUp/PageDown scroll, Home/End jump.
 - `/resume <name>` loads `<history_dir>/<name>.json`; bare `/resume` opens a List-based picker overlay (↑/↓ select, Enter load, Esc cancel); `/status` opens a Table overlay with model/requests/token usage. Overlays swallow keys before the input line (`App::handle_overlay_key`).
+- The `ask_user` tool opens the question overlay (`Overlay::Ask`): one question at a time with progress `i/N`, ↑/↓ move across options plus a final "Other" row where typing edits the text; Enter chooses the focused option (single-select) or confirms the checked options (multi-select, Space toggles); Esc cancels the whole question and reports "user cancelled" back to the model.
 - `/mcp list` shows configured MCP servers and their discovered tools; `/mcp status` shows how many servers are connected.
 - Status bar keeps a compact right-aligned `ctx N tok | total M`; full details are in the /status page.
 - Streaming requests set `stream_options.include_usage`; the returned `Usage` (incl. cached tokens) accumulates in `App.usage`.

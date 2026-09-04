@@ -67,6 +67,7 @@ impl Tool for ShellTool {
                         "catus: tool call format error: arguments must be a single JSON object {{\"command\": \"<shell command>\"}} with exactly one string \"command\" field; got: {}",
                         call.arguments
                     ),
+                    interaction: None,
                 };
             };
 
@@ -83,6 +84,7 @@ impl Tool for ShellTool {
                 status: output.status,
                 stdout: output.stdout,
                 stderr: output.stderr,
+                interaction: None,
             }
         })
     }

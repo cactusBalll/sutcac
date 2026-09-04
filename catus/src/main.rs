@@ -126,6 +126,16 @@ async fn run_test_mode(
                         if let Some(message) = app.run_pending_tool().await {
                             println!("TOOL RESULT:\n{}", message);
                         }
+                        if app.has_pending_interaction() {
+                            // The ask overlay needs the interactive TUI;
+                            // report the question as cancelled so the model
+                            // can continue without a user.
+                            app.cancel_interaction();
+                            println!(
+                                "TOOL RESULT:\nuser cancelled (ask_user requires the interactive TUI)"
+                            );
+                            break;
+                        }
                     }
                 } else {
                     println!(

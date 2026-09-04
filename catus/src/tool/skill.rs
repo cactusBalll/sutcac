@@ -62,12 +62,14 @@ impl Tool for SkillTool {
                     status: 0,
                     stdout,
                     stderr: String::new(),
+                    interaction: None,
                 },
                 Err(stderr) => ToolResult {
                     call: call.clone(),
                     status: 1,
                     stdout: String::new(),
                     stderr: format!("catus: {}", stderr),
+                    interaction: None,
                 },
             }
         })

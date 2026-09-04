@@ -7,11 +7,13 @@
 //!
 //! - `shell` — the built-in `shell` tool ([`ShellTool`]);
 //! - `skill` — the built-in `use_skill` tool ([`SkillTool`]);
+//! - `ask_user` — the built-in interactive `ask_user` tool ([`AskUserTool`]);
 //! - `crate::mcp` — tools converted from MCP servers (`McpTool`).
 //!
 //! The application (`app.rs`) acts as the composition root: it registers the
 //! built-in tools at startup and MCP tools as servers connect.
 
+mod ask_user;
 mod shell;
 mod skill;
 
@@ -24,6 +26,9 @@ use sutcac_sh::exec::ShellState;
 use crate::message::Message;
 use crate::skills::SkillRegistry;
 
+pub use ask_user::{
+    Answer, AskAnswer, AskOption, AskQuestion, AskUserTool, InteractionRequest, collect_answer,
+};
 pub use shell::ShellTool;
 pub use skill::SkillTool;
 
@@ -176,6 +181,11 @@ pub struct ToolResult {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
+    /// Set when the tool needs input from the user before its result is
+    /// final. The application pauses the turn, collects the answers through
+    /// an interactive overlay, and only then sends the completed result to
+    /// the LLM.
+    pub interaction: Option<InteractionRequest>,
 }
 
 impl ToolResult {

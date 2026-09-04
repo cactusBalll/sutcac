@@ -99,6 +99,22 @@ fn handle_overlay_result(app: &mut App, result: OverlayAction) -> AppAction {
             }
             Err(e) => AppAction::SetError(e.to_string()),
         },
+        // The ask overlay finished: append the tool result and resume the
+        // paused LLM turn.
+        OverlayAction::Answered(answers) => {
+            if app.complete_interaction(answers) {
+                AppAction::StartStream
+            } else {
+                AppAction::None
+            }
+        }
+        OverlayAction::CancelInteraction => {
+            if app.cancel_interaction() {
+                AppAction::StartStream
+            } else {
+                AppAction::None
+            }
+        }
         OverlayAction::Closed | OverlayAction::Consumed => AppAction::None,
     }
 }

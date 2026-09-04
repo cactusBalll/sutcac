@@ -266,6 +266,7 @@ impl Tool for McpTool {
                         status: 1,
                         stdout: String::new(),
                         stderr: format!("catus: mcp tool failed: {}", e),
+                        interaction: None,
                     }
                 }
             }
@@ -381,6 +382,7 @@ fn convert_call_tool_result(result: rmcp::model::CallToolResult) -> ToolResult {
         status,
         stdout,
         stderr,
+        interaction: None,
     }
 }
 

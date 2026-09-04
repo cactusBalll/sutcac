@@ -12,7 +12,10 @@ use crate::llm::{LlmClient, LlmError, StreamEvent, Usage};
 use crate::mcp::{McpManager, mcp_tools};
 use crate::message::{Message, Role};
 use crate::skills::SkillRegistry;
-use crate::tool::{ShellTool, SkillTool, Tool, ToolCall, ToolContext, ToolResult, Toolbox};
+use crate::tool::{
+    AskAnswer, AskQuestion, AskUserTool, ShellTool, SkillTool, Tool, ToolCall, ToolContext,
+    ToolResult, Toolbox,
+};
 
 pub mod chat_state;
 pub mod command;
@@ -56,6 +59,10 @@ pub struct App {
     pub max_tool_rounds: usize,
     pending_tool_calls: Vec<ToolCall>,
     tool_rounds_this_turn: usize,
+    /// A tool call that is paused waiting for the user to answer questions
+    /// in the ask overlay. The turn resumes via `complete_interaction` or
+    /// `cancel_interaction` once the overlay closes.
+    pending_interaction: Option<(ToolCall, Vec<AskQuestion>)>,
     /// Path of the history file currently being continued, if any.
     current_history_file: Option<std::path::PathBuf>,
     /// Cumulative token usage across all completed LLM requests.
@@ -124,6 +131,7 @@ impl App {
         let mut toolbox = Toolbox::default();
         toolbox.register(Box::new(ShellTool));
         toolbox.register(Box::new(SkillTool));
+        toolbox.register(Box::new(AskUserTool));
 
         Self {
             config,
@@ -139,6 +147,7 @@ impl App {
             max_tool_rounds,
             pending_tool_calls: Vec::new(),
             tool_rounds_this_turn: 0,
+            pending_interaction: None,
             current_history_file: None,
             usage: Usage::default(),
             request_count: 0,
@@ -583,9 +592,21 @@ impl App {
                     status: 1,
                     stdout: String::new(),
                     stderr: format!("catus: unknown tool '{}'", call.name),
+                    interaction: None,
                 }
             }
         };
+
+        if let Some(request) = result.interaction {
+            // The tool is asking the user questions: pause the turn, open the
+            // ask overlay, and resume via `complete_interaction` once the
+            // overlay closes. No result message is pushed yet.
+            log::info!("tool '{}' is waiting for user input", call.name);
+            self.pending_interaction = Some((call, request.questions.clone()));
+            self.overlay_state.open_ask(request.questions);
+            self.chat_state.scroll_to_bottom();
+            return None;
+        }
 
         let message = result.to_message();
         self.messages
@@ -598,6 +619,59 @@ impl App {
         self.chat_state.scroll_to_bottom();
 
         Some(message)
+    }
+
+    /// True while a tool call is paused waiting for the ask overlay.
+    pub fn has_pending_interaction(&self) -> bool {
+        self.pending_interaction.is_some()
+    }
+
+    /// Complete the paused tool call with the user's answers, append the tool
+    /// result message, and resume the LLM turn. Returns false when there is
+    /// no paused interaction (nothing was done).
+    pub fn complete_interaction(&mut self, answers: Vec<AskAnswer>) -> bool {
+        let stdout = serde_json::to_string(&answers).unwrap_or_else(|e| {
+            log::warn!("failed to serialize ask_user answers: {}", e);
+            "[]".to_string()
+        });
+        self.finish_interaction(|call| ToolResult {
+            call,
+            status: 0,
+            stdout,
+            stderr: String::new(),
+            interaction: None,
+        })
+    }
+
+    /// Cancel the paused tool call (the user dismissed the ask overlay) and
+    /// resume the LLM turn with an error result so the model can recover.
+    pub fn cancel_interaction(&mut self) -> bool {
+        self.finish_interaction(|call| ToolResult {
+            call,
+            status: 1,
+            stdout: String::new(),
+            stderr: "catus: user cancelled the question".to_string(),
+            interaction: None,
+        })
+    }
+
+    /// Shared tail of `complete_interaction` / `cancel_interaction`: append
+    /// the result message, drop the paused call, and count it as a tool round.
+    fn finish_interaction(&mut self, make_result: impl FnOnce(ToolCall) -> ToolResult) -> bool {
+        let Some((call, _questions)) = self.pending_interaction.take() else {
+            return false;
+        };
+        let result = make_result(call);
+        let message = result.to_message();
+        self.messages
+            .push(Message::tool(message, result.call.id.clone()));
+        self.pending_tool_calls.remove(0);
+        self.tool_rounds_this_turn += 1;
+
+        self.status = AppStatus::Idle;
+        self.status_message.clear();
+        self.chat_state.scroll_to_bottom();
+        true
     }
 
     /// Load conversation history from a JSON file and append it after the
@@ -825,6 +899,12 @@ impl App {
                         self.pending_tool_calls_count()
                     );
                     self.run_pending_tool().await;
+                    if self.pending_interaction.is_some() {
+                        // The tool turned into an interactive question; the
+                        // overlay collects the answer and the turn resumes
+                        // via AppAction::StartStream once it closes.
+                        return;
+                    }
                     self.start_llm_stream(event_tx.clone(), done_tx.clone())
                         .await;
                 } else if self.pending_tool_calls_count() > 0 {
@@ -1754,5 +1834,81 @@ log_level = "info"
     fn submit_message(app: &mut App, text: &str) {
         app.input_state.input = text.to_string();
         app.submit_user_message();
+    }
+
+    fn ask_tool_call() -> ToolCall {
+        ToolCall {
+            id: "call_ask".to_string(),
+            name: "ask_user".to_string(),
+            arguments: r#"{"questions":[{"prompt":"Pick one","title":"Pick","options":[{"label":"a"},{"label":"b"}],"multiSelect":false}]}"#
+                .to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_tool_pauses_turn_for_interaction() {
+        let mut app = App::new(AppConfig::default());
+        app.messages.push(Message::assistant(String::new()));
+        app.add_tool_call(ask_tool_call());
+
+        let result = app.run_pending_tool().await;
+        assert!(
+            result.is_none(),
+            "no result message while waiting for the user"
+        );
+        assert!(app.has_pending_interaction());
+        assert_eq!(app.pending_tool_calls_count(), 1, "call stays pending");
+        assert!(app.overlay_state.is_active());
+        assert!(
+            !app.messages.iter().any(|m| m.role == Role::Tool),
+            "tool result must not be sent before the user answers"
+        );
+    }
+
+    #[test]
+    fn complete_interaction_appends_result_and_clears_pending() {
+        let mut app = App::new(AppConfig::default());
+        app.messages.push(Message::assistant(String::new()));
+        app.add_tool_call(ask_tool_call());
+        app.pending_interaction = Some((
+            ask_tool_call(),
+            vec![serde_json::from_str(
+                r#"{"prompt":"Pick one","title":"Pick","options":[{"label":"a"},{"label":"b"}],"multiSelect":false}"#,
+            )
+            .unwrap()],
+        ));
+
+        let answers = vec![AskAnswer {
+            prompt: "Pick one".to_string(),
+            answer: crate::tool::Answer::One("a".to_string()),
+        }];
+        assert!(app.complete_interaction(answers));
+        assert!(!app.has_pending_interaction());
+        assert_eq!(app.pending_tool_calls_count(), 0);
+        let last = app.messages.last().expect("tool result message");
+        assert_eq!(last.role, Role::Tool);
+        assert!(last.content.contains(r#""answer":"a""#));
+    }
+
+    #[test]
+    fn cancel_interaction_reports_cancellation() {
+        let mut app = App::new(AppConfig::default());
+        app.messages.push(Message::assistant(String::new()));
+        app.add_tool_call(ask_tool_call());
+        app.pending_interaction = Some((ask_tool_call(), Vec::new()));
+
+        assert!(app.cancel_interaction());
+        assert!(!app.has_pending_interaction());
+        let last = app.messages.last().expect("tool result message");
+        assert!(last.content.contains("user cancelled"));
+        assert!(app.messages.iter().filter(|m| m.role == Role::Tool).count() == 1);
+    }
+
+    #[test]
+    fn completing_without_pending_interaction_is_a_noop() {
+        let mut app = App::new(AppConfig::default());
+        assert!(!app.complete_interaction(Vec::new()));
+        assert!(!app.cancel_interaction());
+        assert!(app.messages.iter().all(|m| m.role != Role::Tool));
     }
 }
