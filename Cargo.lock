@@ -258,6 +258,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "crossterm",
+ "diff-match-patch-rs",
  "dirs",
  "eventsource-stream",
  "futures",
@@ -271,6 +272,7 @@ dependencies = [
  "serde_json",
  "simplelog",
  "sutcac-sh",
+ "tempfile",
  "tokio",
  "toml",
  "unicode-width",
@@ -568,6 +570,16 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "diff-match-patch-rs"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1e836eb966678daed8789e698dbdb1016a260c3cdaca6172585e13580c4e4be"
+dependencies = [
+ "chrono",
+ "percent-encoding",
 ]
 
 [[package]]

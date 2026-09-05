@@ -409,8 +409,7 @@ impl<'a> Lexer<'a> {
                 QuoteState::Single => {
                     _eq_pos_valid = false;
                     self.advance();
-                    if self.chars.peek() == Some(&'\'') {
-                        self.advance();
+                    if c == '\'' {
                         quote_state = QuoteState::None;
                     }
                 }
@@ -533,6 +532,39 @@ mod tests {
                 Token::Assignment("FOO".into(), "bar".into()),
                 Token::Word("echo".into()),
                 Token::Word("'single quote'".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_quote_closes_on_one_quote() {
+        // Bash semantics: a single quote inside single quotes closes them,
+        // so '\'' yields a literal quote and adjacent segments join.
+        let t = tokens("echo 'it'\\''s'");
+        assert_eq!(
+            t,
+            vec![Token::Word("echo".into()), Token::Word("'it'\\''s'".into()),]
+        );
+    }
+
+    #[test]
+    fn empty_single_quotes_form_a_word() {
+        let t = tokens("echo ''");
+        assert_eq!(
+            t,
+            vec![Token::Word("echo".into()), Token::Word("''".into())]
+        );
+    }
+
+    #[test]
+    fn adjacent_single_quoted_segments_stay_separate_words() {
+        let t = tokens("echo 'a' 'b'");
+        assert_eq!(
+            t,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("'a'".into()),
+                Token::Word("'b'".into()),
             ]
         );
     }

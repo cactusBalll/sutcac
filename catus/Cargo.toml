@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = "0.4"
 crossterm = "0.29.0"
+diff-match-patch-rs = "0.5.1"
 dirs = "6.0.0"
 eventsource-stream = "0.2.3"
 futures = "0.3.34"
@@ -26,3 +27,6 @@ sutcac-sh = { path = "../sutcac-sh" }
 tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.4"
 unicode-width = "0.2.2"
+
+[dev-dependencies]
+tempfile = "3"

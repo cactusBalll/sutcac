@@ -13,8 +13,8 @@ use crate::mcp::{McpManager, mcp_tools};
 use crate::message::{Message, Role};
 use crate::skills::SkillRegistry;
 use crate::tool::{
-    AskAnswer, AskQuestion, AskUserTool, ShellTool, SkillTool, Tool, ToolCall, ToolContext,
-    ToolResult, Toolbox,
+    AskAnswer, AskQuestion, AskUserTool, EditTool, ShellTool, SkillTool, Tool, ToolCall,
+    ToolContext, ToolResult, Toolbox,
 };
 
 pub mod chat_state;
@@ -154,6 +154,7 @@ impl App {
         // in `connect_mcp` as servers come online.
         let mut toolbox = Toolbox::default();
         toolbox.register(Box::new(ShellTool));
+        toolbox.register(Box::new(EditTool));
         toolbox.register(Box::new(SkillTool));
         toolbox.register(Box::new(AskUserTool));
 

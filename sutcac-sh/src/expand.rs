@@ -662,30 +662,39 @@ fn split_words(segments: Vec<Segment>) -> Vec<Segment> {
                 quoted: *current_quoted,
                 boundary: false,
             });
-            *current_quoted = false;
         }
+        *current_quoted = false;
     }
 
     for seg in segments {
-        if seg.boundary && !current.is_empty() {
+        if seg.boundary {
+            // A boundary segment starts a new field ("$@" elements and
+            // brace-expansion alternatives); it never merges with neighbours.
             flush(&mut fields, &mut current, &mut current_quoted);
+            if seg.quoted {
+                fields.push(Segment {
+                    value: seg.value,
+                    quoted: true,
+                    boundary: false,
+                });
+                continue;
+            }
         }
         if seg.quoted {
+            // Quoted text never splits: it merges with whatever precedes it,
+            // even across quote boundaries (e.g. a''b is the single field ab).
             current.push_str(&seg.value);
             current_quoted = true;
         } else {
+            // Each separator run between parts is an IFS boundary that ends
+            // the current field; parts themselves are appended without
+            // splitting so adjacent segments keep merging (a''b -> ab).
             let parts: Vec<&str> = seg.value.split(is_ifs).collect();
-            for part in parts {
-                if part.is_empty() {
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
                     flush(&mut fields, &mut current, &mut current_quoted);
-                } else {
-                    if current.is_empty() {
-                        current.push_str(part);
-                    } else {
-                        flush(&mut fields, &mut current, &mut current_quoted);
-                        current.push_str(part);
-                    }
                 }
+                current.push_str(part);
             }
         }
     }
@@ -811,6 +820,23 @@ mod tests {
         let mut c = ctx_with_vars(vars);
         assert_eq!(expand_word("$X", &mut c).unwrap(), vec!["one", "two"]);
         assert_eq!(expand_word("\"$X\"", &mut c).unwrap(), vec!["one two"]);
+    }
+
+    #[test]
+    fn quoted_segments_merge_into_one_field() {
+        let mut vars = HashMap::new();
+        vars.insert("X".into(), "world".into());
+        let mut c = ctx_with_vars(vars);
+        // Quote boundaries and escaped quotes do not split a word.
+        assert_eq!(expand_word("a''b", &mut c).unwrap(), vec!["ab"]);
+        assert_eq!(expand_word("\"a\"'b'\"c\"", &mut c).unwrap(), vec!["abc"]);
+        // Bash idiom '\'' produces a literal single quote mid-word.
+        assert_eq!(
+            expand_word("'it'\\''s $X'", &mut c).unwrap(),
+            vec!["it's $X"]
+        );
+        // A purely quoted empty string is still one (empty) field.
+        assert_eq!(expand_word("''", &mut c).unwrap(), vec![""]);
     }
 
     #[test]

@@ -25,3 +25,12 @@ echo x\a\b\c
 msg="one two three"
 echo $msg
 echo "$msg"
+
+# Escaped single quote inside a single-quoted word
+echo 'it'\''s $var'
+
+# Multiple escaped single quotes in one word
+echo 'a'\''b'\''c'
+
+# Empty single quotes between text
+echo a''b

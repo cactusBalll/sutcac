@@ -6,6 +6,7 @@
 //! of any concrete tool logic; implementations live in sibling modules:
 //!
 //! - `shell` — the built-in `shell` tool ([`ShellTool`]);
+//! - `edit` — the built-in precise file-editing `edit` tool ([`EditTool`]);
 //! - `skill` — the built-in `use_skill` tool ([`SkillTool`]);
 //! - `ask_user` — the built-in interactive `ask_user` tool ([`AskUserTool`]);
 //! - `crate::mcp` — tools converted from MCP servers (`McpTool`).
@@ -14,6 +15,7 @@
 //! built-in tools at startup and MCP tools as servers connect.
 
 mod ask_user;
+mod edit;
 mod shell;
 mod skill;
 
@@ -29,6 +31,7 @@ use crate::skills::SkillRegistry;
 pub use ask_user::{
     Answer, AskAnswer, AskOption, AskQuestion, AskUserTool, InteractionRequest, collect_answer,
 };
+pub use edit::EditTool;
 pub use shell::ShellTool;
 pub use skill::SkillTool;
 

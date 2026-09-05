@@ -38,6 +38,7 @@ pub fn all_builtins() -> Vec<Box<dyn Builtin>> {
         Box::new(TrueBuiltin),
         Box::new(FalseBuiltin),
         Box::new(EchoBuiltin),
+        Box::new(EditBuiltin),
         Box::new(CdBuiltin),
         Box::new(PwdBuiltin),
         Box::new(ExportBuiltin),
@@ -190,6 +191,90 @@ impl Builtin for EchoBuiltin {
             let _ = writeln!(stdout);
         }
         0
+    }
+}
+
+struct EditBuiltin;
+impl Builtin for EditBuiltin {
+    fn name(&self) -> &'static str {
+        "edit"
+    }
+
+    fn permissions(&self) -> PermissionSet {
+        // edit reads the file, then writes it back.
+        PermissionSet::read().union(PermissionSet::write())
+    }
+
+    fn run(
+        &self,
+        args: &[String],
+        state: &mut ShellState,
+        _stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        let [file, old, new] = match args {
+            [file, old, new] => [file, old, new],
+            _ => {
+                let _ = writeln!(
+                    stderr,
+                    "sutcac-sh: edit: usage: edit FILE OLD NEW. Hint: OLD must appear exactly once in FILE and is replaced by NEW."
+                );
+                return 2;
+            }
+        };
+
+        let content = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = writeln!(
+                    stderr,
+                    "sutcac-sh: edit: {}: {}. Hint: check that the file exists and contains valid UTF-8 text.",
+                    file, e
+                );
+                return 1;
+            }
+        };
+
+        let occurrences = content.matches(old.as_str()).count();
+        match occurrences {
+            0 => {
+                let _ = writeln!(
+                    stderr,
+                    "sutcac-sh: edit: {}: old text not found. Hint: re-read the file first to confirm its current content, then retry with an exact match.",
+                    file
+                );
+                1
+            }
+            1 => {
+                let new_content = content.replacen(old.as_str(), new.as_str(), 1);
+                if let Err(e) = std::fs::write(file, &new_content) {
+                    let _ = writeln!(
+                        stderr,
+                        "sutcac-sh: edit: {}: {}. Hint: check write permissions on the file.",
+                        file, e
+                    );
+                    return 1;
+                }
+                state.audit_logger.log(AuditEvent::SideEffect {
+                    cmd: "edit".into(),
+                    description: format!(
+                        "edited {}: {} bytes -> {} bytes",
+                        file,
+                        content.len(),
+                        new_content.len()
+                    ),
+                });
+                0
+            }
+            n => {
+                let _ = writeln!(
+                    stderr,
+                    "sutcac-sh: edit: {}: old text matches {} locations. Hint: include more surrounding context in OLD so the match is unique.",
+                    file, n
+                );
+                1
+            }
+        }
     }
 }
 
@@ -582,11 +667,100 @@ mod tests {
     }
 
     #[test]
+    fn edit_builtin_replaces_unique_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello world\n").unwrap();
+        let mut state = ShellState::new();
+        let (s, _, err) = run(
+            "edit",
+            &[
+                file.to_string_lossy().into_owned(),
+                "world".into(),
+                "rust".into(),
+            ],
+            &mut state,
+        );
+        assert_eq!(s, 0, "stderr: {}", err);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello rust\n");
+    }
+
+    #[test]
+    fn edit_builtin_fails_when_old_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "hello world\n").unwrap();
+        let mut state = ShellState::new();
+        let (s, _, err) = run(
+            "edit",
+            &[
+                file.to_string_lossy().into_owned(),
+                "missing".into(),
+                "rust".into(),
+            ],
+            &mut state,
+        );
+        assert_eq!(s, 1);
+        assert!(err.contains("old text not found"), "stderr: {}", err);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello world\n");
+    }
+
+    #[test]
+    fn edit_builtin_fails_when_old_matches_multiple_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "aaa bbb aaa\n").unwrap();
+        let mut state = ShellState::new();
+        let (s, _, err) = run(
+            "edit",
+            &[
+                file.to_string_lossy().into_owned(),
+                "aaa".into(),
+                "xxx".into(),
+            ],
+            &mut state,
+        );
+        assert_eq!(s, 1);
+        assert!(err.contains("matches 2 locations"), "stderr: {}", err);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaa bbb aaa\n");
+    }
+
+    #[test]
+    fn edit_builtin_requires_exactly_three_args() {
+        let mut state = ShellState::new();
+        let (s, _, err) = run("edit", &["only-file".into()], &mut state);
+        assert_eq!(s, 2);
+        assert!(err.contains("usage: edit FILE OLD NEW"), "stderr: {}", err);
+    }
+
+    #[test]
+    fn edit_builtin_fails_for_missing_file() {
+        let mut state = ShellState::new();
+        let (s, _, err) = run(
+            "edit",
+            &["/nonexistent/path/file.txt".into(), "a".into(), "b".into()],
+            &mut state,
+        );
+        assert_eq!(s, 1);
+        assert!(err.contains("No such file"), "stderr: {}", err);
+    }
+
+    #[test]
     fn builtin_permissions() {
         assert!(permissions_for(":").unwrap().is_empty());
         assert!(permissions_for("true").unwrap().is_empty());
         assert!(permissions_for("false").unwrap().is_empty());
         assert!(permissions_for("echo").unwrap().is_empty());
+        assert!(
+            permissions_for("edit")
+                .unwrap()
+                .contains(&crate::permissions::Permission::Read)
+        );
+        assert!(
+            permissions_for("edit")
+                .unwrap()
+                .contains(&crate::permissions::Permission::Write)
+        );
         assert!(
             permissions_for("pwd")
                 .unwrap()
