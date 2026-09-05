@@ -2,8 +2,15 @@
 //!
 //! Supports both one-shot and streaming (SSE) completions, including
 //! OpenAI-compatible function/tool calling.
+//!
+//! Requests are built from two abstractions:
+//! - [`Provider`]: an API vendor endpoint (base URL, API key, optional
+//!   per-session header name).
+//! - [`Model`]: a concrete model configuration (API model id, display name,
+//!   context window, owning provider).
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::Duration;
 
 use eventsource_stream::Eventsource;
@@ -15,6 +22,79 @@ use crate::message::{Message, Role};
 use crate::tool::{ToolCall, ToolDefinition};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// An API vendor endpoint.
+///
+/// `session_header` names the request header used to carry one stable ID per
+/// conversation (e.g. `"x-opencode-session"` for the opencode platform).
+/// `None` (or empty) means the vendor does not need such a header.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Provider {
+    /// Logical name, e.g. `"opencode"`. Referenced by models.
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub session_header: Option<String>,
+}
+
+impl Default for Provider {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: String::new(),
+            session_header: None,
+        }
+    }
+}
+
+impl Provider {
+    /// Whether every request should carry the per-conversation session ID.
+    pub fn sends_session_id(&self) -> bool {
+        self.session_header
+            .as_deref()
+            .map(|h| !h.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+/// A concrete model configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Model {
+    /// Model id sent in the API request's `model` field.
+    pub id: String,
+    /// Name shown in the UI. Falls back to `id` when empty.
+    pub name: String,
+    /// Context window in tokens; 0 means unspecified.
+    pub context_window: usize,
+    /// The resolved vendor endpoint for this model.
+    #[serde(skip)]
+    pub provider: Provider,
+}
+
+impl Default for Model {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            context_window: 0,
+            provider: Provider::default(),
+        }
+    }
+}
+
+impl Model {
+    /// Display name: `name` when set, otherwise the API `id`.
+    pub fn display_name(&self) -> &str {
+        if self.name.trim().is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
+}
 
 /// Errors returned by the LLM client.
 #[derive(Debug)]
@@ -222,17 +302,13 @@ struct ApiError {
 #[derive(Debug, Clone)]
 pub struct LlmClient {
     client: reqwest::Client,
-    base_url: String,
-    api_key: String,
-    model: String,
+    provider: Provider,
+    model: Model,
+    session_id: String,
 }
 
 impl LlmClient {
-    pub fn new(
-        base_url: impl Into<String>,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
+    pub fn new(provider: Provider, model: Model, session_id: &str) -> Self {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(
@@ -248,19 +324,44 @@ impl LlmClient {
 
         Self {
             client,
-            base_url: base_url.into(),
-            api_key: api_key.into(),
-            model: model.into(),
+            provider,
+            model,
+            session_id: session_id.to_string(),
         }
     }
 
+    /// The per-conversation session ID sent to providers that request one.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     fn auth_header(&self) -> HeaderValue {
-        let value = format!("Bearer {}", self.api_key);
+        let value = format!("Bearer {}", self.provider.api_key);
         HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static(""))
     }
 
+    /// Apply the provider-specific headers shared by both request paths.
+    fn apply_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = request.header(AUTHORIZATION, self.auth_header());
+        if let Some(name) = self
+            .provider
+            .session_header
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_str(name),
+                HeaderValue::from_str(&self.session_id),
+            ) {
+                return request.header(name, value);
+            }
+        }
+        request
+    }
+
     fn url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
+        let base = self.provider.base_url.trim_end_matches('/');
         if base.ends_with("/chat/completions") {
             base.to_string()
         } else {
@@ -279,7 +380,7 @@ impl LlmClient {
             .map(|def| serde_json::to_value(def).unwrap())
             .collect();
         ChatRequest {
-            model: self.model.clone(),
+            model: self.model.id.clone(),
             messages: messages
                 .iter()
                 .filter(|m| m.role != Role::Event)
@@ -320,9 +421,7 @@ impl LlmClient {
     ) -> Result<ChatReply, LlmError> {
         let body = self.build_request(messages, tools, false);
         let response = self
-            .client
-            .post(&self.url())
-            .header(AUTHORIZATION, self.auth_header())
+            .apply_headers(self.client.post(&self.url()))
             .json(&body)
             .send()
             .await?;
@@ -380,9 +479,7 @@ impl LlmClient {
     ) -> Result<(), LlmError> {
         let body = self.build_request(messages, tools, true);
         let response = self
-            .client
-            .post(&self.url())
-            .header(AUTHORIZATION, self.auth_header())
+            .apply_headers(self.client.post(&self.url()))
             .json(&body)
             .send()
             .await?;
@@ -749,9 +846,22 @@ mod tests {
         assert!(parsed.usage.is_none());
     }
 
+    fn test_provider() -> Provider {
+        Provider {
+            name: "test".to_string(),
+            base_url: "https://example.com".to_string(),
+            api_key: "key".to_string(),
+            session_header: None,
+        }
+    }
+
+    fn test_client() -> LlmClient {
+        LlmClient::new(test_provider(), Model::default(), "sess-1")
+    }
+
     #[test]
     fn streaming_request_includes_stream_options() {
-        let client = LlmClient::new("https://example.com", "key", "model");
+        let client = test_client();
         let body = client.build_request(&[], &[], true);
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains(r#""stream_options":{"include_usage":true}"#));
@@ -763,7 +873,7 @@ mod tests {
 
     #[test]
     fn build_request_includes_all_tools() {
-        let client = LlmClient::new("https://example.com", "key", "model");
+        let client = test_client();
         let tools = vec![
             ToolDefinition {
                 tool_type: "function".to_string(),
@@ -786,5 +896,38 @@ mod tests {
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("shell"));
         assert!(json.contains("fs__read"));
+    }
+
+    #[test]
+    fn build_request_uses_model_id() {
+        let mut model = Model::default();
+        model.id = "kimi-k2-0711".to_string();
+        model.name = "Kimi K2".to_string();
+        let client = LlmClient::new(test_provider(), model, "sess-1");
+        let body = client.build_request(&[], &[], false);
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains(r#""model":"kimi-k2-0711""#));
+        assert!(!json.contains("Kimi K2"));
+    }
+
+    #[test]
+    fn provider_detects_session_header_config() {
+        let mut provider = test_provider();
+        assert!(!provider.sends_session_id());
+        provider.session_header = Some(String::new());
+        assert!(!provider.sends_session_id());
+        provider.session_header = Some("   ".to_string());
+        assert!(!provider.sends_session_id());
+        provider.session_header = Some("x-opencode-session".to_string());
+        assert!(provider.sends_session_id());
+    }
+
+    #[test]
+    fn model_display_name_falls_back_to_id() {
+        let mut model = Model::default();
+        model.id = "gpt-4o".to_string();
+        assert_eq!(model.display_name(), "gpt-4o");
+        model.name = "GPT-4o".to_string();
+        assert_eq!(model.display_name(), "GPT-4o");
     }
 }

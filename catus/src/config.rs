@@ -13,17 +13,49 @@ use log::LevelFilter;
 use serde::{Deserialize, Serialize};
 use sutcac_sh::config::ShellConfig;
 
+use crate::llm::{Model, Provider};
+
 /// Full application configuration.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppConfig {
-    pub api: ApiConfig,
+    /// API vendor endpoints (`[[providers]]`).
+    pub providers: Vec<Provider>,
+    /// Configured models (`[[models]]`); each entry references a provider by
+    /// name. See [`AppConfig::resolve_models`].
+    pub models: Vec<ModelEntry>,
     pub agent: AgentConfig,
     pub shell: Option<ShellConfig>,
     /// Optional MCP client configuration. When present, catus connects to the
     /// configured MCP servers and exposes their tools to the LLM alongside the
     /// built-in `shell` tool.
     pub mcp: Option<McpConfig>,
+}
+
+/// Configuration form of a model: like [`Model`], but `provider` names a
+/// configured provider instead of embedding it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ModelEntry {
+    /// Model id sent in the API request's `model` field.
+    pub id: String,
+    /// Name shown in the UI. Falls back to `id` when empty.
+    pub name: String,
+    /// Context window in tokens; 0 means unspecified.
+    pub context_window: usize,
+    /// Name of the `[[providers]]` entry this model talks through.
+    pub provider: String,
+}
+
+impl Default for ModelEntry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            context_window: 0,
+            provider: String::new(),
+        }
+    }
 }
 
 /// MCP client configuration.
@@ -82,15 +114,6 @@ impl Default for McpServerConfig {
     }
 }
 
-/// OpenAI-compatible API configuration.
-#[derive(Debug, Deserialize, Clone, Serialize)]
-#[serde(default)]
-pub struct ApiConfig {
-    pub base_url: String,
-    pub api_key: String,
-    pub model: String,
-}
-
 /// Agent behavior configuration.
 #[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(default)]
@@ -114,7 +137,8 @@ pub struct AgentConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            api: ApiConfig::default(),
+            providers: Vec::new(),
+            models: Vec::new(),
             agent: AgentConfig::default(),
             shell: None,
             mcp: None,
@@ -122,13 +146,39 @@ impl Default for AppConfig {
     }
 }
 
-impl Default for ApiConfig {
-    fn default() -> Self {
-        Self {
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: String::new(),
-            model: "gpt-4o-mini".to_string(),
+impl AppConfig {
+    /// Resolve the configured models into [`Model`]s with their providers
+    /// attached. Fails when a model references an unknown provider, or when
+    /// no providers/models are configured at all.
+    pub fn resolve_models(&self) -> Result<Vec<Model>, String> {
+        if self.providers.is_empty() {
+            return Err("no [[providers]] configured".to_string());
         }
+        if self.models.is_empty() {
+            return Err("no [[models]] configured".to_string());
+        }
+        self.models
+            .iter()
+            .map(|entry| {
+                let provider = self
+                    .providers
+                    .iter()
+                    .find(|p| p.name == entry.provider)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "model '{}' references unknown provider '{}'",
+                            entry.id, entry.provider
+                        )
+                    })?;
+                Ok(Model {
+                    id: entry.id.clone(),
+                    name: entry.name.clone(),
+                    context_window: entry.context_window,
+                    provider,
+                })
+            })
+            .collect()
     }
 }
 
@@ -234,10 +284,15 @@ mod tests {
     #[test]
     fn parse_example_config() {
         let input = r#"
-[api]
+[[providers]]
+name = "openai"
 base_url = "https://api.example.com/v1"
 api_key = "sk-test"
-model = "gpt-4o"
+
+[[models]]
+id = "gpt-4o"
+name = "GPT-4o"
+provider = "openai"
 
 [agent]
 max_tool_rounds = 5
@@ -247,8 +302,11 @@ perm_mode = "deny:write"
 audit_format = "json"
 "#;
         let cfg: AppConfig = toml::from_str(input).unwrap();
-        assert_eq!(cfg.api.base_url, "https://api.example.com/v1");
-        assert_eq!(cfg.api.api_key, "sk-test");
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.providers[0].name, "openai");
+        assert_eq!(cfg.providers[0].api_key, "sk-test");
+        assert_eq!(cfg.models.len(), 1);
+        assert_eq!(cfg.models[0].id, "gpt-4o");
         assert_eq!(cfg.agent.max_tool_rounds, 5);
         assert!(cfg.agent.history_path.is_none());
         let shell = cfg.shell.unwrap();
@@ -256,12 +314,78 @@ audit_format = "json"
     }
 
     #[test]
+    fn resolve_models_attaches_providers() {
+        let input = r#"
+[[providers]]
+name = "opencode"
+base_url = "https://opencode.example.com/v1"
+api_key = "sk-oc"
+session_header = "x-opencode-session"
+
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-oa"
+
+[[models]]
+id = "kimi-k2"
+name = "Kimi K2"
+context_window = 131072
+provider = "opencode"
+
+[[models]]
+id = "gpt-4o-mini"
+provider = "openai"
+"#;
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        let models = cfg.resolve_models().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].display_name(), "Kimi K2");
+        assert_eq!(models[0].context_window, 131072);
+        assert_eq!(models[0].provider.name, "opencode");
+        assert_eq!(
+            models[0].provider.session_header.as_deref(),
+            Some("x-opencode-session")
+        );
+        // Empty display name falls back to the id.
+        assert_eq!(models[1].display_name(), "gpt-4o-mini");
+        assert!(!models[1].provider.sends_session_id());
+    }
+
+    #[test]
+    fn resolve_models_rejects_unknown_provider() {
+        let input = r#"
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-oa"
+
+[[models]]
+id = "gpt-4o"
+provider = "nosuch"
+"#;
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        let err = cfg.resolve_models().unwrap_err();
+        assert!(err.contains("unknown provider"), "unexpected: {}", err);
+    }
+
+    #[test]
+    fn resolve_models_requires_configuration() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert!(cfg.resolve_models().unwrap_err().contains("providers"));
+    }
+
+    #[test]
     fn parse_mcp_servers_config() {
         let input = r#"
-[api]
+[[providers]]
+name = "openai"
 base_url = "https://api.example.com/v1"
 api_key = "sk-test"
-model = "gpt-4o"
+
+[[models]]
+id = "gpt-4o"
+provider = "openai"
 
 [[mcp.servers]]
 name = "filesystem"
@@ -291,10 +415,14 @@ HOME = "/home/user"
     #[test]
     fn parse_remote_streamable_http_server_config() {
         let input = r#"
-[api]
+[[providers]]
+name = "openai"
 base_url = "https://api.example.com/v1"
 api_key = "sk-test"
-model = "gpt-4o"
+
+[[models]]
+id = "gpt-4o"
+provider = "openai"
 
 [[mcp.servers]]
 name = "remote-calc"

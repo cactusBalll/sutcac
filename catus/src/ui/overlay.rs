@@ -6,6 +6,7 @@
 //! - [`Overlay::Status`](crate::app::Overlay::Status): token usage details.
 //! - [`Overlay::Config`](crate::app::Overlay::Config): editable config fields.
 //! - [`Overlay::Skills`](crate::app::Overlay::Skills): skill picker.
+//! - [`Overlay::Model`](crate::app::Overlay::Model): model picker.
 //! - [`Overlay::Ask`](crate::app::Overlay::Ask): question dialog opened by
 //!   the `ask_user` tool.
 //!
@@ -34,6 +35,8 @@ pub enum OverlayAction {
     LoadHistory(String),
     /// The skill picker confirmed a skill name to activate.
     ActivateSkill(String),
+    /// The model picker confirmed a model id to switch to.
+    SwitchModel(String),
     /// The ask overlay collected answers for every question.
     Answered(Vec<AskAnswer>),
     /// The ask overlay was dismissed without answering.
@@ -121,6 +124,45 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 app.overlay_state.close();
                 match chosen {
                     Some(name) => OverlayAction::ActivateSkill(name),
+                    None => OverlayAction::Closed,
+                }
+            }
+            KeyCode::Esc => {
+                app.overlay_state.close();
+                OverlayAction::Closed
+            }
+            _ => OverlayAction::Consumed,
+        },
+        Overlay::Model { items, selected } => match code {
+            KeyCode::Up => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + items.len() - 1) % items.len()
+                };
+                app.overlay_state.overlay = Overlay::Model {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Down => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + 1) % items.len()
+                };
+                app.overlay_state.overlay = Overlay::Model {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Enter => {
+                let chosen = items.get(selected).cloned();
+                app.overlay_state.close();
+                match chosen {
+                    Some(id) => OverlayAction::SwitchModel(id),
                     None => OverlayAction::Closed,
                 }
             }
@@ -289,6 +331,7 @@ pub fn handle_overlay_scroll(app: &mut App, up: bool) -> bool {
         Overlay::Resume { .. }
         | Overlay::Config { .. }
         | Overlay::Skills { .. }
+        | Overlay::Model { .. }
         | Overlay::Ask { .. } => {
             let _ = handle_overlay_key(app, if up { KeyCode::Up } else { KeyCode::Down });
             true
@@ -308,6 +351,7 @@ pub fn draw_overlay(frame: &mut Frame, app: &App) {
         Overlay::Status => draw_status(frame, app, popup),
         Overlay::Config { selected } => draw_config(frame, app, *selected, popup),
         Overlay::Skills { items, selected } => draw_skills(frame, items, *selected, popup),
+        Overlay::Model { items, selected } => draw_model(frame, app, items, *selected, popup),
         Overlay::Ask {
             questions,
             current,
@@ -370,8 +414,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
+    let context_window = if app.current_model.context_window > 0 {
+        app.current_model.context_window.to_string()
+    } else {
+        "unknown".to_string()
+    };
     let usage_rows: Vec<Row> = vec![
-        label_value_row("model", &app.config.api.model),
+        label_value_row("model", app.current_model.display_name()),
+        label_value_row("provider", &app.current_model.provider.name),
+        label_value_row("context window", &context_window),
         label_value_row("requests", &app.request_count.to_string()),
         label_value_row("prompt tokens", &app.usage.prompt_tokens.to_string()),
         label_value_row("  cached", &app.usage.cached_tokens.to_string()),
@@ -432,6 +483,70 @@ fn draw_skills(frame: &mut Frame, items: &[String], selected: usize, area: Rect)
 
     let help = Paragraph::new(Line::styled(
         "↑/↓ select · Enter activate · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ))
+    .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help, rows[1]);
+}
+
+fn draw_model(frame: &mut Frame, app: &App, items: &[String], selected: usize, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Model ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let list_items: Vec<ListItem> = if items.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "(no models configured)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        items
+            .iter()
+            .map(|id| {
+                let text = match app.models.iter().find(|m| m.id == *id) {
+                    Some(model) => {
+                        let ctx = if model.context_window > 0 {
+                            model.context_window.to_string()
+                        } else {
+                            "unknown".to_string()
+                        };
+                        let mut text = format!(
+                            "{} ({} · {} · ctx {})",
+                            model.display_name(),
+                            model.id,
+                            model.provider.name,
+                            ctx
+                        );
+                        if model.id == app.current_model.id {
+                            text.push_str("  ← current");
+                        }
+                        text
+                    }
+                    None => id.clone(),
+                };
+                ListItem::new(Line::from(text))
+            })
+            .collect()
+    };
+
+    let list = List::new(list_items)
+        .highlight_symbol("▶ ")
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, rows[0], &mut state);
+
+    let help = Paragraph::new(Line::styled(
+        "↑/↓ select · Enter switch · Esc cancel",
         Style::default().fg(Color::DarkGray),
     ))
     .alignment(ratatui::layout::Alignment::Center);
@@ -765,6 +880,75 @@ mod tests {
                 OverlayAction::CancelInteraction
             );
             assert!(!app.overlay_state.is_active());
+        }
+    }
+
+    mod model_picker {
+        use super::*;
+        use crate::app::Overlay;
+        use crate::config::{AppConfig, ModelEntry};
+        use crate::llm::Provider;
+
+        fn app_with_models() -> App {
+            let mut config = AppConfig {
+                providers: vec![Provider {
+                    name: "test".to_string(),
+                    base_url: "https://example.com".to_string(),
+                    api_key: "test".to_string(),
+                    session_header: None,
+                }],
+                models: vec![
+                    ModelEntry {
+                        id: "model-a".to_string(),
+                        name: "Model A".to_string(),
+                        context_window: 4096,
+                        provider: "test".to_string(),
+                    },
+                    ModelEntry {
+                        id: "model-b".to_string(),
+                        name: "Model B".to_string(),
+                        context_window: 8192,
+                        provider: "test".to_string(),
+                    },
+                ],
+                ..Default::default()
+            };
+            config.agent.auto_include_skills = false;
+            let mut app = App::new(config);
+            let items: Vec<String> = app.models.iter().map(|m| m.id.clone()).collect();
+            let selected = app
+                .models
+                .iter()
+                .position(|m| m.id == app.current_model.id)
+                .unwrap_or(0);
+            app.overlay_state.open_model(items, selected);
+            app
+        }
+
+        #[test]
+        fn enter_confirms_selected_model_id() {
+            let mut app = app_with_models();
+            handle_overlay_key(&mut app, KeyCode::Down);
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Enter),
+                OverlayAction::SwitchModel("model-b".to_string())
+            );
+            assert!(!app.overlay_state.is_active());
+        }
+
+        #[test]
+        fn selection_wraps_and_esc_closes() {
+            let mut app = app_with_models();
+            handle_overlay_key(&mut app, KeyCode::Up);
+            match &app.overlay_state.overlay {
+                Overlay::Model { selected, .. } => assert_eq!(*selected, 1),
+                other => panic!("expected model overlay, got {:?}", other),
+            }
+            assert_eq!(
+                handle_overlay_key(&mut app, KeyCode::Esc),
+                OverlayAction::Closed
+            );
+            assert_eq!(app.overlay_state.overlay, Overlay::None);
         }
     }
 }

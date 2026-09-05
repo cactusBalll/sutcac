@@ -16,6 +16,9 @@ pub enum Overlay {
     Config { selected: usize },
     /// Skill picker.
     Skills { items: Vec<String>, selected: usize },
+    /// Model picker. `items` are model ids, `selected` is the highlighted
+    /// entry.
+    Model { items: Vec<String>, selected: usize },
     /// Interactive question dialog opened by the `ask_user` tool.
     ///
     /// Questions are shown one at a time. `focus` is the highlighted row:
@@ -78,6 +81,12 @@ impl OverlayState {
     /// Replace the active overlay with the skill picker.
     pub fn open_skills(&mut self, items: Vec<String>) {
         self.overlay = Overlay::Skills { items, selected: 0 };
+    }
+
+    /// Replace the active overlay with the model picker, highlighting
+    /// `selected` (usually the current model).
+    pub fn open_model(&mut self, items: Vec<String>, selected: usize) {
+        self.overlay = Overlay::Model { items, selected };
     }
 
     /// Replace the active overlay with the ask-user question dialog.

@@ -8,7 +8,7 @@ use sutcac_sh::exec::ShellState;
 use tokio::sync::mpsc;
 
 use crate::config::AppConfig;
-use crate::llm::{LlmClient, LlmError, StreamEvent, Usage};
+use crate::llm::{LlmClient, LlmError, Model, StreamEvent, Usage};
 use crate::mcp::{McpManager, mcp_tools};
 use crate::message::{Message, Role};
 use crate::skills::SkillRegistry;
@@ -52,6 +52,14 @@ pub enum OnEnterResult {
 pub struct App {
     pub config: AppConfig,
     pub client: LlmClient,
+    /// All models resolved from the config (providers attached), in config
+    /// order. The list shown by `/model`.
+    pub models: Vec<Model>,
+    /// The model currently in use; drives the API request's `model` field.
+    pub current_model: Model,
+    /// One stable ID per conversation, sent to providers that request a
+    /// session header.
+    pub session_id: String,
     pub shell_state: ShellState,
     pub messages: Vec<Message>,
     pub status: AppStatus,
@@ -94,13 +102,29 @@ pub struct App {
 /// How long transient status-bar messages remain visible before clearing.
 const STATUS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Generate the per-conversation session ID: stable for the lifetime of one
+/// process (one conversation in the TUI).
+fn new_session_id() -> String {
+    format!(
+        "catus-{}-{:08x}",
+        chrono::Utc::now().timestamp_millis(),
+        std::process::id()
+    )
+}
+
 impl App {
     pub fn new(config: AppConfig) -> Self {
-        let client = LlmClient::new(
-            config.api.base_url.clone(),
-            config.api.api_key.clone(),
-            config.api.model.clone(),
-        );
+        let session_id = new_session_id();
+        let models = match config.resolve_models() {
+            Ok(models) => models,
+            Err(e) => {
+                // Tests and minimal setups run without a configured model; real
+                // runs are rejected earlier by config validation in main.
+                log::warn!("no usable model configuration ({}); using placeholder", e);
+                vec![Model::default()]
+            }
+        };
+        let current_model = models.first().cloned().unwrap_or_default();
 
         let (permissions, audit_logger) = config
             .shell
@@ -135,7 +159,14 @@ impl App {
 
         Self {
             config,
-            client,
+            client: LlmClient::new(
+                current_model.provider.clone(),
+                current_model.clone(),
+                &session_id,
+            ),
+            models,
+            current_model,
+            session_id,
             shell_state,
             messages: vec![Message::system(system_prompt)],
             skill_registry,
@@ -412,9 +443,6 @@ impl App {
     /// Return the editable config fields as (key, current_value) pairs.
     pub fn config_fields(&self) -> Vec<(String, String)> {
         let mut fields = vec![
-            ("api.base_url".to_string(), self.config.api.base_url.clone()),
-            ("api.api_key".to_string(), self.config.api.api_key.clone()),
-            ("api.model".to_string(), self.config.api.model.clone()),
             (
                 "agent.max_tool_rounds".to_string(),
                 self.config.agent.max_tool_rounds.to_string(),
@@ -433,6 +461,59 @@ impl App {
         fields
     }
 
+    /// Rebuild the LLM client from the current model and session ID.
+    fn rebuild_client(&mut self) {
+        self.client = LlmClient::new(
+            self.current_model.provider.clone(),
+            self.current_model.clone(),
+            &self.session_id,
+        );
+    }
+
+    /// Switch to a configured model, matched by id or display name. The new
+    /// client takes effect with the next LLM request.
+    pub fn set_model(&mut self, name_or_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let wanted = name_or_id.trim();
+        let model = self
+            .models
+            .iter()
+            .find(|m| m.id == wanted || m.display_name() == wanted)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "model not found: {} (available: {})",
+                    wanted,
+                    self.model_names_list()
+                )
+            })?;
+        let msg = format!(
+            "switched to model {} ({})",
+            model.display_name(),
+            model.provider.name
+        );
+        self.current_model = model;
+        self.rebuild_client();
+        Ok(msg)
+    }
+
+    /// Human-readable list of configured models, marking the current one.
+    pub fn model_names_list(&self) -> String {
+        if self.models.is_empty() {
+            return "no models configured".to_string();
+        }
+        self.models
+            .iter()
+            .map(|m| {
+                if m.id == self.current_model.id {
+                    format!("{}* (current)", m.display_name())
+                } else {
+                    m.display_name().to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Update a single config field by key, save the config file, and refresh
     /// any runtime component that depends on the changed value.
     pub fn set_config_field(
@@ -446,9 +527,6 @@ impl App {
             .ok_or("no config file found; cannot save changes")?;
 
         match key {
-            "api.base_url" => self.config.api.base_url = value.to_string(),
-            "api.api_key" => self.config.api.api_key = value.to_string(),
-            "api.model" => self.config.api.model = value.to_string(),
             "agent.max_tool_rounds" => {
                 self.config.agent.max_tool_rounds = value.parse()?;
                 self.max_tool_rounds = self.config.agent.max_tool_rounds;
@@ -470,15 +548,6 @@ impl App {
                 self.shell_state.set_audit_logger(audit_logger);
             }
             _ => return Err(format!("unknown config field: {}", key).into()),
-        }
-
-        // API changes need a refreshed client.
-        if key.starts_with("api.") {
-            self.client = LlmClient::new(
-                self.config.api.base_url.clone(),
-                self.config.api.api_key.clone(),
-                self.config.api.model.clone(),
-            );
         }
 
         self.config.save(&path)?;
@@ -945,11 +1014,18 @@ mod tests {
 
     fn test_config_with_history_dir(dir: &std::path::Path) -> AppConfig {
         AppConfig {
-            api: crate::config::ApiConfig {
+            providers: vec![crate::llm::Provider {
+                name: "test".to_string(),
                 base_url: "https://example.com".to_string(),
                 api_key: "test".to_string(),
-                model: "test".to_string(),
-            },
+                session_header: None,
+            }],
+            models: vec![crate::config::ModelEntry {
+                id: "test-model".to_string(),
+                name: "Test Model".to_string(),
+                context_window: 4096,
+                provider: "test".to_string(),
+            }],
             agent: crate::config::AgentConfig {
                 system_prompt: "test prompt".to_string(),
                 max_tool_rounds: 5,
@@ -1513,9 +1589,9 @@ mod tests {
         let app = App::new(test_config_with_history_dir(&dir));
         let fields = app.config_fields();
         let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(keys.contains(&"api.base_url"));
-        assert!(keys.contains(&"api.model"));
         assert!(keys.contains(&"agent.max_tool_rounds"));
+        assert!(keys.contains(&"agent.log_level"));
+        assert!(!keys.iter().any(|k| k.starts_with("api.")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1544,10 +1620,14 @@ mod tests {
         // Create a config file so there is a path to save to.
         let config_path = dir.join("config.toml");
         let initial = r#"
-[api]
+[[providers]]
+name = "test"
 base_url = "https://example.com/v1"
 api_key = "test"
-model = "test-model"
+
+[[models]]
+id = "test-model"
+provider = "test"
 
 [agent]
 system_prompt = "test prompt"
@@ -1558,12 +1638,41 @@ log_level = "info"
 
         let mut app = App::new(test_config_with_history_dir(&dir));
         app.config_path = Some(config_path.clone());
-        app.set_config_field("api.model", "gpt-4o")
+        app.set_config_field("agent.max_tool_rounds", "12")
             .expect("set_config_field should succeed");
-        assert_eq!(app.config.api.model, "gpt-4o");
+        assert_eq!(app.config.agent.max_tool_rounds, 12);
+        assert_eq!(app.max_tool_rounds, 12);
 
         let saved = std::fs::read_to_string(&config_path).unwrap();
-        assert!(saved.contains("gpt-4o"));
+        assert!(saved.contains("max_tool_rounds = 12"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_model_switches_current_model_and_rebuilds_client() {
+        let dir = std::env::temp_dir().join(format!("catus_set_model_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = test_config_with_history_dir(&dir);
+        config.models.push(crate::config::ModelEntry {
+            id: "other-model".to_string(),
+            name: "Other".to_string(),
+            context_window: 8192,
+            provider: "test".to_string(),
+        });
+        let mut app = App::new(config);
+        assert_eq!(app.current_model.id, "test-model");
+
+        let msg = app.set_model("Other").unwrap();
+        assert!(msg.contains("Other"));
+        assert_eq!(app.current_model.id, "other-model");
+        assert_eq!(app.client.session_id(), app.session_id);
+
+        assert!(app.set_model("nosuch").is_err());
+        // Failed switches keep the previous model.
+        assert_eq!(app.current_model.id, "other-model");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

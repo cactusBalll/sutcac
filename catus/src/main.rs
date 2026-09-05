@@ -61,9 +61,15 @@ fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         }
     };
 
-    if config.api.api_key.is_empty() {
+    if let Err(e) = config.resolve_models() {
+        eprintln!("catus: invalid model configuration: {}", e);
+        eprintln!("catus: configure at least one [[providers]] entry and one [[models]] entry");
+        std::process::exit(1);
+    }
+
+    if config.providers.iter().all(|p| p.api_key.is_empty()) {
         eprintln!(
-            "catus: api.api_key is empty; set it in .sutcac/config.toml or ~/.config/catus/config.toml"
+            "catus: all provider api_keys are empty; set api_key in .sutcac/config.toml or ~/.config/catus/config.toml"
         );
         std::process::exit(1);
     }

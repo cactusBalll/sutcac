@@ -99,6 +99,14 @@ fn handle_overlay_result(app: &mut App, result: OverlayAction) -> AppAction {
             }
             Err(e) => AppAction::SetError(e.to_string()),
         },
+        OverlayAction::SwitchModel(id) => match app.set_model(&id) {
+            Ok(msg) => {
+                app.status = AppStatus::Idle;
+                app.set_transient_message(msg);
+                AppAction::None
+            }
+            Err(e) => AppAction::SetError(e.to_string()),
+        },
         // The ask overlay finished: append the tool result and resume the
         // paused LLM turn.
         OverlayAction::Answered(answers) => {

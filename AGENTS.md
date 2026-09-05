@@ -62,7 +62,16 @@ Both binaries read the same TOML file, first match wins:
 2. `$XDG_CONFIG_HOME/catus/config.toml`
 3. `~/.config/catus/config.toml`
 
-Copy the root-level `config.toml.example` to `.sutcac/config.toml` and fill in `[api].api_key`. Sections: `[api]`/`[agent]` for catus only; `[shell]` shared by both; `[mcp]` for catus only.
+Copy the root-level `config.toml.example` to `.sutcac/config.toml` and fill in the provider API keys. Sections: `[[providers]]`/`[[models]]`/`[agent]` for catus only; `[shell]` shared by both; `[mcp]` for catus only.
+
+### Providers and models (`[[providers]]`, `[[models]]`)
+
+`catus` separates the API vendor endpoint from the model configuration:
+
+- `[[providers]]` defines an API vendor endpoint: `name`, `base_url`, `api_key`, and an optional `session_header` — the request header name used to carry one stable session ID per conversation (e.g. `"x-opencode-session"` for the opencode platform). Omit `session_header` for vendors that do not need it; the header is never sent when unset.
+- `[[models]]` defines a concrete model: `id` (sent as the API `model` field), `name` (UI display name, falls back to `id`), `context_window` (tokens; 0 = unknown), and `provider` (references a provider's `name`).
+
+`AppConfig::resolve_models()` validates the configuration (unknown provider references are rejected) and produces `llm::Model`s with their provider attached. `App` starts on the first configured model; `/model list` lists them, `/model <name>` switches by id or display name, and bare `/model` opens a picker overlay. Switching rebuilds the `LlmClient`, so it takes effect on the next LLM request.
 
 ### MCP client (`[mcp]`)
 
@@ -111,6 +120,7 @@ Checked before every external command and redirection; denials return non-zero a
 - `/resume <name>` loads `<history_dir>/<name>.json`; bare `/resume` opens a List-based picker overlay (↑/↓ select, Enter load, Esc cancel); `/status` opens a Table overlay with model/requests/token usage. Overlays swallow keys before the input line (`App::handle_overlay_key`).
 - The `ask_user` tool opens the question overlay (`Overlay::Ask`): one question at a time with progress `i/N`, ↑/↓ move across options plus a final "Other" row where typing edits the text; Enter chooses the focused option (single-select) or confirms the checked options (multi-select, Space toggles); Esc cancels the whole question and reports "user cancelled" back to the model.
 - `/mcp list` shows configured MCP servers and their discovered tools; `/mcp status` shows how many servers are connected.
+- `/model list` lists configured models (current one marked); `/model <name>` switches by id or display name; bare `/model` opens the model picker overlay. Switching rebuilds the `LlmClient` and takes effect on the next request.
 - Status bar keeps a compact right-aligned `ctx N tok | total M`; full details are in the /status page.
 - Streaming requests set `stream_options.include_usage`; the returned `Usage` (incl. cached tokens) accumulates in `App.usage`.
 

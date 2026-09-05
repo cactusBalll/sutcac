@@ -305,6 +305,73 @@ impl SlashCommand for SkillCommand {
     }
 }
 
+/// Switch the active model.
+pub struct ModelCommand;
+
+impl SlashCommand for ModelCommand {
+    fn name(&self) -> &'static str {
+        "model"
+    }
+
+    fn description(&self) -> &'static str {
+        "Switch the active model"
+    }
+
+    fn usage(&self) -> &'static str {
+        "/model [name]"
+    }
+
+    fn subcommands(&self) -> &[&'static str] {
+        &["list"]
+    }
+
+    fn help(&self, subcommand: Option<&str>) -> String {
+        match subcommand {
+            Some("list") => "Usage: /model list\nList configured models.".to_string(),
+            Some(sub) => format!("Unknown subcommand '{}' for /model", sub),
+            None => "Usage: /model [name]\n\
+                With no argument, open the model picker. With a name, switch\nto the configured \
+                model directly."
+                .to_string(),
+        }
+    }
+
+    fn record_history(&self, args: Option<&str>) -> bool {
+        args.is_some()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        app: &'a mut App,
+        args: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), CommandError>> {
+        Box::pin(async move {
+            app.status = AppStatus::Idle;
+            match args.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(args) => {
+                    if args == "list" {
+                        app.add_event_message(app.model_names_list());
+                        app.set_transient_message("Models listed");
+                    } else {
+                        let msg = app.set_model(args)?;
+                        app.set_transient_message(msg);
+                    }
+                }
+                None => {
+                    let items: Vec<String> = app.models.iter().map(|m| m.id.clone()).collect();
+                    let selected = app
+                        .models
+                        .iter()
+                        .position(|m| m.id == app.current_model.id)
+                        .unwrap_or(0);
+                    app.overlay_state.open_model(items, selected);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
 /// Show MCP servers and tools.
 pub struct McpCommand;
 
@@ -389,6 +456,7 @@ pub static BUILT_IN_REGISTRY: LazyLock<CommandRegistry> = LazyLock::new(|| {
         Box::new(ConfigCommand),
         Box::new(ResumeCommand),
         Box::new(StatusCommand),
+        Box::new(ModelCommand),
         Box::new(SkillCommand),
         Box::new(McpCommand),
     ])
@@ -413,6 +481,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"help"));
         assert!(names.contains(&"mcp"));
+        assert!(names.contains(&"model"));
         assert!(names.contains(&"skill"));
     }
 
@@ -445,5 +514,61 @@ mod tests {
         let help = BUILT_IN_REGISTRY.find_command("help").unwrap();
         let text = help.help(None);
         assert!(text.contains("/help [command] [subcommand]"));
+    }
+
+    #[tokio::test]
+    async fn model_command_lists_and_switches_models() {
+        let mut config = crate::config::AppConfig {
+            providers: vec![crate::llm::Provider {
+                name: "test".to_string(),
+                base_url: "https://example.com".to_string(),
+                api_key: "test".to_string(),
+                session_header: None,
+            }],
+            models: vec![
+                crate::config::ModelEntry {
+                    id: "model-a".to_string(),
+                    name: "Model A".to_string(),
+                    context_window: 4096,
+                    provider: "test".to_string(),
+                },
+                crate::config::ModelEntry {
+                    id: "model-b".to_string(),
+                    name: "Model B".to_string(),
+                    context_window: 8192,
+                    provider: "test".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        config.agent.auto_include_skills = false;
+        let mut app = App::new(config);
+        assert_eq!(app.current_model.id, "model-a");
+
+        // Bare /model opens the picker with the current model selected.
+        assert!(app.handle_command("/model").await);
+        assert!(matches!(
+            app.overlay_state.overlay,
+            crate::app::Overlay::Model { .. }
+        ));
+
+        assert!(app.handle_command("/model list").await);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.is_event() && m.content.contains("Model B"))
+        );
+
+        assert!(app.handle_command("/model Model B").await);
+        assert_eq!(app.current_model.id, "model-b");
+        assert!(app.status_message.contains("Model B"));
+
+        assert!(app.handle_command("/model nosuch").await);
+        assert!(
+            app.status_message.contains("model not found"),
+            "unexpected status: {}",
+            app.status_message
+        );
+        assert_eq!(app.current_model.id, "model-b");
     }
 }

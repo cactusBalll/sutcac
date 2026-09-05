@@ -1,10 +1,37 @@
 # Copy this file to `.sutcac/config.toml` (or `~/.config/catus/config.toml`)
 # and fill in your OpenAI-compatible API key.
 
-[api]
+# API vendor endpoints. Each provider names its base URL and API key.
+# `session_header` is optional: when set, every request carries one stable
+# session ID per conversation under that header name (e.g. the opencode
+# platform requires `x-opencode-session`). Omit it for providers that do
+# not need such a header.
+[[providers]]
+name = "opencode"
+base_url = "https://api.opencode.example.com/v1"
+api_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+session_header = "x-opencode-session"
+
+[[providers]]
+name = "openai"
 base_url = "https://api.openai.com/v1"
 api_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-model = "gpt-4o-mini"
+
+# Configured models. `provider` references a [[providers]] entry by name.
+# `name` is shown in the UI (falls back to `id`); `context_window` is the
+# model's context size in tokens (0/omitted = unknown). Switch between
+# configured models at runtime with `/model`.
+[[models]]
+id = "kimi-k2"
+name = "Kimi K2"
+context_window = 131072
+provider = "opencode"
+
+[[models]]
+id = "gpt-4o-mini"
+name = "GPT-4o mini"
+context_window = 128000
+provider = "openai"
 
 [agent]
 system_prompt = """You are a helpful assistant running inside a simplified Bash shell.
