@@ -147,7 +147,6 @@ impl App {
             SkillRegistry::new()
         });
 
-        let system_prompt = Self::build_system_prompt(&config, &skill_registry);
         let max_tool_rounds = config.agent.max_tool_rounds;
 
         // Composition root: register the built-in tools; MCP tools are added
@@ -157,6 +156,8 @@ impl App {
         toolbox.register(Box::new(EditTool));
         toolbox.register(Box::new(SkillTool));
         toolbox.register(Box::new(AskUserTool));
+
+        let system_prompt = Self::build_system_prompt(&config, &skill_registry);
 
         Self {
             config,
@@ -192,11 +193,15 @@ impl App {
         }
     }
 
-    /// Build the initial system prompt, optionally appending the skill catalog.
+    /// Build the initial system prompt: the configured base prompt, followed
+    /// by the skill catalog when `auto_include_skills` is set. Tools are not
+    /// listed here — they are advertised to the model through the API's
+    /// native `tools` field.
     pub fn build_system_prompt(config: &AppConfig, registry: &SkillRegistry) -> String {
         let mut prompt = config.agent.system_prompt.clone();
+
         if config.agent.auto_include_skills && !registry.is_empty() {
-            prompt.push_str("\n\nThe following Agent Skills are available. ");
+            prompt.push_str("\nThe following Agent Skills are available. ");
             prompt.push_str("When a task matches a skill's description, activate it ");
             prompt.push_str("by calling the `use_skill` tool with the skill name, ");
             prompt.push_str("then follow the skill's instructions.\n\n");
@@ -882,7 +887,7 @@ impl App {
         }
 
         // Reset to the configured system prompt, then load the saved messages.
-        let system_prompt = self.config.agent.system_prompt.clone();
+        let system_prompt = Self::build_system_prompt(&self.config, &self.skill_registry);
         self.messages = vec![Message::system(system_prompt)];
         self.load_history(&path)?;
         self.current_history_file = Some(path);
@@ -1039,6 +1044,50 @@ mod tests {
             shell: None,
             mcp: None,
         }
+    }
+
+    #[test]
+    fn system_prompt_contains_config_prompt_and_skills() {
+        let dir = std::env::temp_dir().join(format!("catus_sysprompt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("demo-skill")).unwrap();
+        std::fs::write(
+            dir.join("demo-skill/SKILL.md"),
+            "---\nname: demo-skill\ndescription: A demo skill.\n---\nDo demo things.\n",
+        )
+        .unwrap();
+        let registry = SkillRegistry::discover(&[dir.clone()]).unwrap();
+
+        let mut config = test_config_with_history_dir(&dir);
+        config.agent.auto_include_skills = true;
+        let prompt = App::build_system_prompt(&config, &registry);
+
+        // Config prompt comes first, then the skill catalog; no tool section.
+        let base_end = prompt
+            .find("The following Agent Skills are available")
+            .unwrap();
+        assert!(prompt[..base_end].contains("test prompt"));
+        assert!(!prompt.contains("tools are available"));
+        assert!(prompt[base_end..].contains("- demo-skill: A demo skill."));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_prompt_skills_when_empty_or_disabled() {
+        let dir = std::env::temp_dir().join(format!("catus_sysprompt_min_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let config = test_config_with_history_dir(&dir);
+        let prompt = App::build_system_prompt(&config, &SkillRegistry::new());
+        assert_eq!(prompt, "test prompt");
+
+        let registry = SkillRegistry::discover(&[dir.clone()]).unwrap();
+        let prompt = App::build_system_prompt(&config, &registry);
+        assert!(!prompt.contains("Agent Skills"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
