@@ -26,12 +26,15 @@ id = "kimi-k2"
 name = "Kimi K2"
 context_window = 131072
 provider = "opencode"
+# Optional capability tier used by agent definitions: "性能" or "效率".
+tier = "性能"
 
 [[models]]
 id = "gpt-4o-mini"
 name = "GPT-4o mini"
 context_window = 128000
 provider = "openai"
+tier = "效率"
 
 [agent]
 system_prompt = """You are a helpful assistant running inside a simplified Bash shell.
@@ -60,6 +63,11 @@ history_path = ".sutcac/history"
 # Whether to append the list of discovered skills to the system prompt so the
 # model knows they are available. Defaults to true.
 # auto_include_skills = true
+
+# Optional additional directories to scan for Agent definitions (Markdown files
+# with YAML frontmatter). Defaults to ./.sutcac/agents/ and
+# ~/.config/catus/agents/.
+# agent_paths = ["~/.local/share/catus/agents"]
 
 # Optional MCP client configuration. catus connects to the configured MCP
 # servers at startup and exposes their tools to the LLM alongside the built-in

@@ -7,14 +7,16 @@ use sutcac_sh::config::ShellConfig;
 use sutcac_sh::exec::ShellState;
 use tokio::sync::mpsc;
 
+use crate::agents::{AgentDefinition, AgentRegistry};
 use crate::config::AppConfig;
 use crate::llm::{LlmClient, LlmError, Model, StreamEvent, Usage};
 use crate::mcp::{McpManager, mcp_tools};
 use crate::message::{Message, Role};
 use crate::skills::SkillRegistry;
+use crate::subagent::SubagentManager;
 use crate::tool::{
-    AskAnswer, AskQuestion, AskUserTool, EditTool, ShellTool, SkillTool, Tool, ToolCall,
-    ToolContext, ToolResult, Toolbox,
+    AskAnswer, AskQuestion, AskUserTool, EditTool, ShellTool, SkillTool, TaskSyncTool, TaskTool,
+    Tool, ToolCall, ToolContext, ToolResult, Toolbox,
 };
 
 pub mod chat_state;
@@ -83,6 +85,17 @@ pub struct App {
     pub status_message_clear_at: Option<Instant>,
     /// Path of the config file currently in use, if one was found.
     pub config_path: Option<std::path::PathBuf>,
+    /// Discovered Agent definitions registry.
+    pub agent_registry: AgentRegistry,
+    /// The main agent definition driving this conversation.
+    pub main_agent: AgentDefinition,
+    /// Whether `main_agent` was loaded from a file (true) or synthesized from
+    /// the config (false). The real binary requires a `main.md` file.
+    pub main_agent_from_file: bool,
+    /// Running subagents and their state.
+    pub subagents: SubagentManager,
+    /// Currently observed subagent in the TUI, if any.
+    pub current_subagent_view: Option<String>,
     /// Discovered Agent Skills registry.
     pub skill_registry: SkillRegistry,
     /// Names of skills currently active in the conversation.
@@ -112,6 +125,14 @@ fn new_session_id() -> String {
     )
 }
 
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", s.chars().take(max).collect::<String>())
+    }
+}
+
 impl App {
     pub fn new(config: AppConfig) -> Self {
         let session_id = new_session_id();
@@ -126,14 +147,21 @@ impl App {
         };
         let current_model = models.first().cloned().unwrap_or_default();
 
-        let (permissions, audit_logger) = config
-            .shell
+        let (agent_registry, main_agent, main_agent_from_file) = Self::load_main_agent(&config);
+
+        let shell_perm = main_agent
+            .permission
             .clone()
-            .map(|s| (s.permission_policy(), s.audit_logger()))
-            .unwrap_or_else(|| {
-                let default = ShellConfig::default();
-                (default.permission_policy(), default.audit_logger())
-            });
+            .or_else(|| config.shell.as_ref().and_then(|s| s.perm_mode.clone()));
+        let shell_config = {
+            let mut shell = config.shell.clone().unwrap_or_default();
+            shell.perm_mode = shell_perm;
+            shell
+        };
+        let (permissions, audit_logger) = (
+            shell_config.permission_policy(),
+            shell_config.audit_logger(),
+        );
 
         let mut shell_state = ShellState::with_policy_and_logger(permissions, audit_logger);
         shell_state.args = Vec::new();
@@ -152,12 +180,30 @@ impl App {
         // Composition root: register the built-in tools; MCP tools are added
         // in `connect_mcp` as servers come online.
         let mut toolbox = Toolbox::default();
-        toolbox.register(Box::new(ShellTool));
-        toolbox.register(Box::new(EditTool));
-        toolbox.register(Box::new(SkillTool));
-        toolbox.register(Box::new(AskUserTool));
+        toolbox.register(std::sync::Arc::new(ShellTool));
+        toolbox.register(std::sync::Arc::new(EditTool));
+        toolbox.register(std::sync::Arc::new(SkillTool));
+        toolbox.register(std::sync::Arc::new(AskUserTool));
+        // Task dispatch tools are only available to the main agent.
+        toolbox.register(std::sync::Arc::new(TaskTool));
+        toolbox.register(std::sync::Arc::new(TaskSyncTool));
 
-        let system_prompt = Self::build_system_prompt(&config, &skill_registry);
+        // Apply the main agent's allowed-tools filter if it specifies any.
+        let toolbox = if main_agent.allowed_tools.is_empty() || main_agent.inherits_tools() {
+            toolbox
+        } else {
+            toolbox.filter(&main_agent.explicit_tools())
+        };
+
+        let subagents = SubagentManager::new(
+            toolbox.clone(),
+            models.clone(),
+            current_model.clone(),
+            config.clone(),
+            None,
+        );
+
+        let system_prompt = Self::build_system_prompt(&main_agent, &config, &skill_registry);
 
         Self {
             config,
@@ -171,6 +217,11 @@ impl App {
             session_id,
             shell_state,
             messages: vec![Message::system(system_prompt)],
+            agent_registry,
+            main_agent,
+            main_agent_from_file,
+            subagents,
+            current_subagent_view: None,
             skill_registry,
             active_skills: Vec::new(),
             mcp_manager: None,
@@ -193,12 +244,51 @@ impl App {
         }
     }
 
-    /// Build the initial system prompt: the configured base prompt, followed
-    /// by the skill catalog when `auto_include_skills` is set. Tools are not
+    /// Discover agent definitions and select the main agent.
+    ///
+    /// If `main.md` is found in the agent search paths, it is used as the main
+    /// agent. Otherwise a synthetic main agent is built from the config's
+    /// `system_prompt` and `shell.perm_mode` so tests and minimal setups still
+    /// work. The real binary enforces the presence of `main.md` in `main.rs`.
+    fn load_main_agent(config: &AppConfig) -> (AgentRegistry, AgentDefinition, bool) {
+        let mut search_paths = AgentRegistry::default_paths();
+        if let Some(extra) = &config.agent.agent_paths {
+            search_paths.extend(extra.iter().cloned());
+        }
+        let registry = AgentRegistry::discover(&search_paths).unwrap_or_else(|e| {
+            log::warn!("failed to discover agents: {}", e);
+            AgentRegistry::new()
+        });
+
+        let main = registry.get("main").cloned();
+        if let Some(main) = main {
+            return (registry, main, true);
+        }
+
+        log::warn!("main.md agent definition not found; using config.system_prompt as fallback");
+        let fallback = AgentDefinition {
+            name: "main".to_string(),
+            description: "Default main agent".to_string(),
+            model_tier: None,
+            allowed_tools: Vec::new(),
+            permission: config.shell.as_ref().and_then(|s| s.perm_mode.clone()),
+            skills: Vec::new(),
+            body: config.agent.system_prompt.clone(),
+            source_path: std::path::PathBuf::new(),
+        };
+        (registry, fallback, false)
+    }
+
+    /// Build the initial system prompt from the main agent body, followed by
+    /// the skill catalog when `auto_include_skills` is set. Tools are not
     /// listed here — they are advertised to the model through the API's
     /// native `tools` field.
-    pub fn build_system_prompt(config: &AppConfig, registry: &SkillRegistry) -> String {
-        let mut prompt = config.agent.system_prompt.clone();
+    pub fn build_system_prompt(
+        main_agent: &AgentDefinition,
+        config: &AppConfig,
+        registry: &SkillRegistry,
+    ) -> String {
+        let mut prompt = main_agent.body.clone();
 
         if config.agent.auto_include_skills && !registry.is_empty() {
             prompt.push_str("\nThe following Agent Skills are available. ");
@@ -233,9 +323,19 @@ impl App {
             let manager = Arc::new(manager);
             for tool in mcp_tools(manager.clone()).await {
                 log::info!("registered mcp tool '{}'", tool.name());
-                self.toolbox.register(Box::new(tool));
+                self.toolbox.register(Arc::new(tool));
             }
-            self.mcp_manager = Some(manager);
+            self.mcp_manager = Some(manager.clone());
+            // Re-apply the main agent tool filter so MCP tools are included in
+            // the subagent parent snapshot if allowed.
+            let parent_toolbox =
+                if self.main_agent.allowed_tools.is_empty() || self.main_agent.inherits_tools() {
+                    self.toolbox.clone()
+                } else {
+                    self.toolbox.filter(&self.main_agent.explicit_tools())
+                };
+            self.subagents
+                .update_parent_toolbox(parent_toolbox, Some(manager));
         }
         warnings
     }
@@ -383,6 +483,77 @@ impl App {
         } else {
             format!("available skills: {}", names.join(", "))
         }
+    }
+
+    /// Return a human-readable list of discovered agents.
+    pub fn agent_names_list(&self) -> String {
+        let items = self.agent_registry.names_and_descriptions();
+        if items.is_empty() {
+            "no agents discovered".to_string()
+        } else {
+            items
+                .into_iter()
+                .map(|(name, desc)| format!("- {}: {}", name, desc))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    /// Spawn a subagent manually from the TUI.
+    pub fn spawn_subagent(
+        &mut self,
+        name: &str,
+        task: &str,
+        mode: crate::subagent::SubagentContextMode,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let definition = self
+            .agent_registry
+            .get(name)
+            .ok_or_else(|| format!("agent not found: {}", name))?
+            .clone();
+        let id = self.subagents.spawn(
+            &definition,
+            task.to_string(),
+            mode,
+            self.messages.clone(),
+            self.shell_state.clone(),
+            self.active_skills.clone(),
+            self.skill_registry.clone(),
+            None,
+        );
+        Ok(format!(
+            "started subagent {} ({}): {}",
+            definition.name, id, task
+        ))
+    }
+
+    /// Switch the TUI chat view to a subagent's conversation.
+    pub fn watch_subagent(&mut self, id: &str) -> Result<String, Box<dyn std::error::Error>> {
+        if self.subagents.get(id).is_none() {
+            return Err(format!("subagent not found: {}", id).into());
+        }
+        self.current_subagent_view = Some(id.to_string());
+        Ok(format!("watching subagent {}", id))
+    }
+
+    /// Switch the TUI chat view back to the main agent.
+    pub fn watch_main_agent(&mut self) {
+        self.current_subagent_view = None;
+    }
+
+    /// Return a human-readable status list of running subagents.
+    pub fn subagent_status_list(&self) -> String {
+        let subs = self.subagents.list();
+        if subs.is_empty() {
+            return "no active subagents".to_string();
+        }
+        subs.iter()
+            .map(|s| {
+                let task = truncate(&s.task, 40);
+                format!("- {} [{}] {} ({})", s.id, s.state.as_str(), s.name, task)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Return a human-readable list of configured MCP servers and their tools.
@@ -657,6 +828,11 @@ impl App {
                     skill_registry: &mut self.skill_registry,
                     active_skills: &mut self.active_skills,
                     messages: &mut self.messages,
+                    toolbox: &self.toolbox,
+                    agent_registry: Some(&mut self.agent_registry),
+                    subagents: Some(&mut self.subagents),
+                    current_agent: Some(&self.main_agent),
+                    is_main_agent: true,
                 };
                 tool.execute(&call, &mut ctx).await
             }
@@ -857,6 +1033,65 @@ impl App {
         }
     }
 
+    /// Process a subagent event: update managed state, inject completion
+    /// results into the parent conversation, and resume the parent turn when
+    /// an asynchronous subagent finishes.
+    ///
+    /// Returns `true` when the parent agent should start a new LLM stream to
+    /// react to an asynchronous `task` result.
+    pub fn handle_subagent_event(&mut self, event: crate::subagent::SubagentEvent) -> bool {
+        use crate::subagent::SubagentEvent;
+        let mut should_resume = false;
+        match &event {
+            SubagentEvent::Started { id } => {
+                log::info!("subagent {} started", id);
+                self.add_event_message(format!("subagent {} started", id));
+            }
+            SubagentEvent::StateChanged { id, state } => {
+                log::info!("subagent {} state changed to {:?}", id, state);
+            }
+            SubagentEvent::Message { id, message } => {
+                log::debug!("subagent {} message: {:?}", id, message.role);
+            }
+            SubagentEvent::Completed { id, result } => {
+                log::info!("subagent {} completed", id);
+                self.add_event_message(format!(
+                    "subagent {} completed ({} chars)",
+                    id,
+                    result.len()
+                ));
+                // Inject the result as a tool response if the parent is waiting
+                // for this subagent.
+                if let Some(sub) = self.subagents.get(id) {
+                    if sub.parent_call_id.is_some() {
+                        let call_id = sub.parent_call_id.clone().unwrap();
+                        self.messages.push(Message::tool(
+                            format!("status=0\nstdout=```\n{}\n```\nstderr=```\n\n```", result),
+                            call_id,
+                        ));
+                        should_resume = self.status == AppStatus::Idle;
+                    }
+                }
+            }
+            SubagentEvent::Error { id, error } => {
+                log::error!("subagent {} error: {}", id, error);
+                self.add_event_message(format!("subagent {} error: {}", id, error));
+                if let Some(sub) = self.subagents.get(id) {
+                    if sub.parent_call_id.is_some() {
+                        let call_id = sub.parent_call_id.clone().unwrap();
+                        self.messages.push(Message::tool(
+                            format!("status=1\nstdout=```\n\n```\nstderr=```\n{}\n```", error),
+                            call_id,
+                        ));
+                        should_resume = self.status == AppStatus::Idle;
+                    }
+                }
+            }
+        }
+        self.subagents.handle_event(&event);
+        should_resume
+    }
+
     /// Resume a saved conversation. With no `name`, returns the list of
     /// available histories. With a name, loads `<history_dir>/<name>.json`,
     /// resets the current conversation to the configured system prompt plus the
@@ -887,7 +1122,8 @@ impl App {
         }
 
         // Reset to the configured system prompt, then load the saved messages.
-        let system_prompt = Self::build_system_prompt(&self.config, &self.skill_registry);
+        let system_prompt =
+            Self::build_system_prompt(&self.main_agent, &self.config, &self.skill_registry);
         self.messages = vec![Message::system(system_prompt)];
         self.load_history(&path)?;
         self.current_history_file = Some(path);
@@ -1031,6 +1267,7 @@ mod tests {
                 name: "Test Model".to_string(),
                 context_window: 4096,
                 provider: "test".to_string(),
+                tier: None,
             }],
             agent: crate::config::AgentConfig {
                 system_prompt: "test prompt".to_string(),
@@ -1040,6 +1277,7 @@ mod tests {
                 log_level: "info".to_string(),
                 skill_paths: None,
                 auto_include_skills: false,
+                agent_paths: None,
             },
             shell: None,
             mcp: None,
@@ -1060,9 +1298,19 @@ mod tests {
 
         let mut config = test_config_with_history_dir(&dir);
         config.agent.auto_include_skills = true;
-        let prompt = App::build_system_prompt(&config, &registry);
+        let main_agent = AgentDefinition {
+            name: "main".to_string(),
+            description: "Test".to_string(),
+            model_tier: None,
+            allowed_tools: Vec::new(),
+            permission: None,
+            skills: Vec::new(),
+            body: config.agent.system_prompt.clone(),
+            source_path: std::path::PathBuf::new(),
+        };
+        let prompt = App::build_system_prompt(&main_agent, &config, &registry);
 
-        // Config prompt comes first, then the skill catalog; no tool section.
+        // Main agent body comes first, then the skill catalog; no tool section.
         let base_end = prompt
             .find("The following Agent Skills are available")
             .unwrap();
@@ -1080,11 +1328,21 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let config = test_config_with_history_dir(&dir);
-        let prompt = App::build_system_prompt(&config, &SkillRegistry::new());
+        let main_agent = AgentDefinition {
+            name: "main".to_string(),
+            description: "Test".to_string(),
+            model_tier: None,
+            allowed_tools: Vec::new(),
+            permission: None,
+            skills: Vec::new(),
+            body: config.agent.system_prompt.clone(),
+            source_path: std::path::PathBuf::new(),
+        };
+        let prompt = App::build_system_prompt(&main_agent, &config, &SkillRegistry::new());
         assert_eq!(prompt, "test prompt");
 
         let registry = SkillRegistry::discover(&[dir.clone()]).unwrap();
-        let prompt = App::build_system_prompt(&config, &registry);
+        let prompt = App::build_system_prompt(&main_agent, &config, &registry);
         assert!(!prompt.contains("Agent Skills"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1711,6 +1969,7 @@ log_level = "info"
             name: "Other".to_string(),
             context_window: 8192,
             provider: "test".to_string(),
+            tier: None,
         });
         let mut app = App::new(config);
         assert_eq!(app.current_model.id, "test-model");

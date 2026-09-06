@@ -82,6 +82,10 @@ async fn run_test_mode(
     config: AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(config);
+    if !app.main_agent_from_file {
+        eprintln!("catus: main agent definition not found; create .sutcac/agents/main.md");
+        std::process::exit(1);
+    }
     let client = app.client.clone();
     let max_rounds = app.max_tool_rounds;
 
@@ -164,6 +168,10 @@ async fn run_test_mode(
 
 async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(config);
+    if !app.main_agent_from_file {
+        eprintln!("catus: main agent definition not found; create .sutcac/agents/main.md");
+        std::process::exit(1);
+    }
     let mcp_warnings = app.connect_mcp().await;
     for warning in &mcp_warnings {
         log::warn!("mcp warning: {}", warning);
@@ -279,6 +287,11 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                     app.handle_stream_event(event);
                 }
                 app.handle_llm_done(result, &event_tx, &done_tx).await;
+            }
+            Some(event) = app.subagents.event_rx.recv() => {
+                if app.handle_subagent_event(event) {
+                    app.start_llm_stream(event_tx.clone(), done_tx.clone()).await;
+                }
             }
         }
     }

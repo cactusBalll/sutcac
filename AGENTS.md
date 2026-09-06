@@ -33,6 +33,44 @@ Each search directory should contain skill subdirectories (e.g. `my-skill/SKILL.
 - The LLM activates a skill by calling the built-in `use_skill` tool (`SkillTool` in `tool/skill.rs`); activation loads the full `SKILL.md` body and injects it as a system message. Re-activation is idempotent.
 - Use `/skill list` to show discovered skills, `/skill use <name>` to activate a skill from the TUI, or bare `/skill` to open a picker overlay.
 
+## Agent Definitions
+
+`catus` also supports Markdown-based Agent definitions. Each agent is a single `.md` file (e.g. `.sutcac/agents/coder.md`) with YAML frontmatter followed by a Markdown body used as the agent's system prompt.
+
+### Required frontmatter
+
+- `name`: must match the file stem.
+- `description`: short description for agent selection.
+
+### Optional frontmatter
+
+- `model`: capability tier label, e.g. `性能` or `效率`. The subagent runtime picks the first configured `[[models]]` entry with a matching `tier`.
+- `tools`: allowed tool names (single value or list). May include `inherit` to inherit the parent's toolset. Subagents never receive `task`/`taskSync`; they always receive `completeTask`.
+- `permission`: sutcac-sh permission string for the agent's `ShellState`.
+- `skills`: skill names (single value or list). May include `inherit` to inherit the parent's active skills.
+
+### Search paths
+
+Agent definitions are discovered from:
+
+1. `./.sutcac/agents/`
+2. `$XDG_CONFIG_HOME/catus/agents/`
+3. `~/.config/catus/agents/`
+
+Additional paths can be added via `[agent].agent_paths` in `config.toml`.
+
+### Main agent
+
+The file `main.md` is required. Its body becomes the main system prompt, and its frontmatter controls the main agent's tools and permissions. If `main.md` is missing, the binary prints a warning and exits.
+
+### Subagents
+
+- The main agent can dispatch tasks to subagents via the `task` (async) or `taskSync` (blocks until completion) tools.
+- Subagents report results by calling `completeTask`.
+- Subagents cannot spawn further subagents.
+- Use `@agent_name <task>` in the input line as a shorthand for `/agent use <agent_name> <task>`.
+- Use `/agent list`, `/agent status`, `/agent use`, `/agent watch`, and `/agent close` to manage and observe subagents.
+
 ## Commands
 
 ```bash
@@ -52,7 +90,7 @@ cargo run -p mcp-calc-server              # calculator MCP server (stdio)
 cargo test -p mcp-calc-server             # unit + integration tests against catus MCP client
 ```
 
-No CI, lint config, or integration tests exist. Tests currently pass (~64 + 4 in sutcac-sh, ~144 in catus, ~9 in mcp-calc-server).
+No CI, lint config, or integration tests exist. Tests currently pass (~64 + 4 in sutcac-sh, ~170 in catus, ~9 in mcp-calc-server).
 
 ## Configuration
 

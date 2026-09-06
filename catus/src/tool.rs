@@ -15,25 +15,34 @@
 //! built-in tools at startup and MCP tools as servers connect.
 
 mod ask_user;
+mod complete_task;
 mod edit;
 mod shell;
 mod skill;
+mod task;
+mod task_sync;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sutcac_sh::exec::ShellState;
 
+use crate::agents::{AgentDefinition, AgentRegistry};
 use crate::message::Message;
 use crate::skills::SkillRegistry;
+use crate::subagent::SubagentManager;
 
 pub use ask_user::{
     Answer, AskAnswer, AskOption, AskQuestion, AskUserTool, InteractionRequest, collect_answer,
 };
+pub use complete_task::CompleteTaskTool;
 pub use edit::EditTool;
 pub use shell::ShellTool;
 pub use skill::SkillTool;
+pub use task::TaskTool;
+pub use task_sync::TaskSyncTool;
 
 /// Mutable host state made available to tools while they execute.
 ///
@@ -43,6 +52,11 @@ pub struct ToolContext<'a> {
     pub skill_registry: &'a mut SkillRegistry,
     pub active_skills: &'a mut Vec<String>,
     pub messages: &'a mut Vec<Message>,
+    pub toolbox: &'a Toolbox,
+    pub agent_registry: Option<&'a mut AgentRegistry>,
+    pub subagents: Option<&'a mut SubagentManager>,
+    pub current_agent: Option<&'a AgentDefinition>,
+    pub is_main_agent: bool,
 }
 
 /// A tool the Agent can invoke, identified by its advertised name.
@@ -72,14 +86,14 @@ pub trait Tool: Send + Sync {
 /// Starts out empty; the application registers the built-in tools at startup
 /// and MCP tools as servers connect. Lookups go through [`Toolbox::get`] so
 /// dispatch is driven entirely by the advertised tool name.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Toolbox {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 impl Toolbox {
     /// Register a tool. Re-registering an existing name replaces it.
-    pub fn register(&mut self, tool: Box<dyn Tool>) {
+    pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.retain(|t| t.name() != tool.name());
         self.tools.push(tool);
     }
@@ -95,6 +109,20 @@ impl Toolbox {
             .iter()
             .find(|t| t.name() == name)
             .map(|t| t.as_ref())
+    }
+
+    /// Return a new toolbox containing only tools whose names are in `names`.
+    /// Names not found are silently ignored.
+    pub fn filter(&self, names: &[String]) -> Self {
+        let allowed: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .filter(|t| allowed.contains(t.name()))
+                .cloned()
+                .collect(),
+        }
     }
 
     /// Number of registered tools.
@@ -222,8 +250,8 @@ mod tests {
 
     fn test_toolbox() -> Toolbox {
         let mut toolbox = Toolbox::default();
-        toolbox.register(Box::new(ShellTool));
-        toolbox.register(Box::new(SkillTool));
+        toolbox.register(Arc::new(ShellTool));
+        toolbox.register(Arc::new(SkillTool));
         toolbox
     }
 
@@ -264,7 +292,7 @@ mod tests {
     fn toolbox_register_replaces_same_name() {
         let mut toolbox = test_toolbox();
         assert_eq!(toolbox.len(), 2);
-        toolbox.register(Box::new(ShellTool));
+        toolbox.register(Arc::new(ShellTool));
         assert_eq!(toolbox.len(), 2);
     }
 

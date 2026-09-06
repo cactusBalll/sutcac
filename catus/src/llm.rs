@@ -72,6 +72,8 @@ pub struct Model {
     /// The resolved vendor endpoint for this model.
     #[serde(skip)]
     pub provider: Provider,
+    /// Optional capability tier, e.g. "性能" or "效率".
+    pub tier: Option<String>,
 }
 
 impl Default for Model {
@@ -81,6 +83,7 @@ impl Default for Model {
             name: String::new(),
             context_window: 0,
             provider: Provider::default(),
+            tier: None,
         }
     }
 }

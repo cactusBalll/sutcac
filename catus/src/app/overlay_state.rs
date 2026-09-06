@@ -32,6 +32,10 @@ pub enum Overlay {
         other: String,
         answers: Vec<AskAnswer>,
     },
+    /// Agent picker.
+    Agents { items: Vec<String>, selected: usize },
+    /// Subagent status picker.
+    SubagentStatus { items: Vec<String>, selected: usize },
 }
 
 impl Overlay {
@@ -103,6 +107,16 @@ impl OverlayState {
             other: String::new(),
             answers: Vec::new(),
         };
+    }
+
+    /// Replace the active overlay with the agent picker.
+    pub fn open_agents(&mut self, items: Vec<String>) {
+        self.overlay = Overlay::Agents { items, selected: 0 };
+    }
+
+    /// Replace the active overlay with the subagent status picker.
+    pub fn open_subagent_status(&mut self, items: Vec<String>) {
+        self.overlay = Overlay::SubagentStatus { items, selected: 0 };
     }
 
     /// Close any active overlay.

@@ -120,6 +120,7 @@ fn activate_skill(ctx: &mut ToolContext<'_>, arguments: &str) -> Result<String, 
 mod tests {
     use super::*;
     use crate::skills::SkillRegistry;
+    use crate::tool::Toolbox;
     use sutcac_sh::exec::ShellState;
 
     fn skill_call(arguments: &str) -> ToolCall {
@@ -142,11 +143,17 @@ mod tests {
         active_skills: &'a mut Vec<String>,
         messages: &'a mut Vec<Message>,
     ) -> ToolContext<'a> {
+        let toolbox: &'a Toolbox = Box::leak(Box::new(Toolbox::default()));
         ToolContext {
             shell_state,
             skill_registry,
             active_skills,
             messages,
+            toolbox,
+            agent_registry: None,
+            subagents: None,
+            current_agent: None,
+            is_main_agent: true,
         }
     }
 

@@ -172,6 +172,7 @@ pub fn execute_shell_command(cmd: &str, state: &mut ShellState) -> CommandOutput
 mod tests {
     use super::*;
     use crate::skills::SkillRegistry;
+    use crate::tool::Toolbox;
 
     fn shell_call(arguments: &str) -> ToolCall {
         ToolCall {
@@ -193,11 +194,17 @@ mod tests {
         active_skills: &'a mut Vec<String>,
         messages: &'a mut Vec<crate::message::Message>,
     ) -> ToolContext<'a> {
+        let toolbox: &'a Toolbox = Box::leak(Box::new(Toolbox::default()));
         ToolContext {
             shell_state,
             skill_registry,
             active_skills,
             messages,
+            toolbox,
+            agent_registry: None,
+            subagents: None,
+            current_agent: None,
+            is_main_agent: true,
         }
     }
 

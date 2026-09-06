@@ -229,6 +229,131 @@ impl SlashCommand for StatusCommand {
     }
 }
 
+/// Manage Agent definitions and subagents.
+pub struct AgentCommand;
+
+impl SlashCommand for AgentCommand {
+    fn name(&self) -> &'static str {
+        "agent"
+    }
+
+    fn aliases(&self) -> &[&'static str] {
+        &["agents"]
+    }
+
+    fn description(&self) -> &'static str {
+        "Manage Agent definitions and running subagents"
+    }
+
+    fn usage(&self) -> &'static str {
+        "/agent [list | status | use <name> <task> | watch <id>]"
+    }
+
+    fn subcommands(&self) -> &[&'static str] {
+        &["list", "status", "use", "watch", "close"]
+    }
+
+    fn help(&self, subcommand: Option<&str>) -> String {
+        match subcommand {
+            Some("list") => "Usage: /agent list\nList discovered Agent definitions.".to_string(),
+            Some("status") => "Usage: /agent status\nList running subagents and their state.".to_string(),
+            Some("use") => "Usage: /agent use <name> <task> [fork|create]\nDispatch a task to a subagent manually.".to_string(),
+            Some("watch") => "Usage: /agent watch <id>\nSwitch the chat view to a subagent's conversation.".to_string(),
+            Some("close") => "Usage: /agent close <id>\nRemove a completed subagent from the status list.".to_string(),
+            Some(sub) => format!("Unknown subcommand '{}' for /agent", sub),
+            None => format!("Usage: {}\n{}", self.usage(), self.description()),
+        }
+    }
+
+    fn record_history(&self, args: Option<&str>) -> bool {
+        args.is_some()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        app: &'a mut App,
+        args: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), CommandError>> {
+        Box::pin(async move {
+            app.status = AppStatus::Idle;
+            match args.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(args) => {
+                    let mut parts = args.splitn(4, ' ');
+                    let sub = parts.next().unwrap_or("");
+                    match sub {
+                        "list" => {
+                            app.add_event_message(app.agent_names_list());
+                            app.set_transient_message("Agents listed");
+                        }
+                        "status" => {
+                            app.add_event_message(app.subagent_status_list());
+                            app.set_transient_message("Subagent status listed");
+                        }
+                        "use" => {
+                            let name = parts
+                                .next()
+                                .ok_or("usage: /agent use <name> <task> [fork|create]")?;
+                            let rest: Vec<&str> = parts.collect();
+                            if rest.is_empty() {
+                                return Err("usage: /agent use <name> <task> [fork|create]".into());
+                            }
+                            let mode_str = rest
+                                .last()
+                                .copied()
+                                .filter(|s| *s == "fork" || *s == "create");
+                            let task = if mode_str.is_some() {
+                                rest[..rest.len() - 1].join(" ")
+                            } else {
+                                rest.join(" ")
+                            };
+                            let mode = mode_str
+                                .unwrap_or("create")
+                                .parse::<crate::subagent::SubagentContextMode>()?;
+                            let msg = app.spawn_subagent(name, &task, mode)?;
+                            app.set_transient_message(msg);
+                        }
+                        "watch" => match parts.next() {
+                            Some(id) => {
+                                let msg = app.watch_subagent(id)?;
+                                app.set_transient_message(msg);
+                            }
+                            None => {
+                                let items: Vec<String> =
+                                    app.subagents.list().iter().map(|s| s.id.clone()).collect();
+                                app.overlay_state.open_subagent_status(items);
+                            }
+                        },
+                        "close" => {
+                            let id = parts.next().ok_or("usage: /agent close <id>")?;
+                            if app.subagents.remove(id) {
+                                if app.current_subagent_view.as_deref() == Some(id) {
+                                    app.watch_main_agent();
+                                }
+                                app.set_transient_message(format!("closed subagent {}", id));
+                            } else {
+                                return Err(format!("subagent not found: {}", id).into());
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "unknown /agent subcommand: {}. Try /agent list, status, use, watch, or close",
+                                sub
+                            )
+                            .into());
+                        }
+                    }
+                }
+                None => {
+                    let items: Vec<String> =
+                        app.agent_registry.iter().map(|a| a.name.clone()).collect();
+                    app.overlay_state.open_agents(items);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
 /// Manage Agent Skills.
 pub struct SkillCommand;
 
@@ -457,6 +582,7 @@ pub static BUILT_IN_REGISTRY: LazyLock<CommandRegistry> = LazyLock::new(|| {
         Box::new(ResumeCommand),
         Box::new(StatusCommand),
         Box::new(ModelCommand),
+        Box::new(AgentCommand),
         Box::new(SkillCommand),
         Box::new(McpCommand),
     ])
@@ -531,12 +657,14 @@ mod tests {
                     name: "Model A".to_string(),
                     context_window: 4096,
                     provider: "test".to_string(),
+                    tier: None,
                 },
                 crate::config::ModelEntry {
                     id: "model-b".to_string(),
                     name: "Model B".to_string(),
                     context_window: 8192,
                     provider: "test".to_string(),
+                    tier: None,
                 },
             ],
             ..Default::default()

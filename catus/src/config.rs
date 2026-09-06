@@ -16,7 +16,7 @@ use sutcac_sh::config::ShellConfig;
 use crate::llm::{Model, Provider};
 
 /// Full application configuration.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppConfig {
     /// API vendor endpoints (`[[providers]]`).
@@ -45,6 +45,9 @@ pub struct ModelEntry {
     pub context_window: usize,
     /// Name of the `[[providers]]` entry this model talks through.
     pub provider: String,
+    /// Optional capability tier, e.g. "性能" or "效率". Used by agent
+    /// definitions to pick a cost-effective model for a task.
+    pub tier: Option<String>,
 }
 
 impl Default for ModelEntry {
@@ -54,6 +57,7 @@ impl Default for ModelEntry {
             name: String::new(),
             context_window: 0,
             provider: String::new(),
+            tier: None,
         }
     }
 }
@@ -132,6 +136,8 @@ pub struct AgentConfig {
     pub skill_paths: Option<Vec<PathBuf>>,
     /// Whether to include discovered skills in the system prompt automatically.
     pub auto_include_skills: bool,
+    /// Optional additional directories to scan for Agent definitions.
+    pub agent_paths: Option<Vec<PathBuf>>,
 }
 
 impl Default for AppConfig {
@@ -176,6 +182,7 @@ impl AppConfig {
                     name: entry.name.clone(),
                     context_window: entry.context_window,
                     provider,
+                    tier: entry.tier.clone(),
                 })
             })
             .collect()
@@ -199,6 +206,7 @@ impl Default for AgentConfig {
             log_level: "info".to_string(),
             skill_paths: None,
             auto_include_skills: true,
+            agent_paths: None,
         }
     }
 }

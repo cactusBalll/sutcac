@@ -57,6 +57,20 @@ pub async fn handle_key_event(app: &mut App, key: KeyEvent) -> AppAction {
 
     // Enter is special: it may run a slash command or submit a message.
     if key.code == KeyCode::Enter {
+        // @agent_name <task> is a shorthand for /agent use <name> <task>.
+        let input = app.input_state.input.trim();
+        if let Some(rest) = input.strip_prefix('@') {
+            let rest = rest.trim_start();
+            if !rest.is_empty() {
+                let mut parts = rest.splitn(2, ' ');
+                let name = parts.next().unwrap_or("");
+                let task = parts.next().unwrap_or("").trim();
+                app.input_state.input = format!("/agent use {} {} create", name, task);
+                app.input_state.cursor = app.input_state.input.len();
+                app.input_state.recompute_candidates();
+            }
+        }
+
         match app.on_enter().await {
             OnEnterResult::Submitted => return AppAction::StartStream,
             OnEnterResult::Handled | OnEnterResult::Empty => {}
@@ -123,6 +137,20 @@ fn handle_overlay_result(app: &mut App, result: OverlayAction) -> AppAction {
                 AppAction::None
             }
         }
+        OverlayAction::ActivateAgent(name) => {
+            app.input_state.input = format!("/agent use {} ", name);
+            app.input_state.cursor = app.input_state.input.len();
+            app.input_state.recompute_candidates();
+            AppAction::None
+        }
+        OverlayAction::WatchSubagent(id) => match app.watch_subagent(&id) {
+            Ok(msg) => {
+                app.status = AppStatus::Idle;
+                app.set_transient_message(msg);
+                AppAction::None
+            }
+            Err(e) => AppAction::SetError(e.to_string()),
+        },
         OverlayAction::Closed | OverlayAction::Consumed => AppAction::None,
     }
 }

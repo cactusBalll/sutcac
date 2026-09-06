@@ -41,6 +41,10 @@ pub enum OverlayAction {
     Answered(Vec<AskAnswer>),
     /// The ask overlay was dismissed without answering.
     CancelInteraction,
+    /// The agent picker confirmed an agent name to dispatch.
+    ActivateAgent(String),
+    /// The subagent status picker confirmed a subagent id to watch.
+    WatchSubagent(String),
 }
 
 /// Handle a key press while an overlay is active. Keys never reach the
@@ -321,6 +325,84 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 _ => OverlayAction::Consumed,
             }
         }
+        Overlay::Agents { items, selected } => match code {
+            KeyCode::Up => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + items.len() - 1) % items.len()
+                };
+                app.overlay_state.overlay = Overlay::Agents {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Down => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + 1) % items.len()
+                };
+                app.overlay_state.overlay = Overlay::Agents {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Enter => {
+                let chosen = items.get(selected).cloned();
+                app.overlay_state.close();
+                match chosen {
+                    Some(name) => OverlayAction::ActivateAgent(name),
+                    None => OverlayAction::Closed,
+                }
+            }
+            KeyCode::Esc => {
+                app.overlay_state.close();
+                OverlayAction::Closed
+            }
+            _ => OverlayAction::Consumed,
+        },
+        Overlay::SubagentStatus { items, selected } => match code {
+            KeyCode::Up => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + items.len() - 1) % items.len()
+                };
+                app.overlay_state.overlay = Overlay::SubagentStatus {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Down => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + 1) % items.len()
+                };
+                app.overlay_state.overlay = Overlay::SubagentStatus {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Enter => {
+                let chosen = items.get(selected).cloned();
+                app.overlay_state.close();
+                match chosen {
+                    Some(id) => OverlayAction::WatchSubagent(id),
+                    None => OverlayAction::Closed,
+                }
+            }
+            KeyCode::Esc => {
+                app.overlay_state.close();
+                OverlayAction::Closed
+            }
+            _ => OverlayAction::Consumed,
+        },
     }
 }
 
@@ -332,6 +414,8 @@ pub fn handle_overlay_scroll(app: &mut App, up: bool) -> bool {
         | Overlay::Config { .. }
         | Overlay::Skills { .. }
         | Overlay::Model { .. }
+        | Overlay::Agents { .. }
+        | Overlay::SubagentStatus { .. }
         | Overlay::Ask { .. } => {
             let _ = handle_overlay_key(app, if up { KeyCode::Up } else { KeyCode::Down });
             true
@@ -352,6 +436,10 @@ pub fn draw_overlay(frame: &mut Frame, app: &App) {
         Overlay::Config { selected } => draw_config(frame, app, *selected, popup),
         Overlay::Skills { items, selected } => draw_skills(frame, items, *selected, popup),
         Overlay::Model { items, selected } => draw_model(frame, app, items, *selected, popup),
+        Overlay::Agents { items, selected } => draw_agents(frame, app, items, *selected, popup),
+        Overlay::SubagentStatus { items, selected } => {
+            draw_subagent_status(frame, app, items, *selected, popup)
+        }
         Overlay::Ask {
             questions,
             current,
@@ -547,6 +635,108 @@ fn draw_model(frame: &mut Frame, app: &App, items: &[String], selected: usize, a
 
     let help = Paragraph::new(Line::styled(
         "↑/↓ select · Enter switch · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ))
+    .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help, rows[1]);
+}
+
+fn draw_agents(frame: &mut Frame, app: &App, items: &[String], selected: usize, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Agents ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let list_items: Vec<ListItem> = if items.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "(no agents discovered)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        items
+            .iter()
+            .map(|name| {
+                let text = match app.agent_registry.get(name) {
+                    Some(agent) => format!("{} — {}", agent.name, agent.description),
+                    None => name.clone(),
+                };
+                ListItem::new(Line::from(text))
+            })
+            .collect()
+    };
+
+    let list = List::new(list_items)
+        .highlight_symbol("▶ ")
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, rows[0], &mut state);
+
+    let help = Paragraph::new(Line::styled(
+        "↑/↓ select · Enter dispatch · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ))
+    .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help, rows[1]);
+}
+
+fn draw_subagent_status(
+    frame: &mut Frame,
+    app: &App,
+    items: &[String],
+    selected: usize,
+    area: Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Subagent Status ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let list_items: Vec<ListItem> = if items.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "(no active subagents)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        items
+            .iter()
+            .map(|id| {
+                let text = match app.subagents.get(id) {
+                    Some(s) => format!("{} [{}] {}", s.id, s.state.as_str(), s.name),
+                    None => id.clone(),
+                };
+                ListItem::new(Line::from(text))
+            })
+            .collect()
+    };
+
+    let list = List::new(list_items)
+        .highlight_symbol("▶ ")
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, rows[0], &mut state);
+
+    let help = Paragraph::new(Line::styled(
+        "↑/↓ select · Enter watch · Esc cancel",
         Style::default().fg(Color::DarkGray),
     ))
     .alignment(ratatui::layout::Alignment::Center);
@@ -903,12 +1093,14 @@ mod tests {
                         name: "Model A".to_string(),
                         context_window: 4096,
                         provider: "test".to_string(),
+                        tier: None,
                     },
                     ModelEntry {
                         id: "model-b".to_string(),
                         name: "Model B".to_string(),
                         context_window: 8192,
                         provider: "test".to_string(),
+                        tier: None,
                     },
                 ],
                 ..Default::default()

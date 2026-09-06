@@ -43,7 +43,15 @@ pub fn draw_chat(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_history(frame: &mut Frame, app: &mut App, area: Rect) {
-    let lines: Vec<Line> = app.messages.iter().flat_map(message_to_lines).collect();
+    let messages: Vec<&Message> = if let Some(id) = &app.current_subagent_view {
+        app.subagents
+            .get(id)
+            .map(|s| s.messages.iter().collect())
+            .unwrap_or_default()
+    } else {
+        app.messages.iter().collect()
+    };
+    let lines: Vec<Line> = messages.into_iter().flat_map(message_to_lines).collect();
 
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     let total_wrapped_lines = paragraph.line_count(area.width);
@@ -277,13 +285,22 @@ fn render_status(frame: &mut Frame, app: &mut App, area: Rect) {
         ));
     }
 
-    // Right-aligned compact token usage; details live in the /status page.
-    if app.usage.prompt_tokens > 0 {
-        let info = format!(
-            "ctx {} tok | total {}",
+    // Right-aligned compact subagent count and token usage; details live in
+    // the /agent status and /status pages.
+    let running = app.subagents.running_count();
+    let info = if app.usage.prompt_tokens > 0 {
+        format!(
+            "subs {} | ctx {} tok | total {}",
+            running,
             format_tokens(app.usage.context_tokens()),
             format_tokens(app.usage.total_tokens),
-        );
+        )
+    } else if running > 0 {
+        format!("subs {}", running)
+    } else {
+        String::new()
+    };
+    if !info.is_empty() {
         let used: usize = spans.iter().map(|s| s.width()).sum();
         let needed = info.chars().count() + 2; // at least two spaces of padding
         let pad = (area.width as usize)
