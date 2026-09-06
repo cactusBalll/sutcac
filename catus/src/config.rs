@@ -45,9 +45,6 @@ pub struct ModelEntry {
     pub context_window: usize,
     /// Name of the `[[providers]]` entry this model talks through.
     pub provider: String,
-    /// Optional capability tier, e.g. "性能" or "效率". Used by agent
-    /// definitions to pick a cost-effective model for a task.
-    pub tier: Option<String>,
 }
 
 impl Default for ModelEntry {
@@ -57,7 +54,77 @@ impl Default for ModelEntry {
             name: String::new(),
             context_window: 0,
             provider: String::new(),
-            tier: None,
+        }
+    }
+}
+
+/// Capability tier an agent definition can request via its `model`
+/// frontmatter field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelTier {
+    /// High-capability model. Must be configured (`[agent.models]`).
+    Performance,
+    /// Cost-effective model. Optional; falls back to `performance`.
+    Efficient,
+}
+
+impl ModelTier {
+    /// Parse a tier label. Only `performance` and `efficient` are accepted.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_lowercase().as_str() {
+            "performance" => Ok(Self::Performance),
+            "efficient" => Ok(Self::Efficient),
+            other => Err(format!(
+                "unknown model tier '{}'; expected 'performance' or 'efficient'",
+                other
+            )),
+        }
+    }
+
+    /// The tier label as written in configuration.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Performance => "performance",
+            Self::Efficient => "efficient",
+        }
+    }
+}
+
+/// Tier-to-model mapping configured under `[agent.models]`.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default)]
+pub struct TierModelConfig {
+    /// Model id (or display name) used for the `performance` tier. Required.
+    pub performance: String,
+    /// Model id (or display name) used for the `efficient` tier. Optional;
+    /// falls back to `performance` when unset.
+    pub efficient: Option<String>,
+}
+
+/// Resolved tier mapping: the concrete [`Model`] behind each tier. The
+/// `efficient` model always falls back to `performance` when unconfigured.
+#[derive(Debug, Clone)]
+pub struct TierModels {
+    pub performance: Model,
+    pub efficient: Model,
+}
+
+impl Default for TierModels {
+    fn default() -> Self {
+        Self {
+            performance: Model::default(),
+            efficient: Model::default(),
+        }
+    }
+}
+
+impl TierModels {
+    /// Return the model for the given tier.
+    pub fn get(&self, tier: ModelTier) -> &Model {
+        match tier {
+            ModelTier::Performance => &self.performance,
+            ModelTier::Efficient => &self.efficient,
         }
     }
 }
@@ -122,7 +189,6 @@ impl Default for McpServerConfig {
 #[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(default)]
 pub struct AgentConfig {
-    pub system_prompt: String,
     pub max_tool_rounds: usize,
     /// Optional directory that holds JSON conversation-history files. When set,
     /// catus can load a previous conversation with the `/resume` command and
@@ -138,6 +204,10 @@ pub struct AgentConfig {
     pub auto_include_skills: bool,
     /// Optional additional directories to scan for Agent definitions.
     pub agent_paths: Option<Vec<PathBuf>>,
+    /// Tier-to-model mapping. `performance` must reference a configured
+    /// `[[models]]` entry; `efficient` is optional and falls back to
+    /// `performance`.
+    pub models: TierModelConfig,
 }
 
 impl Default for AppConfig {
@@ -182,24 +252,103 @@ impl AppConfig {
                     name: entry.name.clone(),
                     context_window: entry.context_window,
                     provider,
-                    tier: entry.tier.clone(),
                 })
             })
             .collect()
+    }
+
+    /// Find a configured model entry by id or (non-empty) display name.
+    fn find_model_entry(&self, reference: &str) -> Option<&ModelEntry> {
+        self.models
+            .iter()
+            .find(|m| m.id == reference || (!m.name.trim().is_empty() && m.name == reference))
+    }
+
+    /// Validate the `[agent.models]` tier mapping without resolving providers.
+    ///
+    /// `performance` is required and must reference a configured `[[models]]`
+    /// entry; `efficient` is optional but, when set, must also reference one.
+    pub fn validate_tier_models(&self) -> Result<(), String> {
+        let reference = self.agent.models.performance.trim();
+        if reference.is_empty() {
+            return Err(
+                "[agent.models].performance is required; set it to a [[models]] id or name"
+                    .to_string(),
+            );
+        }
+        if self.find_model_entry(reference).is_none() {
+            return Err(format!(
+                "[agent.models].performance '{}' does not match any configured [[models]] id or name",
+                reference
+            ));
+        }
+        if let Some(efficient) = self
+            .agent
+            .models
+            .efficient
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if self.find_model_entry(efficient).is_none() {
+                return Err(format!(
+                    "[agent.models].efficient '{}' does not match any configured [[models]] id or name",
+                    efficient
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the `[agent.models]` tier mapping into concrete [`Model`]s with
+    /// their providers attached. An unset `efficient` tier falls back to the
+    /// `performance` model.
+    pub fn resolve_tier_models(&self, models: &[Model]) -> Result<TierModels, String> {
+        let resolve = |reference: &str| -> Result<Model, String> {
+            models
+                .iter()
+                .find(|m| {
+                    m.id == reference
+                        || (!m.display_name().trim().is_empty() && m.display_name() == reference)
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "tier reference '{}' does not match any configured [[models]] id or name",
+                        reference
+                    )
+                })
+        };
+
+        let performance_ref = self.agent.models.performance.trim();
+        if performance_ref.is_empty() {
+            return Err(
+                "[agent.models].performance is required; set it to a [[models]] id or name"
+                    .to_string(),
+            );
+        }
+        let performance = resolve(performance_ref)?;
+        let efficient = match self
+            .agent
+            .models
+            .efficient
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(efficient_ref) => resolve(efficient_ref)?,
+            None => performance.clone(),
+        };
+        Ok(TierModels {
+            performance,
+            efficient,
+        })
     }
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            system_prompt: concat!(
-                "You are a helpful assistant running inside a simplified Bash shell. ",
-                "You can execute shell commands using the provided `shell` function. ",
-                "Call it with a JSON object like {\"command\": \"the command\"}. ",
-                "The user will see the command output and you can continue. ",
-                "When you have enough information, answer the user directly without tools."
-            )
-            .to_string(),
             max_tool_rounds: 30,
             history_path: None,
             log_path: None,
@@ -207,6 +356,7 @@ impl Default for AgentConfig {
             skill_paths: None,
             auto_include_skills: true,
             agent_paths: None,
+            models: TierModelConfig::default(),
         }
     }
 }
@@ -381,6 +531,121 @@ provider = "nosuch"
     fn resolve_models_requires_configuration() {
         let cfg: AppConfig = toml::from_str("").unwrap();
         assert!(cfg.resolve_models().unwrap_err().contains("providers"));
+    }
+
+    #[test]
+    fn parse_tier_model_config() {
+        let input = r#"
+[agent.models]
+performance = "kimi-k2"
+efficient = "gpt-4o-mini"
+"#;
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        assert_eq!(cfg.agent.models.performance, "kimi-k2");
+        assert_eq!(cfg.agent.models.efficient.as_deref(), Some("gpt-4o-mini"));
+
+        // The whole section is optional at parse time; validation catches the
+        // missing `performance` reference.
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert!(cfg.agent.models.performance.is_empty());
+        assert!(cfg.validate_tier_models().is_err());
+    }
+
+    #[test]
+    fn resolve_tier_models_falls_back_to_performance() {
+        let input = r#"
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-oa"
+
+[[models]]
+id = "kimi-k2"
+name = "Kimi K2"
+provider = "openai"
+
+[[models]]
+id = "gpt-4o-mini"
+provider = "openai"
+
+[agent.models]
+performance = "Kimi K2"
+"#;
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        cfg.validate_tier_models().unwrap();
+        let models = cfg.resolve_models().unwrap();
+        let tiers = cfg.resolve_tier_models(&models).unwrap();
+        assert_eq!(tiers.performance.id, "kimi-k2");
+        // No `efficient` configured: fall back to the performance model.
+        assert_eq!(tiers.efficient.id, "kimi-k2");
+    }
+
+    #[test]
+    fn resolve_tier_models_resolves_both_tiers() {
+        let input = r#"
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-oa"
+
+[[models]]
+id = "kimi-k2"
+provider = "openai"
+
+[[models]]
+id = "gpt-4o-mini"
+provider = "openai"
+
+[agent.models]
+performance = "kimi-k2"
+efficient = "gpt-4o-mini"
+"#;
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        let models = cfg.resolve_models().unwrap();
+        let tiers = cfg.resolve_tier_models(&models).unwrap();
+        assert_eq!(tiers.performance.id, "kimi-k2");
+        assert_eq!(tiers.efficient.id, "gpt-4o-mini");
+        assert_eq!(
+            tiers.get(ModelTier::Efficient).display_name(),
+            "gpt-4o-mini"
+        );
+    }
+
+    #[test]
+    fn tier_models_validation_rejects_missing_or_unknown_performance() {
+        let input = r#"
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-oa"
+
+[[models]]
+id = "kimi-k2"
+provider = "openai"
+"#;
+        // No [agent.models] at all.
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        let err = cfg.validate_tier_models().unwrap_err();
+        assert!(err.contains("performance"), "unexpected: {}", err);
+
+        // Unknown performance reference.
+        let input = format!("{}\n[agent.models]\nperformance = \"nosuch\"\n", input);
+        let cfg: AppConfig = toml::from_str(&input).unwrap();
+        let err = cfg.validate_tier_models().unwrap_err();
+        assert!(err.contains("nosuch"), "unexpected: {}", err);
+    }
+
+    #[test]
+    fn model_tier_parse_is_strict() {
+        assert_eq!(
+            ModelTier::parse("performance").unwrap(),
+            ModelTier::Performance
+        );
+        assert_eq!(
+            ModelTier::parse(" Efficient ").unwrap(),
+            ModelTier::Efficient
+        );
+        assert!(ModelTier::parse("性能").is_err());
     }
 
     #[test]

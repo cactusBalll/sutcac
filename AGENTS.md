@@ -44,7 +44,7 @@ Each search directory should contain skill subdirectories (e.g. `my-skill/SKILL.
 
 ### Optional frontmatter
 
-- `model`: capability tier label, e.g. `性能` or `效率`. The subagent runtime picks the first configured `[[models]]` entry with a matching `tier`.
+- `model`: capability tier, `performance` or `efficient`. The subagent runtime resolves the tier through the `[agent.models]` mapping in config.toml (`efficient` falls back to `performance` when unconfigured); agents without `model` use the parent's current model.
 - `tools`: allowed tool names (single value or list). May include `inherit` to inherit the parent's toolset. Subagents never receive `task`/`taskSync`; they always receive `completeTask`.
 - `permission`: sutcac-sh permission string for the agent's `ShellState`.
 - `skills`: skill names (single value or list). May include `inherit` to inherit the parent's active skills.
@@ -107,9 +107,9 @@ Copy the root-level `config.toml.example` to `.sutcac/config.toml` and fill in t
 `catus` separates the API vendor endpoint from the model configuration:
 
 - `[[providers]]` defines an API vendor endpoint: `name`, `base_url`, `api_key`, and an optional `session_header` — the request header name used to carry one stable session ID per conversation (e.g. `"x-opencode-session"` for the opencode platform). Omit `session_header` for vendors that do not need it; the header is never sent when unset.
-- `[[models]]` defines a concrete model: `id` (sent as the API `model` field), `name` (UI display name, falls back to `id`), `context_window` (tokens; 0 = unknown), and `provider` (references a provider's `name`).
+- `[[models]]` defines a concrete model: `id` (sent as the API `model` field), `name` (UI display name, falls back to `id`), `context_window` (tokens; 0 = unknown), and `provider` (references a provider's `name`). Models carry no tier field; capability tiers are assigned in `[agent.models]`.
 
-`AppConfig::resolve_models()` validates the configuration (unknown provider references are rejected) and produces `llm::Model`s with their provider attached. `App` starts on the first configured model; `/model list` lists them, `/model <name>` switches by id or display name, and bare `/model` opens a picker overlay. Switching rebuilds the `LlmClient`, so it takes effect on the next LLM request.
+`AppConfig::resolve_models()` validates the configuration (unknown provider references are rejected) and produces `llm::Model`s with their provider attached. `[agent.models]` maps the two tiers (`performance` required, `efficient` optional) to model ids or display names; `AppConfig::validate_tier_models()` enforces that `performance` references a configured model, and `resolve_tier_models()` yields the per-tier `Model` (unset `efficient` falls back to `performance`). `App` starts on the first configured model; `/model list` lists them, `/model <name>` switches by id or display name, and bare `/model` opens a picker overlay. Switching rebuilds the `LlmClient`, so it takes effect on the next LLM request.
 
 ### MCP client (`[mcp]`)
 

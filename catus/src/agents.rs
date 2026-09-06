@@ -6,15 +6,18 @@
 //! Supported frontmatter fields:
 //! - `name`: optional, must match file name if present.
 //! - `description`: short human-readable description (required).
-//! - `model`: tier label such as "性能" or "效率".
+//! - `model`: capability tier, `performance` or `efficient`.
 //! - `tools`: list of allowed tool names; may include "inherit".
 //! - `permission`: sutcac-sh permission string.
 //! - `skills`: list of skill names; may include "inherit".
+//!
+//! The tier maps to a concrete model through `[agent.models]` in config.toml.
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::config::ModelTier;
 use crate::frontmatter::{parse_frontmatter, split_frontmatter, validate_name};
 
 /// Parsed metadata from an agent definition's YAML frontmatter.
@@ -53,8 +56,8 @@ pub struct AgentDefinition {
     pub name: String,
     /// Short description for selecting an agent for a task.
     pub description: String,
-    /// Optional model tier label (e.g. "性能", "效率").
-    pub model_tier: Option<String>,
+    /// Optional capability tier (`performance` or `efficient`).
+    pub model_tier: Option<ModelTier>,
     /// Allowed tool names. May contain "inherit".
     pub allowed_tools: Vec<String>,
     /// Optional sutcac-sh permission string.
@@ -111,8 +114,11 @@ impl AgentDefinition {
 
         let model_tier = frontmatter
             .model
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ModelTier::parse)
+            .transpose()?;
         let allowed_tools = frontmatter
             .tools
             .map(|v| {
@@ -392,6 +398,32 @@ mod tests {
         let agent = AgentDefinition::load(&dir.join("single.md")).unwrap();
         assert_eq!(agent.allowed_tools, vec!["shell"]);
         assert_eq!(agent.skills, vec!["rust"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_model_tier_frontmatter() {
+        let dir = std::env::temp_dir().join(format!("catus_agent_tier_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("fast.md"),
+            "---\nname: fast\ndescription: D.\nmodel: efficient\n---\nBody",
+        )
+        .unwrap();
+
+        let agent = AgentDefinition::load(&dir.join("fast.md")).unwrap();
+        assert_eq!(agent.model_tier, Some(ModelTier::Efficient));
+
+        // Unknown tier values make the definition invalid.
+        std::fs::write(
+            dir.join("bad.md"),
+            "---\nname: bad\ndescription: D.\nmodel: turbo\n---\nBody",
+        )
+        .unwrap();
+        let err = AgentDefinition::load(&dir.join("bad.md")).unwrap_err();
+        assert!(err.contains("unknown model tier"), "unexpected: {}", err);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

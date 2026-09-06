@@ -1,0 +1,132 @@
+//! Embedded default resources for catus.
+//!
+//! The default project configuration (config template, agent definitions and
+//! skills) lives in `catus/resources/` and is embedded into the binary with
+//! `include_str!`. `catus --install-project-config` dumps these files into
+//! `./.sutcac/` so a fresh project only needs its provider credentials filled
+//! in before catus can run.
+//!
+//! Existing files are never overwritten: the installer skips them so user
+//! edits (and API keys) survive a re-run.
+
+use std::path::{Path, PathBuf};
+
+/// Default config template. Fill in the provider and model entries and catus
+/// runs directly.
+pub const CONFIG_TOML: &str = include_str!("../resources/config.toml");
+/// Default main agent definition.
+pub const AGENT_MAIN_MD: &str = include_str!("../resources/agents/main.md");
+/// Default coder subagent definition.
+pub const AGENT_CODER_MD: &str = include_str!("../resources/agents/coder.md");
+/// Example skill: git commit workflow.
+pub const SKILL_COMMIT_MD: &str = include_str!("../resources/skills/commit/SKILL.md");
+
+/// Files written by [`install_project_config`], relative to `.sutcac/`.
+pub const PROJECT_FILES: &[(&str, &str)] = &[
+    ("config.toml", CONFIG_TOML),
+    ("agents/main.md", AGENT_MAIN_MD),
+    ("agents/coder.md", AGENT_CODER_MD),
+    ("skills/commit/SKILL.md", SKILL_COMMIT_MD),
+];
+
+/// What happened to a single installed file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallAction {
+    /// File did not exist and was written.
+    Written,
+    /// File already existed and was left untouched.
+    Skipped,
+}
+
+/// Result of one [`install_project_config`] run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallReport {
+    /// Target directory the files were installed into.
+    pub target_dir: PathBuf,
+    /// Per-file outcome, in [`PROJECT_FILES`] order.
+    pub files: Vec<(&'static str, InstallAction)>,
+}
+
+impl InstallReport {
+    /// Number of files written by this run.
+    pub fn written(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|(_, a)| *a == InstallAction::Written)
+            .count()
+    }
+
+    /// Number of existing files skipped by this run.
+    pub fn skipped(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|(_, a)| *a == InstallAction::Skipped)
+            .count()
+    }
+}
+
+/// Dump the embedded default resources into `<target_root>/.sutcac/`.
+///
+/// Missing parent directories are created; files that already exist are
+/// skipped so user configuration is never overwritten.
+pub fn install_project_config(target_root: &Path) -> std::io::Result<InstallReport> {
+    let target_dir = target_root.join(".sutcac");
+    let mut files = Vec::new();
+
+    for (relative, contents) in PROJECT_FILES {
+        let path = target_dir.join(relative);
+        let action = if path.exists() {
+            InstallAction::Skipped
+        } else {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, contents)?;
+            InstallAction::Written
+        };
+        files.push((*relative, action));
+    }
+
+    Ok(InstallReport { target_dir, files })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_resources_are_non_empty() {
+        assert!(CONFIG_TOML.contains("[[providers]]"));
+        assert!(CONFIG_TOML.contains("[[models]]"));
+        assert!(CONFIG_TOML.contains("[agent.models]"));
+        assert!(AGENT_MAIN_MD.starts_with("---\nname: main\n"));
+        assert!(AGENT_CODER_MD.starts_with("---\nname: coder\n"));
+        assert!(SKILL_COMMIT_MD.starts_with("---\nname: commit\n"));
+    }
+
+    #[test]
+    fn install_writes_all_files_once_and_skips_on_rerun() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let report = install_project_config(root).unwrap();
+        assert_eq!(report.target_dir, root.join(".sutcac"));
+        assert_eq!(report.written(), PROJECT_FILES.len());
+        assert_eq!(report.skipped(), 0);
+        for (relative, _) in PROJECT_FILES {
+            assert!(root.join(".sutcac").join(relative).is_file());
+        }
+
+        // A second run must not overwrite anything.
+        let report = install_project_config(root).unwrap();
+        assert_eq!(report.written(), 0);
+        assert_eq!(report.skipped(), PROJECT_FILES.len());
+    }
+
+    #[test]
+    fn installed_config_parses_and_validates() {
+        let cfg: crate::config::AppConfig = toml::from_str(CONFIG_TOML).unwrap();
+        cfg.resolve_models().unwrap();
+        cfg.validate_tier_models().unwrap();
+    }
+}

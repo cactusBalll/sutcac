@@ -3,6 +3,7 @@
 use std::fs::OpenOptions;
 use std::path::Path;
 
+use clap::Parser;
 use crossterm::event::Event;
 use log::LevelFilter;
 use simplelog::{Config, WriteLogger};
@@ -12,8 +13,22 @@ use catus::app::{App, AppStatus};
 use catus::config::AppConfig;
 use catus::llm::{LlmError, StreamEvent};
 use catus::message::Message;
+use catus::resources;
 use catus::tui;
 use catus::ui;
+
+/// catus: an Agent TUI with an OpenAI-compatible API.
+#[derive(Debug, Parser)]
+#[command(name = "catus", version)]
+struct Cli {
+    /// Headless one-shot mode: run this prompt without the TUI and exit.
+    #[arg(long, value_name = "PROMPT")]
+    test: Option<String>,
+    /// Dump the default config template, agents and skills into ./.sutcac/
+    /// (existing files are never overwritten) and exit.
+    #[arg(long)]
+    install_project_config: bool,
+}
 
 enum UiEvent {
     Key(crossterm::event::KeyEvent),
@@ -23,9 +38,37 @@ enum UiEvent {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse();
 
-    if let Some(prompt) = parse_test_arg(&args) {
+    if cli.install_project_config {
+        let root = std::env::current_dir()?;
+        match resources::install_project_config(&root) {
+            Ok(report) => {
+                println!(
+                    "catus: installed project config into {}",
+                    report.target_dir.display()
+                );
+                for (relative, action) in &report.files {
+                    let verb = match action {
+                        resources::InstallAction::Written => "written",
+                        resources::InstallAction::Skipped => "kept",
+                    };
+                    println!("catus:   {verb}: .sutcac/{relative}");
+                }
+                if report.skipped() > 0 {
+                    println!("catus: existing files were kept; edit them instead of overwriting");
+                }
+                println!("catus: fill in api_key in .sutcac/config.toml, then run catus again");
+            }
+            Err(e) => {
+                eprintln!("catus: failed to install project config: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(prompt) = cli.test {
         let config = load_config()?;
         init_logger(&config.effective_log_path(), config.effective_log_level());
         return run_test_mode(prompt, config).await;
@@ -34,16 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config()?;
     init_logger(&config.effective_log_path(), config.effective_log_level());
     run_tui_mode(config).await
-}
-
-fn parse_test_arg(args: &[String]) -> Option<String> {
-    let mut iter = args.iter().skip(1);
-    while let Some(arg) = iter.next() {
-        if arg == "--test" {
-            return iter.next().cloned();
-        }
-    }
-    None
 }
 
 fn init_logger(path: &Path, level: LevelFilter) {
@@ -64,6 +97,14 @@ fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     if let Err(e) = config.resolve_models() {
         eprintln!("catus: invalid model configuration: {}", e);
         eprintln!("catus: configure at least one [[providers]] entry and one [[models]] entry");
+        std::process::exit(1);
+    }
+
+    if let Err(e) = config.validate_tier_models() {
+        eprintln!("catus: invalid tier model configuration: {}", e);
+        eprintln!(
+            "catus: set [agent.models] performance to a configured [[models]] id or name; efficient is optional"
+        );
         std::process::exit(1);
     }
 

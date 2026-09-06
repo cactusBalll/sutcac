@@ -1,5 +1,7 @@
-# Copy this file to `.sutcac/config.toml` (or `~/.config/catus/config.toml`)
-# and fill in your OpenAI-compatible API key.
+# catus project configuration, installed by `catus --install-project-config`.
+# Fill in the provider base_url / api_key and the [[models]] entries, then run
+# catus directly. Search order: ./.sutcac/config.toml first, then
+# $XDG_CONFIG_HOME/catus/config.toml, then ~/.config/catus/config.toml.
 
 # API vendor endpoints. Each provider names its base URL and API key.
 # `session_header` is optional: when set, every request carries one stable
@@ -12,11 +14,6 @@ base_url = "https://api.opencode.example.com/v1"
 api_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 session_header = "x-opencode-session"
 
-[[providers]]
-name = "openai"
-base_url = "https://api.openai.com/v1"
-api_key = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
 # Configured models. `provider` references a [[providers]] entry by name.
 # `name` is shown in the UI (falls back to `id`); `context_window` is the
 # model's context size in tokens (0/omitted = unknown). Switch between
@@ -27,12 +24,6 @@ name = "Kimi K2"
 context_window = 131072
 provider = "opencode"
 
-[[models]]
-id = "gpt-4o-mini"
-name = "GPT-4o mini"
-context_window = 128000
-provider = "openai"
-
 [agent]
 max_tool_rounds = 10
 # Optional directory for JSON conversation-history files. When set, catus can
@@ -40,26 +31,18 @@ max_tool_rounds = 10
 # session to a timestamped JSON file on exit.
 history_path = ".sutcac/history"
 
-# Optional log file path. All catus diagnostics are written here; nothing is
-# printed to stderr while the TUI is running. Defaults to `.sutcac/catus.log`.
+# Optional log file path and level. Defaults to `.sutcac/catus.log` and info.
 # log_path = ".sutcac/catus.log"
-
-# Optional log level: trace, debug, info, warn, error. Defaults to info.
 # log_level = "info"
 
-# Optional additional directories to scan for Agent Skills (directories
-# containing skill subdirectories, each with a SKILL.md file). Defaults to
-# ./.sutcac/skills/ and ~/.config/catus/skills/.
+# Optional additional directories to scan for Agent Skills and Agent
+# definitions. Defaults to ./.sutcac/skills/ and ./.sutcac/agents/ plus the
+# user-level ~/.config/catus/{skills,agents}/ directories.
 # skill_paths = ["~/.local/share/catus/skills"]
-
-# Whether to append the list of discovered skills to the system prompt so the
-# model knows they are available. Defaults to true.
-# auto_include_skills = true
-
-# Optional additional directories to scan for Agent definitions (Markdown files
-# with YAML frontmatter). Defaults to ./.sutcac/agents/ and
-# ~/.config/catus/agents/.
 # agent_paths = ["~/.local/share/catus/agents"]
+
+# Whether to append the list of discovered skills to the system prompt.
+# auto_include_skills = true
 
 # Model tiers for agent definitions. An agent's `model` frontmatter field
 # accepts "performance" or "efficient" and maps to the model configured here
@@ -67,49 +50,21 @@ history_path = ".sutcac/history"
 # `efficient` is optional and falls back to `performance` when omitted.
 [agent.models]
 performance = "kimi-k2"
-# efficient = "gpt-4o-mini"
+# efficient = "kimi-k2"
 
 # Optional MCP client configuration. catus connects to the configured MCP
 # servers at startup and exposes their tools to the LLM alongside the built-in
-# `shell` tool. Two transports are supported: stdio child processes (default)
-# and remote Streamable HTTP servers. Tool names are prefixed with
-# `{server_name}__` to avoid collisions, e.g. `filesystem__read_file`.
-# [[mcp.servers]]
-# name = "filesystem"
-# command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
-#
-# [mcp.servers.env]
-# HOME = "/home/user"
-
-# Example: local calculator MCP server built from this workspace.
-# Tools are exposed as `calc__sum`, `calc__sub`, `calc__mul`, `calc__div`,
-# and `calc__modulo`.
+# `shell` tool. Tool names are prefixed with `{server_name}__`, e.g.
+# `calc__sum`.
 # [[mcp.servers]]
 # name = "calc"
 # command = "target/debug/mcp-calc-server"
 
-# Example: remote MCP server over Streamable HTTP. `transport` defaults to
-# "stdio"; `command` may be omitted for remote servers. `headers` are sent
-# with every request (e.g. for Bearer authentication). The legacy SSE
-# transport is not supported.
-# [[mcp.servers]]
-# name = "remote-calc"
-# transport = "streamable-http"
-# url = "https://mcp.example.com/calc"
-#
-# [mcp.servers.headers]
-# Authorization = "Bearer sk-xxxxxxxx"
-
 [shell]
 # allow_all | allow:<tags> | deny:<tags> | allow:<tags> deny:<tags> | allow1:<cmds> | deny1:<cmds>
 perm_mode = "allow_all"
-audit_log = "/tmp/sutcac-audit.log"
+audit_log = ".sutcac/audit.log"
 audit_format = "text"
-
-# Optional structured metadata appended to every audit log entry.
-[shell.audit_meta]
-session = "example-session"
 
 # Shorthand permission lists: every listed command gets the READ (or WRITE)
 # permission tag, equivalent to listing each one under [shell.commands].
@@ -125,10 +80,7 @@ read = [
 # to READ+WRITE. Entries here override the shorthand lists above.
 [shell.commands]
 curl = ["network", "read"]
-clip = ["clipboard"]
 
-# Optional path-based access control. Paths are canonicalized when the config
-# is loaded; relative paths are resolved against the working directory at load
-# time, not at command execution time. Empty lists mean no restriction.
-# read_paths = ["/home/user/data", "/tmp"]
+# Optional path-based access control. Empty lists mean no restriction.
+# read_paths = ["/home/user/data"]
 # write_paths = ["/home/user/projects"]

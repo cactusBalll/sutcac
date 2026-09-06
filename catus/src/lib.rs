@@ -7,6 +7,7 @@ pub mod frontmatter;
 pub mod llm;
 pub mod mcp;
 pub mod message;
+pub mod resources;
 pub mod skills;
 pub mod subagent;
 pub mod tool;

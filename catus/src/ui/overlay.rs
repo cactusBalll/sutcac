@@ -1093,14 +1093,12 @@ mod tests {
                         name: "Model A".to_string(),
                         context_window: 4096,
                         provider: "test".to_string(),
-                        tier: None,
                     },
                     ModelEntry {
                         id: "model-b".to_string(),
                         name: "Model B".to_string(),
                         context_window: 8192,
                         provider: "test".to_string(),
-                        tier: None,
                     },
                 ],
                 ..Default::default()

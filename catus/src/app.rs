@@ -8,7 +8,7 @@ use sutcac_sh::exec::ShellState;
 use tokio::sync::mpsc;
 
 use crate::agents::{AgentDefinition, AgentRegistry};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, TierModels};
 use crate::llm::{LlmClient, LlmError, Model, StreamEvent, Usage};
 use crate::mcp::{McpManager, mcp_tools};
 use crate::message::{Message, Role};
@@ -146,6 +146,18 @@ impl App {
             }
         };
         let current_model = models.first().cloned().unwrap_or_default();
+        let tier_models = config.resolve_tier_models(&models).unwrap_or_else(|e| {
+            // Tests and minimal setups run without a tier configuration; real
+            // runs are rejected earlier by config validation in main.
+            log::warn!(
+                "invalid tier model configuration ({}); tiers fall back to the current model",
+                e
+            );
+            TierModels {
+                performance: current_model.clone(),
+                efficient: current_model.clone(),
+            }
+        });
 
         let (agent_registry, main_agent, main_agent_from_file) = Self::load_main_agent(&config);
 
@@ -197,7 +209,7 @@ impl App {
 
         let subagents = SubagentManager::new(
             toolbox.clone(),
-            models.clone(),
+            tier_models.clone(),
             current_model.clone(),
             config.clone(),
             None,
@@ -247,9 +259,10 @@ impl App {
     /// Discover agent definitions and select the main agent.
     ///
     /// If `main.md` is found in the agent search paths, it is used as the main
-    /// agent. Otherwise a synthetic main agent is built from the config's
-    /// `system_prompt` and `shell.perm_mode` so tests and minimal setups still
-    /// work. The real binary enforces the presence of `main.md` in `main.rs`.
+    /// agent. Otherwise a synthetic placeholder main agent with an empty body
+    /// is returned so the app struct stays constructible (tests, minimal
+    /// setups); the real binary enforces the presence of `main.md` in
+    /// `main.rs` and exits when it is missing.
     fn load_main_agent(config: &AppConfig) -> (AgentRegistry, AgentDefinition, bool) {
         let mut search_paths = AgentRegistry::default_paths();
         if let Some(extra) = &config.agent.agent_paths {
@@ -265,18 +278,18 @@ impl App {
             return (registry, main, true);
         }
 
-        log::warn!("main.md agent definition not found; using config.system_prompt as fallback");
-        let fallback = AgentDefinition {
+        log::warn!("main.md agent definition not found; using empty placeholder");
+        let placeholder = AgentDefinition {
             name: "main".to_string(),
             description: "Default main agent".to_string(),
             model_tier: None,
             allowed_tools: Vec::new(),
             permission: config.shell.as_ref().and_then(|s| s.perm_mode.clone()),
             skills: Vec::new(),
-            body: config.agent.system_prompt.clone(),
+            body: String::new(),
             source_path: std::path::PathBuf::new(),
         };
-        (registry, fallback, false)
+        (registry, placeholder, false)
     }
 
     /// Build the initial system prompt from the main agent body, followed by
@@ -1267,10 +1280,8 @@ mod tests {
                 name: "Test Model".to_string(),
                 context_window: 4096,
                 provider: "test".to_string(),
-                tier: None,
             }],
             agent: crate::config::AgentConfig {
-                system_prompt: "test prompt".to_string(),
                 max_tool_rounds: 5,
                 history_path: Some(dir.to_path_buf()),
                 log_path: None,
@@ -1278,6 +1289,10 @@ mod tests {
                 skill_paths: None,
                 auto_include_skills: false,
                 agent_paths: None,
+                models: crate::config::TierModelConfig {
+                    performance: "test-model".to_string(),
+                    efficient: None,
+                },
             },
             shell: None,
             mcp: None,
@@ -1285,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_contains_config_prompt_and_skills() {
+    fn system_prompt_contains_agent_body_and_skills() {
         let dir = std::env::temp_dir().join(format!("catus_sysprompt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("demo-skill")).unwrap();
@@ -1305,7 +1320,7 @@ mod tests {
             allowed_tools: Vec::new(),
             permission: None,
             skills: Vec::new(),
-            body: config.agent.system_prompt.clone(),
+            body: "test prompt".to_string(),
             source_path: std::path::PathBuf::new(),
         };
         let prompt = App::build_system_prompt(&main_agent, &config, &registry);
@@ -1335,7 +1350,7 @@ mod tests {
             allowed_tools: Vec::new(),
             permission: None,
             skills: Vec::new(),
-            body: config.agent.system_prompt.clone(),
+            body: "test prompt".to_string(),
             source_path: std::path::PathBuf::new(),
         };
         let prompt = App::build_system_prompt(&main_agent, &config, &SkillRegistry::new());
@@ -1938,7 +1953,6 @@ id = "test-model"
 provider = "test"
 
 [agent]
-system_prompt = "test prompt"
 max_tool_rounds = 5
 log_level = "info"
 "#;
@@ -1969,7 +1983,6 @@ log_level = "info"
             name: "Other".to_string(),
             context_window: 8192,
             provider: "test".to_string(),
-            tier: None,
         });
         let mut app = App::new(config);
         assert_eq!(app.current_model.id, "test-model");

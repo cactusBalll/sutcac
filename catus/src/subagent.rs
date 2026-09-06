@@ -11,7 +11,7 @@ use sutcac_sh::exec::ShellState;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::agents::{AgentDefinition, AgentRegistry};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ModelTier, TierModels};
 use crate::llm::{LlmClient, LlmError, Model, StreamEvent};
 use crate::mcp::McpManager;
 use crate::message::Message;
@@ -72,7 +72,7 @@ pub struct ParentSnapshot {
     pub shell_state: ShellState,
     pub toolbox: Toolbox,
     pub active_skills: Vec<String>,
-    pub models: Vec<Model>,
+    pub tier_models: TierModels,
     pub current_model: Model,
     pub skill_registry: SkillRegistry,
     pub config: AppConfig,
@@ -146,7 +146,7 @@ pub struct SubagentManager {
     pub event_rx: mpsc::Receiver<SubagentEvent>,
     next_id: usize,
     parent_toolbox: Toolbox,
-    parent_models: Vec<Model>,
+    parent_tier_models: TierModels,
     parent_current_model: Model,
     parent_config: AppConfig,
     parent_mcp_manager: Option<Arc<McpManager>>,
@@ -157,7 +157,7 @@ pub struct SubagentManager {
 impl SubagentManager {
     pub fn new(
         parent_toolbox: Toolbox,
-        parent_models: Vec<Model>,
+        parent_tier_models: TierModels,
         parent_current_model: Model,
         parent_config: AppConfig,
         parent_mcp_manager: Option<Arc<McpManager>>,
@@ -169,7 +169,7 @@ impl SubagentManager {
             event_rx,
             next_id: 0,
             parent_toolbox,
-            parent_models,
+            parent_tier_models,
             parent_current_model,
             parent_config,
             parent_mcp_manager,
@@ -202,7 +202,7 @@ impl SubagentManager {
             shell_state: parent_shell_state,
             toolbox: self.parent_toolbox.clone(),
             active_skills: parent_active_skills,
-            models: self.parent_models.clone(),
+            tier_models: self.parent_tier_models.clone(),
             current_model: self.parent_current_model.clone(),
             skill_registry: parent_skill_registry,
             config: self.parent_config.clone(),
@@ -431,7 +431,7 @@ impl SubagentRunner {
         SkillRegistry,
         LlmClient,
     ) {
-        let model = Self::resolve_model(&parent, definition.model_tier.as_deref());
+        let model = Self::resolve_model(&parent, definition.model_tier);
         let client = LlmClient::new(
             model.provider.clone(),
             model.clone(),
@@ -502,22 +502,11 @@ impl SubagentRunner {
         }
     }
 
-    fn resolve_model(parent: &ParentSnapshot, tier: Option<&str>) -> Model {
-        if let Some(tier) = tier {
-            if let Some(model) = parent
-                .models
-                .iter()
-                .find(|m| m.tier.as_deref() == Some(tier))
-                .cloned()
-            {
-                return model;
-            }
-            log::warn!(
-                "no model with tier '{}' configured for subagent; falling back to parent model",
-                tier
-            );
+    fn resolve_model(parent: &ParentSnapshot, tier: Option<ModelTier>) -> Model {
+        match tier {
+            Some(tier) => parent.tier_models.get(tier).clone(),
+            None => parent.current_model.clone(),
         }
-        parent.current_model.clone()
     }
 
     async fn run(mut self) {
@@ -614,7 +603,7 @@ impl SubagentRunner {
                         let mut dummy_agent_registry = AgentRegistry::new();
                         let mut dummy_subagents = SubagentManager::new(
                             Toolbox::default(),
-                            Vec::new(),
+                            TierModels::default(),
                             Model::default(),
                             AppConfig::default(),
                             None,
