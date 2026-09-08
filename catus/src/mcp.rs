@@ -1,13 +1,14 @@
 //! MCP client support for catus.
 //!
 //! Connects to configured MCP servers via the `rmcp` SDK — either local stdio
-//! child processes or remote Streamable HTTP endpoints — discovers their tools,
-//! and forwards tool calls from the LLM to the correct server. Each discovered
-//! tool is wrapped in an [`McpTool`] and registered in the application's
-//! `Toolbox` alongside the built-in tools.
+//! child processes or remote Streamable HTTP endpoints — and caches each
+//! server's tool catalog at connect time. Tool calls from the LLM are routed
+//! through the per-server gateway tool ([`crate::tool::McpServerTool`]), which
+//! uses [`McpManager`] to forward invocations to the right server. Caching the
+//! catalog keeps `list`/`help`/`/mcp list` free of server round-trips and lets
+//! a single gateway tool per server stand in for every advertised MCP tool.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use http::{HeaderName, HeaderValue};
 use rmcp::{
@@ -20,10 +21,7 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use crate::config::{McpServerConfig, McpTransport};
-use crate::tool::{FunctionDefinition, Tool, ToolCall, ToolContext, ToolDefinition, ToolResult};
-
-/// Separator used to prefix MCP tool names with their server name.
-const SERVER_PREFIX_SEP: &str = "__";
+use crate::tool::{ToolCall, ToolResult};
 
 /// Errors that can occur while using MCP servers.
 #[derive(Debug)]
@@ -32,10 +30,10 @@ pub enum McpError {
     Connect(String),
     /// An MCP protocol or transport error occurred.
     Rmcp(rmcp::service::ServiceError),
-    /// The server prefix of the tool name does not match any connected server.
+    /// The server name does not match any connected server.
     UnknownServer(String),
-    /// The tool name is not in the expected `{server}__{tool}` format.
-    InvalidToolName(String),
+    /// The tool name is not advertised by the given server.
+    UnknownTool { server: String, tool: String },
 }
 
 impl std::fmt::Display for McpError {
@@ -44,8 +42,8 @@ impl std::fmt::Display for McpError {
             McpError::Connect(msg) => write!(f, "mcp connect error: {}", msg),
             McpError::Rmcp(e) => write!(f, "mcp error: {}", e),
             McpError::UnknownServer(name) => write!(f, "unknown mcp server: {}", name),
-            McpError::InvalidToolName(name) => {
-                write!(f, "invalid mcp tool name (expected server__tool): {}", name)
+            McpError::UnknownTool { server, tool } => {
+                write!(f, "mcp server '{}' has no tool '{}'", server, tool)
             }
         }
     }
@@ -68,6 +66,36 @@ impl From<std::io::Error> for McpError {
 impl From<rmcp::service::ClientInitializeError> for McpError {
     fn from(e: rmcp::service::ClientInitializeError) -> Self {
         McpError::Connect(e.to_string())
+    }
+}
+
+/// A lightweight snapshot of one tool advertised by an MCP server.
+///
+/// The full JSON input schema is kept so the gateway tool can serve it on
+/// demand (`help`) without contacting the server again.
+#[derive(Debug, Clone)]
+pub struct CachedTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+impl CachedTool {
+    /// Convert an rmcp `Tool` advertisement into a cached snapshot.
+    fn from_rmcp(tool: RmcpTool) -> Self {
+        Self {
+            name: tool.name.to_string(),
+            description: tool
+                .description
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "MCP tool".to_string()),
+            input_schema: Value::Object(tool.input_schema.as_ref().clone()),
+        }
+    }
+
+    /// First line of the description, for compact listing.
+    pub fn first_description_line(&self) -> &str {
+        self.description.lines().next().unwrap_or("")
     }
 }
 
@@ -131,23 +159,50 @@ impl McpClient {
 }
 
 /// Manager for all configured MCP server connections.
+///
+/// Each server's tool catalog is fetched once at connect time and cached in
+/// [`McpManager::catalogs`]; only `invoke` traffic goes to the server.
 pub struct McpManager {
     clients: HashMap<String, McpClient>,
+    catalogs: HashMap<String, Vec<CachedTool>>,
 }
 
 impl McpManager {
-    /// Connect to every configured MCP server.
+    /// Connect to every configured MCP server and cache their tool catalogs.
     ///
     /// Returns the manager and a list of per-server connection warnings. A
     /// single failing server does not prevent the others from being used.
+    /// A server that connects but fails to list its tools is kept with an
+    /// empty catalog and produces a warning.
     pub async fn connect(servers: &[McpServerConfig]) -> (Self, Vec<String>) {
         let mut clients = HashMap::new();
+        let mut catalogs = HashMap::new();
         let mut warnings = Vec::new();
 
         for config in servers {
             match McpClient::connect(config).await {
                 Ok(client) => {
                     log::info!("connected to mcp server '{}'", config.name);
+                    let catalog = match client.list_tools().await {
+                        Ok(tools) => {
+                            log::info!(
+                                "mcp server '{}' advertises {} tool(s)",
+                                config.name,
+                                tools.len()
+                            );
+                            tools.into_iter().map(CachedTool::from_rmcp).collect()
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "failed to list tools from mcp server '{}': {}",
+                                config.name,
+                                e
+                            );
+                            warnings.push(format!("{}: {}", config.name, e));
+                            Vec::new()
+                        }
+                    };
+                    catalogs.insert(config.name.clone(), catalog);
                     clients.insert(config.name.clone(), client);
                 }
                 Err(e) => {
@@ -157,7 +212,7 @@ impl McpManager {
             }
         }
 
-        (Self { clients }, warnings)
+        (Self { clients, catalogs }, warnings)
     }
 
     /// Return true if no MCP servers are connected.
@@ -175,114 +230,51 @@ impl McpManager {
         self.clients.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Collect tool definitions from all connected servers, prefixing each tool
-    /// name with its server name.
-    pub async fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
-        let mut definitions = Vec::new();
-        for (server_name, client) in &self.clients {
-            match client.list_tools().await {
-                Ok(tools) => {
-                    for tool in tools {
-                        definitions.push(tool_to_definition(server_name, tool));
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "failed to list tools from mcp server '{}': {}",
-                        server_name,
-                        e
-                    );
-                }
-            }
+    /// The cached tool catalog of one connected server.
+    pub fn tool_catalog(&self, server: &str) -> Option<&[CachedTool]> {
+        self.catalogs.get(server).map(|c| c.as_slice())
+    }
+
+    /// Invoke one tool on a server. `server` must be a connected server name
+    /// and `tool_name` must be advertised by it (checked against the cached
+    /// catalog); `arguments` is forwarded verbatim to the server.
+    pub async fn call_tool(
+        &self,
+        server: &str,
+        tool_name: &str,
+        arguments: serde_json::Map<String, Value>,
+    ) -> Result<ToolResult, McpError> {
+        if !self.clients.contains_key(server) {
+            return Err(McpError::UnknownServer(server.to_string()));
         }
-        definitions
-    }
+        let known = self
+            .catalogs
+            .get(server)
+            .map(|c| c.iter().any(|t| t.name == tool_name))
+            .unwrap_or(false);
+        if !known {
+            return Err(McpError::UnknownTool {
+                server: server.to_string(),
+                tool: tool_name.to_string(),
+            });
+        }
 
-    /// Call an MCP tool. `prefixed_name` must be `{server}__{tool}`.
-    pub async fn call_tool(&self, call: &ToolCall) -> Result<ToolResult, McpError> {
-        let (server_name, tool_name) = split_prefixed_name(&call.name)?;
-        let client = self
-            .clients
-            .get(server_name)
-            .ok_or_else(|| McpError::UnknownServer(server_name.to_string()))?;
-
-        let arguments = parse_arguments(&call.arguments)?;
-        let result = client.call_tool(tool_name, arguments).await?;
-        Ok(ToolResult {
-            call: call.clone(),
-            ..result
-        })
+        let client = &self.clients[server];
+        client.call_tool(tool_name, arguments).await
     }
 }
 
-/// A single MCP tool converted into a catus [`Tool`].
-///
-/// Holds the shared manager and the tool's advertised definition; execution
-/// forwards the call to the owning server through the manager.
-pub struct McpTool {
-    manager: Arc<McpManager>,
-    definition: ToolDefinition,
-}
-
-impl McpTool {
-    fn new(manager: Arc<McpManager>, definition: ToolDefinition) -> Self {
+#[cfg(test)]
+impl McpManager {
+    /// Build a manager holding only cached catalogs (no live connections).
+    ///
+    /// Enough for `list`/`help` tests; `invoke` reports an unknown server.
+    pub(crate) fn with_catalogs(catalogs: HashMap<String, Vec<CachedTool>>) -> Self {
         Self {
-            manager,
-            definition,
+            clients: HashMap::new(),
+            catalogs,
         }
     }
-}
-
-impl Tool for McpTool {
-    fn name(&self) -> &str {
-        &self.definition.function.name
-    }
-
-    fn definition(&self) -> ToolDefinition {
-        self.definition.clone()
-    }
-
-    fn execute<'a>(
-        &'a self,
-        call: &'a ToolCall,
-        _ctx: &'a mut ToolContext<'_>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
-        Box::pin(async move {
-            match self.manager.call_tool(call).await {
-                Ok(result) => {
-                    log::info!(
-                        "mcp tool finished: {} status={} stdout_len={} stderr_len={}",
-                        call.name,
-                        result.status,
-                        result.stdout.len(),
-                        result.stderr.len()
-                    );
-                    result
-                }
-                Err(e) => {
-                    log::warn!("mcp tool failed: {} error={}", call.name, e);
-                    ToolResult {
-                        call: call.clone(),
-                        status: 1,
-                        stdout: String::new(),
-                        stderr: format!("catus: mcp tool failed: {}", e),
-                        interaction: None,
-                    }
-                }
-            }
-        })
-    }
-}
-
-/// Wrap every tool advertised by the connected servers as an [`McpTool`].
-///
-/// Servers that fail to list their tools are logged and skipped.
-pub async fn mcp_tools(manager: Arc<McpManager>) -> Vec<McpTool> {
-    let mut tools = Vec::new();
-    for definition in manager.all_tool_definitions().await {
-        tools.push(McpTool::new(manager.clone(), definition));
-    }
-    tools
 }
 
 /// Convert configured header strings into the `http` crate types expected by
@@ -301,52 +293,6 @@ fn build_headers(
             Ok((name, value))
         })
         .collect()
-}
-
-/// Parse the JSON arguments from a tool call. Empty or non-object input is
-/// treated as an empty object.
-fn parse_arguments(arguments: &str) -> Result<serde_json::Map<String, Value>, McpError> {
-    if arguments.trim().is_empty() {
-        return Ok(serde_json::Map::new());
-    }
-    let value: Value = serde_json::from_str(arguments)
-        .map_err(|e| McpError::Connect(format!("invalid tool arguments: {}", e)))?;
-    match value {
-        Value::Object(obj) => Ok(obj),
-        _ => Ok(serde_json::Map::new()),
-    }
-}
-
-/// Split a prefixed MCP tool name into `(server_name, tool_name)`.
-fn split_prefixed_name(prefixed_name: &str) -> Result<(&str, &str), McpError> {
-    let (server, tool) = prefixed_name
-        .split_once(SERVER_PREFIX_SEP)
-        .ok_or_else(|| McpError::InvalidToolName(prefixed_name.to_string()))?;
-    if server.is_empty() || tool.is_empty() {
-        return Err(McpError::InvalidToolName(prefixed_name.to_string()));
-    }
-    Ok((server, tool))
-}
-
-/// Convert an rmcp `Tool` into the OpenAI-compatible `ToolDefinition`, prefixing
-/// the tool name with the server name.
-fn tool_to_definition(server_name: &str, tool: RmcpTool) -> ToolDefinition {
-    let name = format!("{}{}{}", server_name, SERVER_PREFIX_SEP, tool.name);
-    let description = tool
-        .description
-        .as_deref()
-        .unwrap_or("MCP tool")
-        .to_string();
-    let parameters = Value::Object(tool.input_schema.as_ref().clone());
-
-    ToolDefinition {
-        tool_type: "function".to_string(),
-        function: FunctionDefinition {
-            name,
-            description,
-            parameters,
-        },
-    }
 }
 
 /// Convert an rmcp `CallToolResult` into the `ToolResult` format used by catus.
@@ -398,32 +344,32 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn split_valid_prefixed_name() {
-        assert_eq!(
-            split_prefixed_name("filesystem__read_file").unwrap(),
-            ("filesystem", "read_file")
-        );
+    fn cached(name: &str, description: &str) -> CachedTool {
+        CachedTool {
+            name: name.to_string(),
+            description: description.to_string(),
+            input_schema: json!({"type": "object"}),
+        }
     }
 
     #[test]
-    fn split_rejects_missing_prefix() {
-        assert!(matches!(
-            split_prefixed_name("read_file").unwrap_err(),
-            McpError::InvalidToolName(_)
-        ));
+    fn cached_tool_first_description_line() {
+        let tool = cached("sum", "Add two numbers.\nMore details.");
+        assert_eq!(tool.first_description_line(), "Add two numbers.");
+        let empty = cached("x", "");
+        assert_eq!(empty.first_description_line(), "");
     }
 
     #[test]
-    fn split_rejects_empty_parts() {
-        assert!(matches!(
-            split_prefixed_name("__read_file").unwrap_err(),
-            McpError::InvalidToolName(_)
+    fn cached_tool_from_rmcp_defaults_description() {
+        let tool = CachedTool::from_rmcp(RmcpTool::new_with_raw(
+            "read_file",
+            None,
+            serde_json::Map::from_iter([("type".to_string(), json!("object"))]),
         ));
-        assert!(matches!(
-            split_prefixed_name("filesystem__").unwrap_err(),
-            McpError::InvalidToolName(_)
-        ));
+        assert_eq!(tool.name, "read_file");
+        assert_eq!(tool.description, "MCP tool");
+        assert_eq!(tool.input_schema, json!({"type": "object"}));
     }
 
     #[test]
@@ -456,32 +402,6 @@ mod tests {
             build_headers(&headers).unwrap_err(),
             McpError::Connect(_)
         ));
-    }
-
-    #[test]
-    fn parse_arguments_accepts_object() {
-        let args = r#"{"path": "/tmp"}"#;
-        let parsed = parse_arguments(args).unwrap();
-        assert_eq!(parsed.get("path"), Some(&json!("/tmp")));
-    }
-
-    #[test]
-    fn parse_arguments_treats_empty_as_empty_object() {
-        let parsed = parse_arguments("").unwrap();
-        assert!(parsed.is_empty());
-    }
-
-    #[test]
-    fn tool_definition_gets_prefixed_name() {
-        let tool = RmcpTool::new(
-            "read_file",
-            "Read a file",
-            serde_json::Map::from_iter([("type".to_string(), json!("object"))]),
-        );
-        let def = tool_to_definition("fs", tool);
-        assert_eq!(def.function.name, "fs__read_file");
-        assert_eq!(def.function.description, "Read a file");
-        assert_eq!(def.tool_type, "function");
     }
 
     #[test]

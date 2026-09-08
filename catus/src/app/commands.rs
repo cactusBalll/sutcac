@@ -682,7 +682,7 @@ impl SlashCommand for McpCommand {
                     let sub = parts.next().unwrap_or("");
                     match sub {
                         "list" => {
-                            app.add_event_message(app.mcp_server_list().await);
+                            app.add_event_message(app.mcp_server_list());
                             app.set_transient_message("MCP servers listed");
                         }
                         "status" => {

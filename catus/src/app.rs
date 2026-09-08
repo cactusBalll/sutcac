@@ -10,10 +10,11 @@ use tokio::sync::mpsc;
 use crate::agents::{AgentDefinition, AgentRegistry};
 use crate::config::{AppConfig, TierModels};
 use crate::llm::{LlmClient, LlmError, Model, StreamEvent, Usage};
-use crate::mcp::{McpManager, mcp_tools};
+use crate::mcp::McpManager;
 use crate::message::{Message, Role};
 use crate::skills::SkillRegistry;
 use crate::subagent::SubagentManager;
+use crate::tool::McpServerTool;
 use crate::tool::{
     AskAnswer, AskPermissionTool, AskQuestion, AskUserTool, EditTool, GRANT_SESSION, ReadTool,
     ShellTool, SkillTool, TaskSyncTool, TaskTool, TodoList, TodoTool, Tool, ToolCall, ToolContext,
@@ -368,8 +369,15 @@ impl App {
         } else {
             log::info!("{} mcp server(s) connected", manager.len());
             let manager = Arc::new(manager);
-            for tool in mcp_tools(manager.clone()).await {
-                log::info!("registered mcp tool '{}'", tool.name());
+            // One gateway tool per connected server collapses all of the
+            // server's tools behind list/help/invoke actions.
+            for server in manager.server_names() {
+                let tool = McpServerTool::new(manager.clone(), server);
+                log::info!(
+                    "registered mcp gateway tool '{}' for server '{}'",
+                    tool.name(),
+                    server
+                );
                 self.toolbox.register(Arc::new(tool));
             }
             self.mcp_manager = Some(manager.clone());
@@ -606,7 +614,9 @@ impl App {
     }
 
     /// Return a human-readable list of configured MCP servers and their tools.
-    pub async fn mcp_server_list(&self) -> String {
+    ///
+    /// Reads the catalogs cached at connect time; no server round-trips.
+    pub fn mcp_server_list(&self) -> String {
         let configured: Vec<&str> = self
             .config
             .mcp
@@ -619,13 +629,24 @@ impl App {
 
         let mut lines = vec![format!("configured mcp servers: {}", configured.join(", "))];
         if let Some(manager) = &self.mcp_manager {
-            let defs = manager.all_tool_definitions().await;
-            if !defs.is_empty() {
-                lines.push("available mcp tools:".to_string());
-                for def in defs {
-                    lines.push(format!("- {}", def.function.name));
+            let mut total = 0;
+            for server in manager.server_names() {
+                let catalog = manager.tool_catalog(server).unwrap_or(&[]);
+                lines.push(format!("server '{}':", server));
+                if catalog.is_empty() {
+                    lines.push("  (no tools)".to_string());
+                } else {
+                    for tool in catalog {
+                        lines.push(format!(
+                            "- {}: {}",
+                            tool.name,
+                            tool.first_description_line()
+                        ));
+                        total += 1;
+                    }
                 }
-            } else {
+            }
+            if total == 0 {
                 lines.push("no mcp tools available".to_string());
             }
         } else {

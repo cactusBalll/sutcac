@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use catus::config::{McpServerConfig, McpTransport};
 use catus::mcp::McpManager;
-use catus::tool::ToolCall;
 
 fn server_binary_path() -> &'static str {
     // Cargo sets this for integration tests of the package that defines the binary.
@@ -82,20 +81,20 @@ async fn connect_list_and_call_calculator_tools_over_http() {
     );
     assert_eq!(manager.len(), 1, "calculator server should be connected");
 
-    let tools = manager.all_tool_definitions().await;
+    let tools = manager
+        .tool_catalog("calc")
+        .expect("calc catalog should be cached");
     assert!(
-        tools.iter().any(|t| t.function.name == "calc__sum"),
-        "expected calc__sum in {:?}",
-        tools.iter().map(|t| &t.function.name).collect::<Vec<_>>()
+        tools.iter().any(|t| t.name == "sum"),
+        "expected sum in {:?}",
+        tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
-    let call = ToolCall {
-        id: "call_1".to_string(),
-        name: "calc__sum".to_string(),
-        arguments: r#"{"a": 3, "b": 2}"#.to_string(),
-    };
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("a".to_string(), serde_json::json!(3));
+    arguments.insert("b".to_string(), serde_json::json!(2));
     let result = manager
-        .call_tool(&call)
+        .call_tool("calc", "sum", arguments)
         .await
         .expect("sum call should succeed");
     assert_eq!(result.status, 0);
@@ -118,9 +117,11 @@ async fn unreachable_remote_server_produces_warning_without_blocking_others() {
     );
     assert!(warnings[0].starts_with("ghost:"), "warning: {:?}", warnings);
 
-    let tools = manager.all_tool_definitions().await;
+    let tools = manager
+        .tool_catalog("calc")
+        .expect("calc catalog should be cached");
     assert!(
-        tools.iter().any(|t| t.function.name == "calc__sum"),
+        tools.iter().any(|t| t.name == "sum"),
         "calc tools should still be available"
     );
 }

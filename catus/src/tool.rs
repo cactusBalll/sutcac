@@ -12,15 +12,18 @@
 //! - `ask_user` — the built-in interactive `ask_user` tool ([`AskUserTool`]);
 //! - `ask_permission` — the built-in `ask_permission` tool ([`AskPermissionTool`]);
 //! - `todo` — the built-in main-agent-only `todo` tool ([`TodoTool`]);
-//! - `crate::mcp` — tools converted from MCP servers (`McpTool`).
+//! - `mcp` — the per-server MCP gateway tool ([`McpServerTool`]), registered
+//!   for every connected MCP server and collapsing all of its tools behind
+//!   `list`/`help`/`invoke` actions.
 //!
 //! The application (`app.rs`) acts as the composition root: it registers the
-//! built-in tools at startup and MCP tools as servers connect.
+//! built-in tools at startup and MCP gateway tools as servers connect.
 
 mod ask_permission;
 mod ask_user;
 mod complete_task;
 mod edit;
+mod mcp;
 mod read;
 mod shell;
 mod skill;
@@ -46,6 +49,7 @@ pub use ask_user::{
 };
 pub use complete_task::CompleteTaskTool;
 pub use edit::EditTool;
+pub use mcp::McpServerTool;
 pub use read::ReadTool;
 pub use shell::ShellTool;
 pub use skill::SkillTool;
