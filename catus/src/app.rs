@@ -15,9 +15,9 @@ use crate::message::{Message, Role};
 use crate::skills::SkillRegistry;
 use crate::subagent::SubagentManager;
 use crate::tool::{
-    AskAnswer, AskPermissionTool, AskQuestion, AskUserTool, EditTool, GRANT_SESSION, ShellTool,
-    SkillTool, TaskSyncTool, TaskTool, TodoList, TodoTool, Tool, ToolCall, ToolContext, ToolResult,
-    Toolbox, parse_ask_permission_tags,
+    AskAnswer, AskPermissionTool, AskQuestion, AskUserTool, EditTool, GRANT_SESSION, ReadTool,
+    ShellTool, SkillTool, TaskSyncTool, TaskTool, TodoList, TodoTool, Tool, ToolCall, ToolContext,
+    ToolResult, Toolbox, parse_ask_permission_tags,
 };
 
 pub mod chat_state;
@@ -210,6 +210,7 @@ impl App {
         let mut toolbox = Toolbox::default();
         toolbox.register(std::sync::Arc::new(ShellTool));
         toolbox.register(std::sync::Arc::new(EditTool));
+        toolbox.register(std::sync::Arc::new(ReadTool));
         toolbox.register(std::sync::Arc::new(SkillTool));
         toolbox.register(std::sync::Arc::new(AskUserTool));
         toolbox.register(std::sync::Arc::new(AskPermissionTool));

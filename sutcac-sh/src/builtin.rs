@@ -39,6 +39,7 @@ pub fn all_builtins() -> Vec<Box<dyn Builtin>> {
         Box::new(FalseBuiltin),
         Box::new(EchoBuiltin),
         Box::new(EditBuiltin),
+        Box::new(ReadFileBuiltin),
         Box::new(CdBuiltin),
         Box::new(PwdBuiltin),
         Box::new(ExportBuiltin),
@@ -274,6 +275,102 @@ impl Builtin for EditBuiltin {
                 );
                 1
             }
+        }
+    }
+}
+
+/// Default number of lines emitted by the `read` builtin when no LIMIT is given.
+const READ_DEFAULT_LIMIT: usize = 2000;
+
+struct ReadFileBuiltin;
+impl Builtin for ReadFileBuiltin {
+    fn name(&self) -> &'static str {
+        "readfile"
+    }
+
+    fn permissions(&self) -> PermissionSet {
+        // read only inspects file contents; it never writes.
+        PermissionSet::read()
+    }
+
+    fn run(
+        &self,
+        args: &[String],
+        _state: &mut ShellState,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> i32 {
+        let (file, offset, limit) = match args {
+            [file] => (file, 1usize, READ_DEFAULT_LIMIT),
+            [file, offset] => match parse_line_number(offset, "OFFSET", stderr) {
+                Some(n) => (file, n, READ_DEFAULT_LIMIT),
+                None => return 2,
+            },
+            [file, offset, limit] => {
+                let (offset, limit) = match (
+                    parse_line_number(offset, "OFFSET", stderr),
+                    parse_line_number(limit, "LIMIT", stderr),
+                ) {
+                    (Some(o), Some(l)) => (o, l),
+                    _ => return 2,
+                };
+                (file, offset, limit)
+            }
+            _ => {
+                let _ = writeln!(
+                    stderr,
+                    "sutcac-sh: readfile: usage: readfile FILE [OFFSET] [LIMIT]. Hint: OFFSET is the 1-based starting line; LIMIT is the number of lines to print."
+                );
+                return 2;
+            }
+        };
+        if offset == 0 {
+            let _ = writeln!(
+                stderr,
+                "sutcac-sh: readfile: OFFSET must be >= 1. Hint: line numbers are 1-based."
+            );
+            return 2;
+        }
+        if limit == 0 {
+            let _ = writeln!(
+                stderr,
+                "sutcac-sh: readfile: LIMIT must be >= 1. Hint: omit LIMIT to read {READ_DEFAULT_LIMIT} lines."
+            );
+            return 2;
+        }
+
+        let content = match std::fs::read_to_string(file) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = writeln!(
+                    stderr,
+                    "sutcac-sh: readfile: {}: {}. Hint: check that the file exists and contains valid UTF-8 text.",
+                    file, e
+                );
+                return 1;
+            }
+        };
+
+        // Emit at most LIMIT lines starting at OFFSET, prefixed with their
+        // 1-based line number so callers can reference lines for edits.
+        for (i, line) in content.lines().enumerate().skip(offset - 1).take(limit) {
+            let _ = writeln!(stdout, "{:>6}\t{}", i + 1, line);
+        }
+        0
+    }
+}
+
+/// Parse a line number argument, reporting a usage error on failure.
+fn parse_line_number(s: &str, label: &str, stderr: &mut dyn Write) -> Option<usize> {
+    match s.parse::<usize>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            let _ = writeln!(
+                stderr,
+                "sutcac-sh: readfile: {label} must be a non-negative integer, got {:?}.",
+                s
+            );
+            None
         }
     }
 }
@@ -743,6 +840,118 @@ mod tests {
         );
         assert_eq!(s, 1);
         assert!(err.contains("No such file"), "stderr: {}", err);
+    }
+
+    #[test]
+    fn readfile_builtin_prints_numbered_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+        let mut state = ShellState::new();
+        let (s, out, err) = run(
+            "readfile",
+            &[file.to_string_lossy().into_owned()],
+            &mut state,
+        );
+        assert_eq!(s, 0, "stderr: {}", err);
+        assert_eq!(out, "     1\talpha\n     2\tbeta\n     3\tgamma\n");
+    }
+
+    #[test]
+    fn readfile_builtin_honours_offset_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let mut state = ShellState::new();
+        let (s, out, err) = run(
+            "readfile",
+            &[file.to_string_lossy().into_owned(), "2".into(), "2".into()],
+            &mut state,
+        );
+        assert_eq!(s, 0, "stderr: {}", err);
+        assert_eq!(out, "     2\tl2\n     3\tl3\n");
+
+        // Offset only: reads to end of file.
+        let (s, out, _) = run(
+            "readfile",
+            &[file.to_string_lossy().into_owned(), "4".into()],
+            &mut state,
+        );
+        assert_eq!(s, 0);
+        assert_eq!(out, "     4\tl4\n     5\tl5\n");
+    }
+
+    #[test]
+    fn readfile_builtin_offset_past_end_prints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let mut state = ShellState::new();
+        let (s, out, _) = run(
+            "readfile",
+            &[file.to_string_lossy().into_owned(), "9".into()],
+            &mut state,
+        );
+        assert_eq!(s, 0);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn readfile_builtin_rejects_bad_numbers_and_zero_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "one\n").unwrap();
+        let mut state = ShellState::new();
+        let (s, _, err) = run(
+            "readfile",
+            &[file.to_string_lossy().into_owned(), "not-a-number".into()],
+            &mut state,
+        );
+        assert_eq!(s, 2);
+        assert!(
+            err.contains("OFFSET must be a non-negative integer"),
+            "stderr: {}",
+            err
+        );
+
+        let (s, _, err) = run(
+            "readfile",
+            &[file.to_string_lossy().into_owned(), "0".into()],
+            &mut state,
+        );
+        assert_eq!(s, 2);
+        assert!(err.contains("OFFSET must be >= 1"), "stderr: {}", err);
+
+        let (s, _, err) = run(
+            "readfile",
+            &[file.to_string_lossy().into_owned(), "1".into(), "0".into()],
+            &mut state,
+        );
+        assert_eq!(s, 2);
+        assert!(err.contains("LIMIT must be >= 1"), "stderr: {}", err);
+
+        let (s, _, err) = run("readfile", &[], &mut state);
+        assert_eq!(s, 2);
+        assert!(err.contains("usage: readfile FILE"), "stderr: {}", err);
+    }
+
+    #[test]
+    fn readfile_builtin_fails_for_missing_file() {
+        let mut state = ShellState::new();
+        let (s, _, err) = run(
+            "readfile",
+            &["/nonexistent/path/file.txt".into()],
+            &mut state,
+        );
+        assert_eq!(s, 1);
+        assert!(err.contains("No such file"), "stderr: {}", err);
+    }
+
+    #[test]
+    fn readfile_builtin_requires_read_permission() {
+        let perms = permissions_for("readfile").unwrap();
+        assert!(perms.contains(&crate::permissions::Permission::Read));
+        assert!(!perms.contains(&crate::permissions::Permission::Write));
     }
 
     #[test]

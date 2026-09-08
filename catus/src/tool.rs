@@ -7,6 +7,7 @@
 //!
 //! - `shell` — the built-in `shell` tool ([`ShellTool`]);
 //! - `edit` — the built-in precise file-editing `edit` tool ([`EditTool`]);
+//! - `read` — the built-in file-reading `read` tool ([`ReadTool`]);
 //! - `skill` — the built-in `use_skill` tool ([`SkillTool`]);
 //! - `ask_user` — the built-in interactive `ask_user` tool ([`AskUserTool`]);
 //! - `ask_permission` — the built-in `ask_permission` tool ([`AskPermissionTool`]);
@@ -20,6 +21,7 @@ mod ask_permission;
 mod ask_user;
 mod complete_task;
 mod edit;
+mod read;
 mod shell;
 mod skill;
 mod task;
@@ -44,6 +46,7 @@ pub use ask_user::{
 };
 pub use complete_task::CompleteTaskTool;
 pub use edit::EditTool;
+pub use read::ReadTool;
 pub use shell::ShellTool;
 pub use skill::SkillTool;
 pub use task::TaskTool;
