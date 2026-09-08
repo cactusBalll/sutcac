@@ -337,11 +337,8 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
         }
     }
 
-    if app.config.agent.history_path.is_some() {
-        if let Err(e) = app.save_session_history() {
-            log::error!("failed to save history: {}", e);
-        }
-    }
+    // Final snapshot; incremental saves already cover most of the session.
+    app.persist_session();
 
     Ok(())
 }

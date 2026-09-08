@@ -4,6 +4,7 @@ pub mod agents;
 pub mod app;
 pub mod config;
 pub mod frontmatter;
+pub mod history;
 pub mod llm;
 pub mod mcp;
 pub mod message;

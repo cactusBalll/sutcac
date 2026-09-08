@@ -16,19 +16,21 @@ session_header = "x-opencode-session"
 
 # Configured models. `provider` references a [[providers]] entry by name.
 # `name` is shown in the UI (falls back to `id`); `context_window` is the
-# model's context size in tokens (0/omitted = unknown). Switch between
-# configured models at runtime with `/model`.
+# model's context size in tokens (0/omitted = unknown) and also accepts
+# human-readable strings like "512k", "1M", "0.5m" (1024-based suffixes,
+# case-insensitive; a trailing `b` is ignored). Switch between configured
+# models at runtime with `/model`.
 [[models]]
-id = "kimi-k2"
-name = "Kimi K2"
-context_window = 131072
+id = "deepseek-v4-flash"
+name = "Deepseek V4 Flash"
+context_window = "128k"
 provider = "opencode"
 
 [agent]
-max_tool_rounds = 10
-# Optional directory for JSON conversation-history files. When set, catus can
-# load a previous conversation with `/resume <name>` and saves the current
-# session to a timestamped JSON file on exit.
+max_tool_rounds = 100
+# Optional directory for the SQLite session-history database (sessions.db).
+# When set, catus persists each conversation incrementally and you can load a
+# previous one with `/resume <name>`.
 history_path = ".sutcac/history"
 
 # Optional log file path and level. Defaults to `.sutcac/catus.log` and info.
@@ -42,14 +44,14 @@ history_path = ".sutcac/history"
 # agent_paths = ["~/.local/share/catus/agents"]
 
 # Whether to append the list of discovered skills to the system prompt.
-# auto_include_skills = true
+auto_include_skills = true
 
 # Model tiers for agent definitions. An agent's `model` frontmatter field
 # accepts "performance" or "efficient" and maps to the model configured here
 # (referenced by [[models]] id or display name). `performance` is required;
 # `efficient` is optional and falls back to `performance` when omitted.
 [agent.models]
-performance = "kimi-k2"
+performance = "deepseek-v4-flash"
 # efficient = "kimi-k2"
 
 # Optional MCP client configuration. catus connects to the configured MCP
@@ -68,18 +70,33 @@ audit_format = "text"
 
 # Shorthand permission lists: every listed command gets the READ (or WRITE)
 # permission tag, equivalent to listing each one under [shell.commands].
+# Only genuinely read-only commands belong here: awk/sed/sort/find/git/xargs
+# and pagers can write files or run subcommands on their own, so they stay
+# unlisted and fall back to the READ+WRITE default.
 read = [
-  "awk", "basename", "cat", "cmp", "comm", "cut", "diff", "dirname", "file",
-  "find", "git", "grep", "head", "less", "ls", "more", "nl", "printf", "ps",
-  "pwd", "readlink", "realpath", "sed", "sort", "strings", "tail", "tr",
-  "uniq", "wc", "whereis", "which", "xargs",
+  "basename", "bc", "cat", "cmp", "comm", "cut", "date", "diff", "dirname",
+  "df", "du", "env", "file", "grep", "head", "id", "ls", "md5sum", "nl",
+  "od", "printf", "ps", "pwd", "readlink", "realpath", "seq", "sha256sum",
+  "stat", "strings", "tac", "tail", "tr", "uniq", "wc", "whereis", "which",
+  "xxd",
 ]
-# write = ["mkdir", "touch"]
+
+# Write commands usable out of the box: pure writers/creators/removers.
+# Commands that also read a source (cp, mv, dd, ...) are listed under
+# [shell.commands] below instead, since they need both tags.
+write = [
+  "chmod", "chown", "ln", "mkdir", "rm", "rmdir", "tee", "touch", "truncate",
+]
 
 # Per-command permission tags. Any external command not listed here defaults
 # to READ+WRITE. Entries here override the shorthand lists above.
 [shell.commands]
-curl = ["network", "read"]
+# curl can write files (`-o`/`-O`), so it requires WRITE as well.
+curl = ["network", "read", "write"]
+# cp/mv/dd read a source and write a destination, so they need both tags.
+cp = ["read", "write"]
+mv = ["read", "write"]
+dd = ["read", "write"]
 
 # Optional path-based access control. Empty lists mean no restriction.
 # read_paths = ["/home/user/data"]

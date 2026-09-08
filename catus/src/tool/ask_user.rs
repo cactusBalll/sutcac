@@ -28,7 +28,7 @@ pub const MAX_OPTIONS: usize = 5;
 pub struct AskUserTool;
 
 /// A single question shown to the user in the ask overlay.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskQuestion {
     /// Full question text.
     pub prompt: String,
@@ -43,7 +43,7 @@ pub struct AskQuestion {
 }
 
 /// One selectable option of an [`AskQuestion`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskOption {
     /// Display text of the option.
     pub label: String,

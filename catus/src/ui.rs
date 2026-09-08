@@ -52,7 +52,7 @@ pub async fn handle_key_event(app: &mut App, key: KeyEvent) -> AppAction {
     // Modal overlays swallow all other keys first.
     if app.overlay_state.is_active() {
         let action = overlay::handle_overlay_key(app, key.code);
-        return handle_overlay_result(app, action);
+        return handle_overlay_result(app, action).await;
     }
 
     // Enter is special: it may run a slash command or submit a message.
@@ -95,9 +95,9 @@ pub async fn handle_key_event(app: &mut App, key: KeyEvent) -> AppAction {
 }
 
 /// Apply the result of an overlay key press to `App`.
-fn handle_overlay_result(app: &mut App, result: OverlayAction) -> AppAction {
+async fn handle_overlay_result(app: &mut App, result: OverlayAction) -> AppAction {
     match result {
-        OverlayAction::LoadHistory(name) => match app.resume_history(Some(&name)) {
+        OverlayAction::LoadHistory(name) => match app.resume_history(Some(&name)).await {
             Ok(msg) => {
                 app.status = AppStatus::Idle;
                 app.set_transient_message(msg);

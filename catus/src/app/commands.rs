@@ -179,19 +179,11 @@ impl SlashCommand for ResumeCommand {
             app.status = AppStatus::Idle;
             match args.map(str::trim).filter(|s| !s.is_empty()) {
                 Some(name) => {
-                    let msg = app.resume_history(Some(name))?;
+                    let msg = app.resume_history(Some(name)).await?;
                     app.set_transient_message(msg);
                 }
                 None => {
-                    let items = app
-                        .list_history_files()
-                        .iter()
-                        .filter_map(|p| {
-                            p.file_stem()
-                                .and_then(|s| s.to_str())
-                                .map(|s| s.to_string())
-                        })
-                        .collect();
+                    let items = app.list_session_names();
                     app.overlay_state.open_resume(items);
                 }
             }

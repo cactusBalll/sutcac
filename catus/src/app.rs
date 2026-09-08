@@ -73,8 +73,12 @@ pub struct App {
     /// in the ask overlay. The turn resumes via `complete_interaction` or
     /// `cancel_interaction` once the overlay closes.
     pending_interaction: Option<(ToolCall, Vec<AskQuestion>)>,
-    /// Path of the history file currently being continued, if any.
-    current_history_file: Option<std::path::PathBuf>,
+    /// SQLite-backed session history, when `[agent].history_path` is set.
+    pub history_store: Option<crate::history::SessionStore>,
+    /// Database row id of the session currently being continued, if any.
+    pub current_session_id: Option<i64>,
+    /// Name for the not-yet-persisted current session (timestamp-based).
+    session_name: String,
     /// Cumulative token usage across all completed LLM requests.
     pub usage: Usage,
     /// Number of completed LLM requests in this session.
@@ -122,6 +126,15 @@ fn new_session_id() -> String {
         "catus-{}-{:08x}",
         chrono::Utc::now().timestamp_millis(),
         std::process::id()
+    )
+}
+
+/// Generate the default history session name: timestamp-based, matching the
+/// previous `history_<timestamp>` naming.
+fn new_session_name() -> String {
+    format!(
+        "history_{}",
+        chrono::Local::now().format("%Y-%m-%dT%H_%M_%S")
     )
 }
 
@@ -217,6 +230,17 @@ impl App {
 
         let system_prompt = Self::build_system_prompt(&main_agent, &config, &skill_registry);
 
+        let (history_store, session_name) = match &config.agent.history_path {
+            Some(dir) => match crate::history::SessionStore::open(dir) {
+                Ok(store) => (Some(store), new_session_name()),
+                Err(e) => {
+                    log::warn!("failed to open history database: {}", e);
+                    (None, String::new())
+                }
+            },
+            None => (None, String::new()),
+        };
+
         Self {
             config,
             client: LlmClient::new(
@@ -244,7 +268,9 @@ impl App {
             pending_tool_calls: Vec::new(),
             tool_rounds_this_turn: 0,
             pending_interaction: None,
-            current_history_file: None,
+            history_store,
+            current_session_id: None,
+            session_name,
             usage: Usage::default(),
             request_count: 0,
             should_quit: false,
@@ -361,6 +387,7 @@ impl App {
 
         self.tool_rounds_this_turn = 0;
         self.chat_state.scroll_to_bottom();
+        self.persist_session();
         Some(text)
     }
 
@@ -482,6 +509,7 @@ impl App {
             .total_tokens
             .max(self.usage.prompt_tokens + self.usage.completion_tokens);
         self.usage.cached_tokens += usage.cached_tokens;
+        self.persist_session();
     }
 
     /// Return a human-readable list of discovered skill names.
@@ -627,6 +655,7 @@ impl App {
             "Skill '{}' instructions:\n{}",
             name, instructions
         )));
+        self.persist_session();
         Ok(format!("activated skill '{}'", name))
     }
 
@@ -683,6 +712,7 @@ impl App {
         );
         self.current_model = model;
         self.rebuild_client();
+        self.persist_session();
         Ok(msg)
     }
 
@@ -881,6 +911,7 @@ impl App {
         self.status = AppStatus::Idle;
         self.status_message.clear();
         self.chat_state.scroll_to_bottom();
+        self.persist_session();
 
         Some(message)
     }
@@ -935,114 +966,129 @@ impl App {
         self.status = AppStatus::Idle;
         self.status_message.clear();
         self.chat_state.scroll_to_bottom();
+        self.persist_session();
         true
     }
 
-    /// Load conversation history from a JSON file and append it after the
-    /// existing system prompt. Leading system messages in the file are skipped
-    /// so the configured system prompt remains authoritative.
-    pub fn load_history(
-        &mut self,
-        path: &std::path::Path,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if !path.exists() {
-            return Ok(());
-        }
-        let contents = std::fs::read_to_string(path)?;
-        let mut loaded: Vec<Message> = serde_json::from_str(&contents)?;
-
-        // Drop any leading system messages from the loaded file.
-        while let Some(first) = loaded.first() {
-            if first.is_system() {
-                loaded.remove(0);
-            } else {
-                break;
+    /// List available session names from the history database, newest first.
+    pub fn list_session_names(&self) -> Vec<String> {
+        let Some(store) = self.history_store.as_ref() else {
+            return Vec::new();
+        };
+        match store.list_sessions() {
+            Ok(sessions) => sessions.into_iter().map(|s| s.name).collect(),
+            Err(e) => {
+                log::warn!("failed to list sessions: {}", e);
+                Vec::new()
             }
         }
-
-        // Drop invalid assistant placeholders created by older versions that
-        // left empty assistant messages with no tool calls in history.
-        loaded
-            .retain(|m| !(m.role == Role::Assistant && m.content.is_empty() && !m.had_tool_calls));
-
-        // Make sure the first message is the configured system prompt.
-        if self
-            .messages
-            .first()
-            .map(|m| !m.is_system())
-            .unwrap_or(true)
-        {
-            self.messages.insert(0, Message::system(String::new()));
-        }
-        self.messages.extend(loaded);
-        self.chat_state.scroll_to_bottom();
-        Ok(())
-    }
-
-    /// Save the conversation history (including the system prompt) to a JSON
-    /// file. Missing parent directories are created automatically.
-    pub fn save_history(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let contents = serde_json::to_string_pretty(&self.messages)?;
-        std::fs::write(path, contents)?;
-        Ok(())
-    }
-
-    /// Return the configured history directory, if any.
-    fn history_dir(&self) -> Option<&std::path::Path> {
-        self.config.agent.history_path.as_deref()
-    }
-
-    /// List available history JSON files in the configured history directory,
-    /// sorted from newest to oldest by modification time.
-    pub fn list_history_files(&self) -> Vec<std::path::PathBuf> {
-        let dir = match self.history_dir() {
-            Some(d) => d,
-            None => return Vec::new(),
-        };
-        let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
-            Ok(entries) => entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|e| e.eq_ignore_ascii_case("json"))
-                        .unwrap_or(false)
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        files.sort_by(|a, b| {
-            let ta = std::fs::metadata(a)
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let tb = std::fs::metadata(b)
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            tb.cmp(&ta)
-        });
-        files
     }
 
     /// Return a human-readable list of available history names for the status
-    /// bar. Names are the file stems of JSON files in the history directory.
+    /// bar.
     pub fn history_names_list(&self) -> String {
-        let names: Vec<String> = self
-            .list_history_files()
-            .iter()
-            .filter_map(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
+        let names = self.list_session_names();
         if names.is_empty() {
             "no saved histories".to_string()
         } else {
             format!("available: {}", names.join(", "))
+        }
+    }
+
+    /// Build the key/value state persisted alongside the conversation.
+    fn persist_state(&self) -> std::collections::HashMap<String, String> {
+        use crate::history::{
+            STATE_PENDING_INTERACTION, STATE_PENDING_TOOL_CALLS, STATE_SHELL_CWD,
+            STATE_SHELL_EXPORTED, STATE_SHELL_VARS,
+        };
+        let mut state = std::collections::HashMap::new();
+        state.insert(
+            STATE_PENDING_TOOL_CALLS.to_string(),
+            crate::history::tool_calls_to_json(&self.pending_tool_calls),
+        );
+        if let Some((call, questions)) = &self.pending_interaction {
+            if let Ok(json) = serde_json::to_string(&(call, questions)) {
+                state.insert(STATE_PENDING_INTERACTION.to_string(), json);
+            }
+        }
+        state.insert(
+            STATE_SHELL_CWD.to_string(),
+            self.shell_state.cwd.to_string_lossy().to_string(),
+        );
+        if let Ok(json) = serde_json::to_string(&self.shell_state.vars) {
+            state.insert(STATE_SHELL_VARS.to_string(), json);
+        }
+        if let Ok(json) = serde_json::to_string(&self.shell_state.exported) {
+            state.insert(STATE_SHELL_EXPORTED.to_string(), json);
+        }
+        state
+    }
+
+    /// Persist a full snapshot of the current session: main messages,
+    /// subagent records and messages, metadata, and pending state.
+    ///
+    /// No-op when history is disabled. The session row is created lazily on
+    /// the first call. Called incrementally — after every LLM turn, tool
+    /// result, usage report, and subagent event — so exiting (even while a
+    /// subagent is running) always leaves a complete record on disk.
+    pub fn persist_session(&mut self) {
+        if self.history_store.is_none() {
+            return;
+        }
+        if self.current_session_id.is_none() {
+            let store = self.history_store.as_ref().unwrap();
+            let base = self.session_name.clone();
+            let mut name = base.clone();
+            let mut created = None;
+            for attempt in 1..100u32 {
+                match store.create_session(&name, &self.session_id, &self.current_model.id) {
+                    Ok(id) => {
+                        created = Some(id);
+                        break;
+                    }
+                    Err(_) => name = format!("{}-{}", base, attempt + 1),
+                }
+            }
+            match created {
+                Some(id) => {
+                    self.current_session_id = Some(id);
+                    self.session_name = name;
+                }
+                None => {
+                    log::warn!("failed to create history session row; skipping persist");
+                    return;
+                }
+            }
+        }
+        let session = self.current_session_id.unwrap();
+        let meta = crate::history::SessionMeta {
+            id: session,
+            name: self.session_name.clone(),
+            created_at: 0,
+            updated_at: 0,
+            session_id: self.session_id.clone(),
+            model_id: self.current_model.id.clone(),
+            request_count: self.request_count as u64,
+            usage: self.usage,
+            active_skills: self.active_skills.clone(),
+            tool_rounds: self.tool_rounds_this_turn,
+        };
+        let subagents = self.subagents.snapshot();
+        let state = self.persist_state();
+        let store = self.history_store.as_ref().unwrap();
+        if let Err(e) = store.save_meta(&meta) {
+            log::warn!("failed to save session metadata: {}", e);
+        }
+        if let Err(e) =
+            store.replace_messages(session, crate::history::MAIN_AGENT_ID, &self.messages)
+        {
+            log::warn!("failed to save conversation messages: {}", e);
+        }
+        if let Err(e) = store.replace_subagents(session, &subagents) {
+            log::warn!("failed to save subagent state: {}", e);
+        }
+        if let Err(e) = store.replace_state(session, &state) {
+            log::warn!("failed to save session state: {}", e);
         }
     }
 
@@ -1102,71 +1148,160 @@ impl App {
             }
         }
         self.subagents.handle_event(&event);
+        self.persist_session();
         should_resume
     }
 
-    /// Resume a saved conversation. With no `name`, returns the list of
-    /// available histories. With a name, loads `<history_dir>/<name>.json`,
-    /// resets the current conversation to the configured system prompt plus the
-    /// saved messages, and records the file as the current history file.
-    pub fn resume_history(
+    /// Resume a saved session. With no `name`, returns the list of available
+    /// histories. With a name, loads the full snapshot from the history
+    /// database: messages, token usage, model, provider session id, active
+    /// skills, pending tool calls / interactions, shell state, and subagents
+    /// (still-running ones restart their turn loop from the saved messages).
+    pub async fn resume_history(
         &mut self,
         name: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let dir = self.history_dir().ok_or("history_path is not configured")?;
-
-        let path = match name {
-            None => {
-                return Ok(self.history_names_list());
-            }
-            Some(n) => {
-                let n = n.trim();
-                let file_name = if n.ends_with(".json") {
-                    n.to_string()
-                } else {
-                    format!("{}.json", n)
-                };
-                dir.join(file_name)
-            }
-        };
-
-        if !path.exists() {
-            return Err(format!("history file not found: {}", path.display()).into());
+        if self.history_store.is_none() {
+            return Err("history_path is not configured".into());
         }
+        let Some(name) = name.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(self.history_names_list());
+        };
+        let store = self.history_store.as_ref().unwrap();
+        let id = store
+            .find_session(name)?
+            .ok_or_else(|| format!("history not found: {}", name))?;
+        let snapshot = store
+            .load_session(id)?
+            .ok_or_else(|| format!("history not found: {}", name))?;
 
         // Reset to the configured system prompt, then load the saved messages.
         let system_prompt =
             Self::build_system_prompt(&self.main_agent, &self.config, &self.skill_registry);
         self.messages = vec![Message::system(system_prompt)];
-        self.load_history(&path)?;
-        self.current_history_file = Some(path);
-        self.chat_state.scroll_to_bottom();
-        Ok("history loaded".to_string())
-    }
+        let mut loaded = snapshot.messages;
 
-    /// Save the current session to the configured history directory. If a
-    /// history file has been loaded with `/resume`, overwrite that file;
-    /// otherwise create a new timestamped file.
-    pub fn save_session_history(
-        &self,
-    ) -> Result<Option<std::path::PathBuf>, Box<dyn std::error::Error>> {
-        let dir = match self.history_dir() {
-            Some(d) => d,
-            None => return Ok(None),
-        };
-        std::fs::create_dir_all(dir)?;
-
-        let path = match &self.current_history_file {
-            Some(p) => p.clone(),
-            None => {
-                let now = chrono::Local::now();
-                let file_name = format!("history_{}.json", now.format("%Y-%m-%dT%H_%M_%S"));
-                dir.join(file_name)
+        // Drop any leading system messages so the configured system prompt
+        // remains authoritative, and drop empty assistant placeholders left
+        // by interrupted streams.
+        while let Some(first) = loaded.first() {
+            if first.is_system() {
+                loaded.remove(0);
+            } else {
+                break;
             }
-        };
+        }
+        loaded
+            .retain(|m| !(m.role == Role::Assistant && m.content.is_empty() && !m.had_tool_calls));
+        self.messages.extend(loaded);
 
-        self.save_history(&path)?;
-        Ok(Some(path))
+        // Session metadata.
+        self.usage = snapshot.meta.usage;
+        self.request_count = snapshot.meta.request_count as usize;
+        self.active_skills = snapshot.meta.active_skills.clone();
+        self.tool_rounds_this_turn = snapshot.meta.tool_rounds;
+
+        // Model and provider session id: keep one stable session across the
+        // process restart so providers with a session header stay connected.
+        if !snapshot.meta.session_id.is_empty() {
+            self.session_id = snapshot.meta.session_id.clone();
+        }
+        if let Some(model) = self.models.iter().find(|m| m.id == snapshot.meta.model_id) {
+            self.current_model = model.clone();
+        } else if !snapshot.meta.model_id.is_empty() {
+            log::warn!(
+                "saved model '{}' is not configured; keeping the current model",
+                snapshot.meta.model_id
+            );
+        }
+        self.client = LlmClient::new(
+            self.current_model.provider.clone(),
+            self.current_model.clone(),
+            &self.session_id,
+        );
+
+        // Pending tool calls: re-run them so the assistant's tool_calls keep
+        // matching tool results in the conversation. task/taskSync dispatches
+        // are not re-run — their subagents are restored separately below.
+        self.pending_tool_calls = snapshot
+            .state
+            .get(crate::history::STATE_PENDING_TOOL_CALLS)
+            .map(|j| crate::history::tool_calls_from_json(j))
+            .unwrap_or_default();
+        let restored_calls = std::mem::take(&mut self.pending_tool_calls);
+        for call in restored_calls {
+            if call.name == "task" || call.name == "taskSync" {
+                self.messages.push(Message::tool(
+                    "status=1\nstdout=```\n\n```\nstderr=```\ncatus: task dispatch was \
+                     interrupted by an exit; the subagent has been restored separately\n```",
+                    call.id,
+                ));
+                self.tool_rounds_this_turn += 1;
+            } else {
+                self.pending_tool_calls.push(call);
+                self.run_pending_tool().await;
+            }
+        }
+
+        // A paused ask_user interaction reopens its overlay; the turn
+        // continues once the user answers.
+        self.pending_interaction = snapshot
+            .state
+            .get(crate::history::STATE_PENDING_INTERACTION)
+            .and_then(|j| serde_json::from_str(j).ok());
+        if let Some((_, questions)) = &self.pending_interaction {
+            self.overlay_state.open_ask(questions.clone());
+        }
+
+        // Shell working directory and variables.
+        if let Some(cwd) = snapshot.state.get(crate::history::STATE_SHELL_CWD) {
+            let path = std::path::PathBuf::from(cwd);
+            if path.is_dir() {
+                self.shell_state.cwd = path;
+            }
+        }
+        if let Some(vars) = snapshot
+            .state
+            .get(crate::history::STATE_SHELL_VARS)
+            .and_then(|j| serde_json::from_str(j).ok())
+        {
+            self.shell_state.vars = vars;
+        }
+        if let Some(exported) = snapshot
+            .state
+            .get(crate::history::STATE_SHELL_EXPORTED)
+            .and_then(|j| serde_json::from_str(j).ok())
+        {
+            self.shell_state.exported = exported;
+        }
+
+        // Subagents: terminal records restore as-is; still-running ones
+        // restart their turn loop from the saved messages.
+        let parent_shell = self.shell_state.clone();
+        let parent_skills = self.active_skills.clone();
+        let parent_registry = self.skill_registry.clone();
+        let mut restore_errors = Vec::new();
+        for sub in &snapshot.subagents {
+            if let Err(e) = self.subagents.restore(
+                sub,
+                &self.agent_registry,
+                &parent_shell,
+                &parent_skills,
+                &parent_registry,
+            ) {
+                restore_errors.push(e);
+            }
+        }
+        for error in restore_errors {
+            self.add_event_message(error);
+        }
+
+        self.current_session_id = Some(id);
+        // Keep the loaded session's name so subsequent persists update the
+        // same row instead of renaming it.
+        self.session_name = snapshot.meta.name.clone();
+        self.chat_state.scroll_to_bottom();
+        Ok("session resumed".to_string())
     }
 
     /// Handle a TUI slash command. Returns `true` if the input was a command
@@ -1246,6 +1381,7 @@ impl App {
                 } else {
                     log::info!("no pending tool call; turn complete");
                 }
+                self.persist_session();
             }
             Err(e) => {
                 // Remove the empty assistant placeholder so a failed request does
@@ -1256,6 +1392,7 @@ impl App {
                 log::error!("llm stream error: {}", e);
                 self.add_event_message(format!("LLM request failed: {}", e));
                 self.set_error("LLM request failed".to_string());
+                self.persist_session();
             }
         }
     }
@@ -1363,15 +1500,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Seed a session row with messages directly in the store under test.
+    fn seed_session(
+        dir: &std::path::Path,
+        name: &str,
+        messages: &[Message],
+    ) -> crate::history::SessionStore {
+        let store = crate::history::SessionStore::open(dir).unwrap();
+        let id = store
+            .create_session(name, "catus-seed", "test-model")
+            .unwrap();
+        store
+            .replace_messages(id, crate::history::MAIN_AGENT_ID, messages)
+            .unwrap();
+        store
+    }
+
     #[tokio::test]
     async fn resume_lists_available_histories() {
         let dir = std::env::temp_dir().join(format!("catus_resume_list_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let history = dir.join("alpha.json");
-        let messages = vec![Message::user("hello")];
-        std::fs::write(&history, serde_json::to_string(&messages).unwrap()).unwrap();
+        seed_session(&dir, "alpha", &[Message::user("hello")]);
 
         let app = App::new(test_config_with_history_dir(&dir));
         let list = app.history_names_list();
@@ -1384,21 +1535,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn resume_loads_history_and_sets_current_file() {
+    #[tokio::test]
+    async fn resume_loads_history_and_sets_current_session() {
         let dir = std::env::temp_dir().join(format!("catus_resume_load_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let history = dir.join("session.json");
-        let messages = vec![Message::user("previous"), Message::assistant("ok")];
-        std::fs::write(&history, serde_json::to_string(&messages).unwrap()).unwrap();
+        let store = seed_session(
+            &dir,
+            "session",
+            &[Message::user("previous"), Message::assistant("ok")],
+        );
+        let id = store.find_session("session").unwrap().unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.current_history_file.is_none());
+        assert!(app.current_session_id.is_none());
 
-        app.resume_history(Some("session")).unwrap();
-        assert_eq!(app.current_history_file, Some(history.clone()));
+        app.resume_history(Some("session")).await.unwrap();
+        assert_eq!(app.current_session_id, Some(id));
         assert!(
             app.messages
                 .iter()
@@ -1414,42 +1568,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn save_session_history_overwrites_loaded_file() {
+    #[tokio::test]
+    async fn persist_updates_loaded_session() {
         let dir = std::env::temp_dir().join(format!("catus_resume_save_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let history = dir.join("existing.json");
-        let messages = vec![Message::user("old")];
-        std::fs::write(&history, serde_json::to_string(&messages).unwrap()).unwrap();
+        let store = seed_session(&dir, "existing", &[Message::user("old")]);
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.resume_history(Some("existing")).unwrap();
+        app.resume_history(Some("existing")).await.unwrap();
         app.messages.push(Message::user("new"));
+        app.persist_session();
 
-        let saved = app.save_session_history().unwrap();
-        assert_eq!(saved, Some(history.clone()));
-
-        let loaded: Vec<Message> =
-            serde_json::from_str(&std::fs::read_to_string(&history).unwrap()).unwrap();
-        assert!(loaded.iter().any(|m| m.content == "new"));
+        let id = store.find_session("existing").unwrap().unwrap();
+        let snap = store.load_session(id).unwrap().unwrap();
+        assert!(snap.messages.iter().any(|m| m.content == "new"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn save_session_history_creates_timestamped_file_for_new_session() {
+    #[tokio::test]
+    async fn persist_creates_timestamped_session_row_for_new_session() {
         let dir = std::env::temp_dir().join(format!("catus_resume_new_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let app = App::new(test_config_with_history_dir(&dir));
-        let saved = app.save_session_history().unwrap();
-        assert!(saved.is_some());
-        let saved = saved.unwrap();
-        assert_eq!(saved.parent().unwrap(), dir);
-        assert!(saved.exists());
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert!(app.current_session_id.is_none());
+        app.persist_session();
+        assert!(app.current_session_id.is_some());
+        assert!(dir.join("sessions.db").exists());
+
+        let store = crate::history::SessionStore::open(&dir).unwrap();
+        let names = store.list_sessions().unwrap();
+        assert_eq!(names.len(), 1);
+        assert!(names[0].name.starts_with("history_"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resume_restores_metadata_and_model() {
+        let dir = std::env::temp_dir().join(format!("catus_resume_meta_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.messages.push(Message::user("hello"));
+        app.usage = crate::llm::Usage {
+            prompt_tokens: 120,
+            completion_tokens: 60,
+            total_tokens: 180,
+            cached_tokens: 30,
+        };
+        app.request_count = 4;
+        app.active_skills.push("demo".to_string());
+        app.tool_rounds_this_turn = 2;
+        let saved_session_id = app.session_id.clone();
+        app.persist_session();
+        let name = {
+            let store = app.history_store.as_ref().unwrap();
+            store.list_sessions().unwrap()[0].name.clone()
+        };
+
+        // A fresh app resumes the persisted session.
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        assert_ne!(app.session_id, saved_session_id);
+        app.resume_history(Some(&name)).await.unwrap();
+
+        assert_eq!(app.usage.prompt_tokens, 120);
+        assert_eq!(app.usage.total_tokens, 180);
+        assert_eq!(app.request_count, 4);
+        assert_eq!(app.active_skills, vec!["demo".to_string()]);
+        assert_eq!(app.tool_rounds_this_turn, 2);
+        // The provider session id is restored for session-header continuity.
+        assert_eq!(app.session_id, saved_session_id);
+        assert_eq!(app.current_model.id, "test-model");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1527,23 +1722,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn load_history_filters_empty_assistant_placeholders() {
+    #[tokio::test]
+    async fn resume_filters_empty_assistant_placeholders() {
         let dir = std::env::temp_dir().join(format!("catus_load_filter_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let history = dir.join("bad.json");
-        let messages = vec![
-            Message::system("old".to_string()),
-            Message::user("hello".to_string()),
-            Message::assistant(String::new()),
-            Message::event("LLM request failed".to_string()),
-        ];
-        std::fs::write(&history, serde_json::to_string(&messages).unwrap()).unwrap();
+        seed_session(
+            &dir,
+            "bad",
+            &[
+                Message::system("old".to_string()),
+                Message::user("hello".to_string()),
+                Message::assistant(String::new()),
+                Message::event("LLM request failed".to_string()),
+            ],
+        );
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        app.load_history(&history).unwrap();
+        app.resume_history(Some("bad")).await.unwrap();
 
         assert!(
             !app.messages.iter().any(|m| m.role == Role::Assistant),
@@ -1724,7 +1921,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("catus_cmd_hist_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("foo.json"), "[]").unwrap();
+        seed_session(&dir, "foo", &[]);
 
         let mut app = App::new(test_config_with_history_dir(&dir));
         app.input_state.input = "/resume foo".to_string();
@@ -1802,12 +1999,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("catus_resume_overlay_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("alpha.json"),
-            serde_json::to_string(&vec![Message::user("hi")]).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(dir.join("beta.json"), "[]").unwrap();
+        seed_session(&dir, "alpha", &[Message::user("hi")]);
+        seed_session(&dir, "beta", &[]);
 
         let mut app = App::new(test_config_with_history_dir(&dir));
         assert!(app.handle_command("/resume").await);
@@ -1832,13 +2025,13 @@ mod tests {
             other => panic!("expected resume overlay, got {:?}", other),
         }
 
-        // Enter loads the selected history and closes the picker.
+        // Enter yields the selected session name for the event loop to load.
         let action =
             crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Enter);
         match action {
             crate::ui::OverlayAction::LoadHistory(name) => {
-                let path = dir.join(format!("{}.json", name));
-                assert!(path.exists());
+                let store = crate::history::SessionStore::open(&dir).unwrap();
+                assert!(store.find_session(&name).unwrap().is_some());
             }
             other => panic!("expected LoadHistory, got {:?}", other),
         }
@@ -1847,27 +2040,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn resume_picker_esc_closes_without_loading() {
+    #[tokio::test]
+    async fn resume_picker_esc_closes_without_loading() {
         let dir = std::env::temp_dir().join(format!("catus_resume_esc_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.json"), "[]").unwrap();
+        seed_session(&dir, "a", &[]);
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        let items = app
-            .list_history_files()
-            .iter()
-            .filter_map(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
+        let items = app.list_session_names();
         app.overlay_state.open_resume(items);
         crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Esc);
         assert_eq!(app.overlay_state.overlay, Overlay::None);
-        assert!(app.current_history_file.is_none());
+        assert!(app.current_session_id.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1877,12 +2062,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("catus_resume_arg_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("foo.json"), "[]").unwrap();
+        seed_session(&dir, "foo", &[]);
 
         let mut app = App::new(test_config_with_history_dir(&dir));
         assert!(app.handle_command("/resume foo").await);
         assert_eq!(app.overlay_state.overlay, Overlay::None);
-        assert_eq!(app.status_message, "history loaded");
+        assert_eq!(app.status_message, "session resumed");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

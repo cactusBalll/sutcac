@@ -148,7 +148,7 @@ pub enum StreamEvent {
 /// `cached_tokens` covers prompt tokens served from the provider cache; it is
 /// taken from `prompt_tokens_details.cached_tokens` (OpenAI) or a top-level
 /// `cached_tokens` field (some compatible providers).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,

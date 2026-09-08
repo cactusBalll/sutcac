@@ -40,6 +40,26 @@ impl SubagentState {
             SubagentState::Error => "error",
         }
     }
+
+    /// Parse a persisted state string; unknown values fall back to `Idle`.
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "streaming" => SubagentState::Streaming,
+            "running tool" => SubagentState::RunningTool,
+            "completed" => SubagentState::Completed,
+            "error" => SubagentState::Error,
+            _ => SubagentState::Idle,
+        }
+    }
+
+    /// Whether the subagent was still doing work (and therefore needs its
+    /// runner restarted after a resume).
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self,
+            SubagentState::Idle | SubagentState::Streaming | SubagentState::RunningTool
+        )
+    }
 }
 
 /// How a subagent should be initialized relative to its parent.
@@ -278,6 +298,117 @@ impl SubagentManager {
         &self.subagents
     }
 
+    /// Snapshot every subagent for persistence.
+    pub fn snapshot(&self) -> Vec<crate::history::SubagentSnapshot> {
+        self.subagents
+            .iter()
+            .map(|s| crate::history::SubagentSnapshot {
+                record: crate::history::SubagentRecord {
+                    id: s.id.clone(),
+                    name: s.name.clone(),
+                    task: s.task.clone(),
+                    state: s.state.as_str().to_string(),
+                    mode: match s.mode {
+                        SubagentContextMode::Fork => "fork",
+                        SubagentContextMode::Create => "create",
+                    }
+                    .to_string(),
+                    parent_call_id: s.parent_call_id.clone(),
+                    result: s.result.clone(),
+                    error: s.error.clone(),
+                },
+                messages: s.messages.clone(),
+            })
+            .collect()
+    }
+
+    /// Restore a subagent from a persisted snapshot.
+    ///
+    /// Terminal subagents (completed/error) are restored as-is. Subagents
+    /// that were still running get their turn loop restarted from the saved
+    /// messages, so work that was interrupted by an exit continues after a
+    /// resume. Returns `Err` when the agent definition no longer exists.
+    pub fn restore(
+        &mut self,
+        snapshot: &crate::history::SubagentSnapshot,
+        registry: &AgentRegistry,
+        parent_shell_state: &ShellState,
+        parent_active_skills: &[String],
+        parent_skill_registry: &SkillRegistry,
+    ) -> Result<(), String> {
+        let record = &snapshot.record;
+        // Never reuse restored ids for future spawns.
+        if let Some(n) = record
+            .id
+            .strip_prefix("subagent-")
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            self.next_id = self.next_id.max(n + 1);
+        }
+
+        let mode = record
+            .mode
+            .parse::<SubagentContextMode>()
+            .unwrap_or(SubagentContextMode::Create);
+        let saved_state = SubagentState::from_db(&record.state);
+        let restart = saved_state.is_running();
+
+        let subagent = Subagent {
+            id: record.id.clone(),
+            name: record.name.clone(),
+            task: record.task.clone(),
+            state: if restart {
+                SubagentState::Streaming
+            } else {
+                saved_state
+            },
+            mode,
+            // Keep the persisted conversation so later snapshots (incremental
+            // persists) don't lose the restored history.
+            messages: snapshot.messages.clone(),
+            result: record.result.clone(),
+            error: record.error.clone(),
+            parent_call_id: record.parent_call_id.clone(),
+        };
+        self.subagents.push(subagent);
+
+        if !restart {
+            return Ok(());
+        }
+
+        let definition = registry.get(&record.name).cloned().ok_or_else(|| {
+            format!(
+                "agent definition '{}' not found; cannot resume subagent {}",
+                record.name, record.id
+            )
+        })?;
+
+        let parent = ParentSnapshot {
+            messages: Vec::new(),
+            shell_state: parent_shell_state.clone(),
+            toolbox: self.parent_toolbox.clone(),
+            active_skills: parent_active_skills.to_vec(),
+            tier_models: self.parent_tier_models.clone(),
+            current_model: self.parent_current_model.clone(),
+            skill_registry: parent_skill_registry.clone(),
+            config: self.parent_config.clone(),
+            mcp_manager: self.parent_mcp_manager.clone(),
+        };
+        let runner = SubagentRunner::resume(
+            record.id.clone(),
+            definition,
+            snapshot.messages.clone(),
+            mode,
+            parent,
+            self.event_tx.clone(),
+        );
+        tokio::spawn(async move {
+            runner.run().await;
+        });
+        Ok(())
+    }
+
     /// Number of subagents still running.
     pub fn running_count(&self) -> usize {
         self.subagents
@@ -438,6 +569,10 @@ impl SubagentRunner {
             &format!("{}-{}", id, chrono::Utc::now().timestamp_millis()),
         );
 
+        let (shell_state, active_skills, skill_registry) =
+            Self::build_runtime_context(definition, mode, &parent);
+        let toolbox = build_subagent_toolbox(&parent.toolbox, definition);
+
         match mode {
             SubagentContextMode::Fork => {
                 let mut messages = parent.messages.clone();
@@ -445,17 +580,6 @@ impl SubagentRunner {
                     "You are now acting as the '{}' subagent. Task: {}",
                     definition.name, task
                 )));
-
-                let toolbox = build_subagent_toolbox(&parent.toolbox, definition);
-
-                let shell_state = parent.shell_state.clone();
-                let active_skills = if definition.inherits_skills() {
-                    parent.active_skills.clone()
-                } else {
-                    definition.explicit_skills()
-                };
-                let skill_registry = parent.skill_registry.clone();
-
                 (
                     messages,
                     shell_state,
@@ -471,27 +595,8 @@ impl SubagentRunner {
                     "You are the '{}' subagent. Task: {}",
                     definition.name, task
                 ));
-                let messages = vec![system, task_msg];
-
-                let shell_config = {
-                    let mut shell = parent.config.shell.clone().unwrap_or_default();
-                    if let Some(perm) = &definition.permission {
-                        shell.perm_mode = Some(perm.clone());
-                    }
-                    shell
-                };
-                let shell_state = ShellState::with_policy_and_logger(
-                    shell_config.permission_policy(),
-                    shell_config.audit_logger(),
-                );
-
-                let toolbox = build_subagent_toolbox(&parent.toolbox, definition);
-
-                let active_skills = definition.explicit_skills();
-                let skill_registry = SkillRegistry::new();
-
                 (
-                    messages,
+                    vec![system, task_msg],
                     shell_state,
                     active_skills,
                     toolbox,
@@ -499,6 +604,78 @@ impl SubagentRunner {
                     client,
                 )
             }
+        }
+    }
+
+    /// Rebuild the shell state, active skills, and skill registry for a
+    /// (re)started subagent.
+    fn build_runtime_context(
+        definition: &AgentDefinition,
+        mode: SubagentContextMode,
+        parent: &ParentSnapshot,
+    ) -> (ShellState, Vec<String>, SkillRegistry) {
+        match mode {
+            SubagentContextMode::Fork => (
+                parent.shell_state.clone(),
+                if definition.inherits_skills() {
+                    parent.active_skills.clone()
+                } else {
+                    definition.explicit_skills()
+                },
+                parent.skill_registry.clone(),
+            ),
+            SubagentContextMode::Create => {
+                let shell_config = {
+                    let mut shell = parent.config.shell.clone().unwrap_or_default();
+                    if let Some(perm) = &definition.permission {
+                        shell.perm_mode = Some(perm.clone());
+                    }
+                    shell
+                };
+                (
+                    ShellState::with_policy_and_logger(
+                        shell_config.permission_policy(),
+                        shell_config.audit_logger(),
+                    ),
+                    definition.explicit_skills(),
+                    SkillRegistry::new(),
+                )
+            }
+        }
+    }
+
+    /// Restart a subagent turn loop from persisted messages.
+    ///
+    /// Used by [`SubagentManager::restore`]: the conversation continues where
+    /// it left off instead of re-running the task from scratch.
+    fn resume(
+        id: SubagentId,
+        definition: AgentDefinition,
+        messages: Vec<Message>,
+        mode: SubagentContextMode,
+        parent: ParentSnapshot,
+        event_tx: mpsc::Sender<SubagentEvent>,
+    ) -> Self {
+        let model = Self::resolve_model(&parent, definition.model_tier);
+        let client = LlmClient::new(
+            model.provider.clone(),
+            model.clone(),
+            &format!("{}-{}", id, chrono::Utc::now().timestamp_millis()),
+        );
+        let (shell_state, active_skills, skill_registry) =
+            Self::build_runtime_context(&definition, mode, &parent);
+        let toolbox = build_subagent_toolbox(&parent.toolbox, &definition);
+        Self {
+            id,
+            definition,
+            messages,
+            toolbox,
+            shell_state,
+            active_skills,
+            skill_registry,
+            client,
+            max_rounds: 30,
+            event_tx,
         }
     }
 
@@ -565,7 +742,14 @@ impl SubagentRunner {
                         }
                         match result {
                             Ok(()) => break,
-                            Err(e) => stream_error = Some(e),
+                            Err(e) => {
+                                // Leave the loop immediately: both channel
+                                // senders are dropped once the stream task
+                                // finishes, so re-polling the select would
+                                // panic ("all branches are disabled").
+                                stream_error = Some(e);
+                                break;
+                            }
                         }
                     }
                 }
@@ -698,4 +882,179 @@ fn parse_complete_task_result(arguments: &str) -> String {
     serde_json::from_str::<Args>(arguments)
         .map(|a| a.result)
         .unwrap_or_else(|_| arguments.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::AgentRegistry;
+    use crate::llm::Provider;
+    use std::time::Duration;
+
+    fn test_registry(dir: &std::path::Path) -> AgentRegistry {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("coder.md"),
+            "---\nname: coder\ndescription: test agent\n---\nDo things.\n",
+        )
+        .unwrap();
+        AgentRegistry::discover(&[dir.to_path_buf()]).unwrap()
+    }
+
+    /// A model whose provider endpoint refuses connections immediately, so a
+    /// restarted runner fails fast without touching the network.
+    fn unreachable_model() -> Model {
+        Model {
+            id: "test-model".to_string(),
+            name: String::new(),
+            context_window: 0,
+            provider: Provider {
+                name: "test".to_string(),
+                base_url: "http://127.0.0.1:9".to_string(),
+                api_key: String::new(),
+                session_header: None,
+            },
+        }
+    }
+
+    fn manager_with_unreachable_model() -> SubagentManager {
+        SubagentManager::new(
+            Toolbox::default(),
+            TierModels::default(),
+            unreachable_model(),
+            AppConfig::default(),
+            None,
+        )
+    }
+
+    fn running_snapshot() -> crate::history::SubagentSnapshot {
+        crate::history::SubagentSnapshot {
+            record: crate::history::SubagentRecord {
+                id: "subagent-0-coder".to_string(),
+                name: "coder".to_string(),
+                task: "do things".to_string(),
+                state: "running tool".to_string(),
+                mode: "create".to_string(),
+                parent_call_id: Some("call-task".to_string()),
+                result: None,
+                error: None,
+            },
+            messages: vec![
+                Message::user("You are the 'coder' subagent. Task: do things"),
+                Message::tool("partial result", "call-2"),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_restarts_running_subagent_turn_loop() {
+        let dir = std::env::temp_dir().join(format!("catus_sub_restore_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry = test_registry(&dir);
+        let mut manager = manager_with_unreachable_model();
+
+        let shell = ShellState::new();
+        manager
+            .restore(
+                &running_snapshot(),
+                &registry,
+                &shell,
+                &[],
+                &SkillRegistry::new(),
+            )
+            .unwrap();
+
+        assert_eq!(manager.list().len(), 1);
+        assert_eq!(
+            manager.get("subagent-0-coder").unwrap().state,
+            SubagentState::Streaming
+        );
+
+        // The restarted runner cannot reach the LLM endpoint; the resulting
+        // error event proves the turn loop was relaunched from the saved
+        // messages instead of being dropped. Skip the lifecycle events
+        // (Started, StateChanged) emitted before the failed request.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let errored = loop {
+            let event = tokio::time::timeout_at(deadline, manager.event_rx.recv())
+                .await
+                .expect("restart runner should emit an error event")
+                .expect("event channel should stay open");
+            match &event {
+                SubagentEvent::Error { id, .. } => {
+                    assert_eq!(id, "subagent-0-coder");
+                    manager.handle_event(&event);
+                    break true;
+                }
+                _ => manager.handle_event(&event),
+            };
+        };
+        assert!(errored);
+        assert_eq!(
+            manager.get("subagent-0-coder").unwrap().state,
+            SubagentState::Error
+        );
+
+        // A future spawn never reuses a restored id.
+        assert!(manager.next_id >= 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restore_completed_subagent_without_restart_and_snapshot_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("catus_sub_done_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry = test_registry(&dir);
+        let mut manager = manager_with_unreachable_model();
+
+        let snapshot = crate::history::SubagentSnapshot {
+            record: crate::history::SubagentRecord {
+                id: "subagent-3-coder".to_string(),
+                name: "coder".to_string(),
+                task: "done".to_string(),
+                state: "completed".to_string(),
+                mode: "create".to_string(),
+                parent_call_id: Some("call-task".to_string()),
+                result: Some("all done".to_string()),
+                error: None,
+            },
+            messages: vec![Message::assistant("all done")],
+        };
+        let shell = ShellState::new();
+        manager
+            .restore(&snapshot, &registry, &shell, &[], &SkillRegistry::new())
+            .unwrap();
+
+        // Terminal record: restored as completed, no runner relaunch, and the
+        // result survives for the parent-injection path.
+        let sub = manager.get("subagent-3-coder").unwrap();
+        assert_eq!(sub.state, SubagentState::Completed);
+        assert_eq!(sub.result.as_deref(), Some("all done"));
+        assert_eq!(sub.parent_call_id.as_deref(), Some("call-task"));
+
+        // No restarted runner: the channel stays silent.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), manager.event_rx.recv())
+                .await
+                .is_err()
+        );
+
+        // Snapshot round-trips through the store.
+        let store = crate::history::SessionStore::open_in_memory().unwrap();
+        let session = store.create_session("s", "sid", "m").unwrap();
+        let snap = manager.snapshot();
+        assert_eq!(snap.len(), 1);
+        store.replace_subagents(session, &snap).unwrap();
+        let loaded = store.load_session(session).unwrap().unwrap();
+        assert_eq!(loaded.subagents.len(), 1);
+        assert_eq!(loaded.subagents[0].record.id, "subagent-3-coder");
+        assert_eq!(
+            loaded.subagents[0].record.result.as_deref(),
+            Some("all done")
+        );
+        assert_eq!(loaded.subagents[0].messages.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

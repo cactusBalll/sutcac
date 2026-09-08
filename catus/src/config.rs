@@ -41,7 +41,10 @@ pub struct ModelEntry {
     pub id: String,
     /// Name shown in the UI. Falls back to `id` when empty.
     pub name: String,
-    /// Context window in tokens; 0 means unspecified.
+    /// Context window in tokens; 0 means unspecified. Accepts a plain integer
+    /// or a human-readable string like `"512k"` / `"1M"` — see
+    /// [`parse_context_window`].
+    #[serde(default, deserialize_with = "deserialize_context_window")]
     pub context_window: usize,
     /// Name of the `[[providers]]` entry this model talks through.
     pub provider: String,
@@ -56,6 +59,59 @@ impl Default for ModelEntry {
             provider: String::new(),
         }
     }
+}
+
+/// Untagged form accepted for `context_window`: a plain integer or a string
+/// with a size suffix.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ContextWindowInput {
+    Number(usize),
+    Text(String),
+}
+
+fn deserialize_context_window<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match ContextWindowInput::deserialize(deserializer)? {
+        ContextWindowInput::Number(n) => Ok(n),
+        ContextWindowInput::Text(s) => parse_context_window(&s).map_err(serde::de::Error::custom),
+    }
+}
+
+/// Parse a context-window token count written as a plain integer (`131072`)
+/// or a human-readable string (`"128k"`, `"1M"`, `"0.5m"`, `"1mb"`).
+///
+/// Suffixes are case-insensitive and 1024-based: `k` = 1024, `m` = 1024²,
+/// `g` = 1024³; an optional trailing `b` is ignored. Fractional values are
+/// truncated towards zero.
+pub fn parse_context_window(value: &str) -> Result<usize, String> {
+    let s = value.trim();
+    if let Ok(n) = s.parse::<usize>() {
+        return Ok(n);
+    }
+    let invalid = || {
+        format!(
+            "invalid context window '{value}'; expected an integer or a value like '128k', '1M'"
+        )
+    };
+    let s = s.strip_suffix(['b', 'B']).unwrap_or(s);
+    let (num_part, mult) = match s.chars().last() {
+        Some('k' | 'K') => (&s[..s.len() - 1], 1024u64),
+        Some('m' | 'M') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('g' | 'G') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ => return Err(invalid()),
+    };
+    let num: f64 = num_part.trim().parse().map_err(|_| invalid())?;
+    if num < 0.0 {
+        return Err(invalid());
+    }
+    let total = num * mult as f64;
+    if total >= usize::MAX as f64 {
+        return Err(format!("context window '{value}' is out of range"));
+    }
+    Ok(total as usize)
 }
 
 /// Capability tier an agent definition can request via its `model`
@@ -190,9 +246,9 @@ impl Default for McpServerConfig {
 #[serde(default)]
 pub struct AgentConfig {
     pub max_tool_rounds: usize,
-    /// Optional directory that holds JSON conversation-history files. When set,
-    /// catus can load a previous conversation with the `/resume` command and
-    /// saves the current session to a timestamped JSON file on exit.
+    /// Optional directory holding the SQLite session-history database
+    /// (`sessions.db`). When set, catus persists each conversation
+    /// incrementally and can resume it later with the `/resume` command.
     pub history_path: Option<PathBuf>,
     /// Optional log file path. When omitted, defaults to `.sutcac/catus.log`.
     pub log_path: Option<PathBuf>,
@@ -508,6 +564,64 @@ provider = "openai"
         // Empty display name falls back to the id.
         assert_eq!(models[1].display_name(), "gpt-4o-mini");
         assert!(!models[1].provider.sends_session_id());
+    }
+
+    #[test]
+    fn context_window_accepts_human_readable_sizes() {
+        let input = r#"
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-oa"
+
+[[models]]
+id = "m1"
+context_window = "512k"
+provider = "openai"
+
+[[models]]
+id = "m2"
+context_window = "1M"
+provider = "openai"
+
+[[models]]
+id = "m3"
+context_window = "0.5m"
+provider = "openai"
+
+[[models]]
+id = "m4"
+context_window = 131072
+provider = "openai"
+
+[[models]]
+id = "m5"
+provider = "openai"
+"#;
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        let windows: Vec<usize> = cfg.models.iter().map(|m| m.context_window).collect();
+        assert_eq!(
+            windows,
+            vec![512 * 1024, 1024 * 1024, 512 * 1024, 131072, 0]
+        );
+    }
+
+    #[test]
+    fn parse_context_window_sizes() {
+        assert_eq!(parse_context_window("131072").unwrap(), 131072);
+        assert_eq!(parse_context_window("128k").unwrap(), 131072);
+        assert_eq!(parse_context_window("128K").unwrap(), 131072);
+        assert_eq!(parse_context_window("512k").unwrap(), 512 * 1024);
+        assert_eq!(parse_context_window("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_context_window(" 1m ").unwrap(), 1024 * 1024);
+        assert_eq!(parse_context_window("0.5m").unwrap(), 512 * 1024);
+        assert_eq!(parse_context_window("1mb").unwrap(), 1024 * 1024);
+        assert_eq!(parse_context_window("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_context_window("0").unwrap(), 0);
+        assert!(parse_context_window("521x").is_err());
+        assert!(parse_context_window("").is_err());
+        assert!(parse_context_window("m").is_err());
+        assert!(parse_context_window("-1k").is_err());
     }
 
     #[test]
