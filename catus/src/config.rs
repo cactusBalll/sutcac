@@ -241,6 +241,39 @@ impl Default for McpServerConfig {
     }
 }
 
+/// Agent Memory configuration (`[agent.memory]`).
+///
+/// The memory store is an mdbook project: `book.toml` plus a `src/`
+/// directory holding `SUMMARY.md` and topical chapter files. When enabled,
+/// catus dispatches the `memory`-role subagent before each turn (recall) and
+/// after each turn (summarize/write). Building with the `mdbook` binary is
+/// optional: when it is unavailable the store is maintained as plain
+/// Markdown.
+#[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Master switch. Disabled by default so existing configurations are
+    /// unaffected.
+    pub enabled: bool,
+    /// Root directory of the mdbook memory store.
+    pub path: PathBuf,
+    /// Whether to dispatch a recall pass before each user turn.
+    pub auto_recall: bool,
+    /// Whether to dispatch a summarize/write pass after each turn completes.
+    pub auto_write: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: PathBuf::from(".sutcac/memory"),
+            auto_recall: true,
+            auto_write: true,
+        }
+    }
+}
+
 /// Agent behavior configuration.
 #[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(default)]
@@ -264,6 +297,8 @@ pub struct AgentConfig {
     /// `[[models]]` entry; `efficient` is optional and falls back to
     /// `performance`.
     pub models: TierModelConfig,
+    /// Agent Memory subsystem settings (`[agent.memory]`).
+    pub memory: MemoryConfig,
 }
 
 impl Default for AppConfig {
@@ -413,6 +448,7 @@ impl Default for AgentConfig {
             auto_include_skills: true,
             agent_paths: None,
             models: TierModelConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
 }
@@ -760,6 +796,35 @@ provider = "openai"
             ModelTier::Efficient
         );
         assert!(ModelTier::parse("性能").is_err());
+    }
+
+    #[test]
+    fn parse_memory_config() {
+        let input = r#"
+[[providers]]
+name = "openai"
+base_url = "https://api.example.com/v1"
+api_key = "sk-test"
+
+[agent.memory]
+enabled = true
+path = "custom/memory-book"
+auto_recall = false
+"#;
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        let memory = &cfg.agent.memory;
+        assert!(memory.enabled);
+        assert_eq!(memory.path, PathBuf::from("custom/memory-book"));
+        assert!(!memory.auto_recall);
+        // Unset sub-switch falls back to its default.
+        assert!(memory.auto_write);
+
+        // The whole section is optional; defaults keep memory disabled.
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert!(!cfg.agent.memory.enabled);
+        assert_eq!(cfg.agent.memory.path, PathBuf::from(".sutcac/memory"));
+        assert!(cfg.agent.memory.auto_recall);
+        assert!(cfg.agent.memory.auto_write);
     }
 
     #[test]

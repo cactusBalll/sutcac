@@ -708,6 +708,107 @@ impl SlashCommand for McpCommand {
     }
 }
 
+/// Manage the Agent Memory subsystem.
+pub struct MemoryCommand;
+
+impl SlashCommand for MemoryCommand {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+
+    fn description(&self) -> &'static str {
+        "Manage the Agent Memory subsystem"
+    }
+
+    fn usage(&self) -> &'static str {
+        "/memory [status | on | off | path]"
+    }
+
+    fn subcommands(&self) -> &[&'static str] {
+        &["status", "on", "off", "path"]
+    }
+
+    fn help(&self, subcommand: Option<&str>) -> String {
+        match subcommand {
+            Some("status") => {
+                "Usage: /memory status\nShow the memory store path and current state.".to_string()
+            }
+            Some("on") => {
+                "Usage: /memory on\nEnable memory recall/write passes for this session.".to_string()
+            }
+            Some("off") => {
+                "Usage: /memory off\nDisable memory recall/write passes for this session."
+                    .to_string()
+            }
+            Some("path") => {
+                "Usage: /memory path\nShow the mdbook memory store directory.".to_string()
+            }
+            Some(sub) => format!("Unknown subcommand '{}' for /memory", sub),
+            None => format!(
+                "Usage: {}\n\n\
+                 The Agent Memory subsystem dispatches the memory subagent to \
+                 recall long-term memory before each turn and summarize key \
+                 facts after it. The store is an mdbook project; see \
+                 [agent.memory] in config.toml.",
+                self.usage()
+            ),
+        }
+    }
+
+    fn record_history(&self, args: Option<&str>) -> bool {
+        args.is_some()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        app: &'a mut App,
+        args: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), CommandError>> {
+        Box::pin(async move {
+            app.status = AppStatus::Idle;
+            match args.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(args) => {
+                    let mut parts = args.splitn(2, ' ');
+                    let sub = parts.next().unwrap_or("");
+                    match sub {
+                        "status" => {
+                            app.add_event_message(app.memory_status_list());
+                            app.set_transient_message("Memory status listed");
+                        }
+                        "on" => {
+                            let msg = app.set_memory_enabled(true);
+                            app.set_transient_message(msg);
+                        }
+                        "off" => {
+                            let msg = app.set_memory_enabled(false);
+                            app.set_transient_message(msg);
+                        }
+                        "path" => {
+                            app.add_event_message(format!(
+                                "memory store: {}",
+                                app.memory.memory_dir.display()
+                            ));
+                            app.set_transient_message("Memory path listed");
+                        }
+                        _ => {
+                            return Err(format!(
+                                "unknown /memory subcommand: {}. Try /memory status, on, off, or path",
+                                sub
+                            )
+                            .into());
+                        }
+                    }
+                }
+                None => {
+                    app.add_event_message(app.memory_status_list());
+                    app.set_transient_message("Memory status listed");
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
 /// Built-in slash commands available in the TUI.
 ///
 /// The registry is initialized lazily on first access.
@@ -721,6 +822,7 @@ pub static BUILT_IN_REGISTRY: LazyLock<CommandRegistry> = LazyLock::new(|| {
         Box::new(ModelCommand),
         Box::new(AgentCommand),
         Box::new(SkillCommand),
+        Box::new(MemoryCommand),
         Box::new(PermissionCommand),
         Box::new(AutoCommand),
         Box::new(McpCommand),
@@ -748,6 +850,34 @@ mod tests {
         assert!(names.contains(&"mcp"));
         assert!(names.contains(&"model"));
         assert!(names.contains(&"skill"));
+        assert!(names.contains(&"memory"));
+    }
+
+    #[tokio::test]
+    async fn memory_command_shows_status_and_toggles() {
+        use crate::config::AppConfig;
+
+        let mut app = App::new(AppConfig::default());
+
+        // Bare /memory shows the status.
+        assert!(app.handle_command("/memory").await);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("memory store:"))
+        );
+
+        // The subsystem is unavailable without a memory agent; on/off report it.
+        assert!(app.handle_command("/memory off").await);
+        assert!(
+            app.status_message.contains("unavailable"),
+            "unexpected status: {}",
+            app.status_message
+        );
+
+        // Unknown subcommand is an error.
+        assert!(app.handle_command("/memory bogus").await);
+        assert!(app.status_message.contains("unknown /memory subcommand"));
     }
 
     #[test]

@@ -40,6 +40,8 @@ pub const STATE_SHELL_VARS: &str = "shell_vars";
 pub const STATE_SHELL_EXPORTED: &str = "shell_exported";
 /// `session_state` key holding the JSON of the main agent's TODO list.
 pub const STATE_TODOS: &str = "todos";
+/// `session_state` key holding the session-level Agent Memory toggle.
+pub const STATE_MEMORY_ENABLED: &str = "memory_enabled";
 
 /// Wire-format mirror of [`ToolCall`] for persistence. [`ToolCall`]'s own
 /// `Serialize` impl produces the API request shape (`{"function": {...}}`),

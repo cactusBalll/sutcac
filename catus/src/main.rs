@@ -127,6 +127,9 @@ async fn run_test_mode(
         eprintln!("catus: main agent definition not found; create .sutcac/agents/main.md");
         std::process::exit(1);
     }
+    for warning in &app.memory.warnings {
+        eprintln!("catus: memory warning: {}", warning);
+    }
     let client = app.client.clone();
     let max_rounds = app.max_tool_rounds;
 
@@ -138,6 +141,18 @@ async fn run_test_mode(
 
     println!("USER: {}", prompt);
     app.messages.push(Message::user(prompt));
+
+    // Memory recall pass before the first LLM request, mirroring the TUI
+    // flow (simple tasks skip memory inside the pass itself).
+    let user_prompt = app
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == catus::message::Role::User)
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    app.maybe_dispatch_memory_recall(&user_prompt);
+    app.await_memory_passes().await;
 
     for round in 0..max_rounds {
         let tools = app.toolbox.definitions();
@@ -204,6 +219,10 @@ async fn run_test_mode(
         }
     }
 
+    // Let the memory write pass summarize and record the turn before exit.
+    app.maybe_dispatch_memory_write();
+    app.await_memory_passes().await;
+
     Ok(())
 }
 
@@ -212,6 +231,9 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
     if !app.main_agent_from_file {
         eprintln!("catus: main agent definition not found; create .sutcac/agents/main.md");
         std::process::exit(1);
+    }
+    for warning in &app.memory.warnings {
+        log::warn!("memory warning: {}", warning);
     }
     let mcp_warnings = app.connect_mcp().await;
     for warning in &mcp_warnings {
@@ -285,7 +307,14 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                             ui::AppAction::None => {}
                             ui::AppAction::Quit => should_quit = true,
                             ui::AppAction::StartStream => {
-                                app.start_llm_stream(event_tx.clone(), done_tx.clone()).await;
+                                if app.awaiting_memory_recall() {
+                                    // The user's message is still waiting for
+                                    // the memory recall pass; the main stream
+                                    // starts when the pass completes.
+                                } else {
+                                    app.start_llm_stream(event_tx.clone(), done_tx.clone())
+                                        .await;
+                                }
                             }
                             ui::AppAction::SetError(msg) => app.set_error(msg),
                         }

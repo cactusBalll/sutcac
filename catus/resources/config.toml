@@ -46,6 +46,18 @@ history_path = ".sutcac/history"
 # Whether to append the list of discovered skills to the system prompt.
 auto_include_skills = true
 
+# Agent Memory subsystem. When enabled, catus dispatches the `memory`-role
+# subagent before each user turn (recall: simple tasks skip memory, otherwise
+# relevant memories are injected into the conversation) and after each turn
+# (summarize: key facts are written into an mdbook store). The installed
+# agents/memory.md provides the memory agent; `mdbook build` runs only when
+# the mdbook binary is available.
+[agent.memory]
+enabled = true
+path = ".sutcac/memory"
+auto_recall = true
+auto_write = true
+
 # Model tiers for agent definitions. An agent's `model` frontmatter field
 # accepts "performance" or "efficient" and maps to the model configured here
 # (referenced by [[models]] id or display name). `performance` is required;

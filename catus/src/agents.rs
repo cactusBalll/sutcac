@@ -10,6 +10,9 @@
 //! - `tools`: list of allowed tool names; may include "inherit".
 //! - `permission`: sutcac-sh permission string.
 //! - `skills`: list of skill names; may include "inherit".
+//! - `role`: special responsibility marker, `main` or `memory`. Agents with a
+//!   special role are managed by catus itself (e.g. the memory subagent behind
+//!   the Agent Memory subsystem); plain subagents omit the field.
 //!
 //! The tier maps to a concrete model through `[agent.models]` in config.toml.
 
@@ -19,6 +22,38 @@ use serde::Deserialize;
 
 use crate::config::ModelTier;
 use crate::frontmatter::{parse_frontmatter, split_frontmatter, validate_name};
+
+/// Special responsibility assigned through an agent's `role` frontmatter
+/// field. Plain subagents have no role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    /// The main agent (defined by `main.md`; role is implicit there).
+    Main,
+    /// The memory subagent managing the mdbook-based Agent Memory store.
+    Memory,
+}
+
+impl AgentRole {
+    /// Parse a role label. Only `main` and `memory` are accepted.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_lowercase().as_str() {
+            "main" => Ok(Self::Main),
+            "memory" => Ok(Self::Memory),
+            other => Err(format!(
+                "unknown agent role '{}'; expected 'main' or 'memory'",
+                other
+            )),
+        }
+    }
+
+    /// The role label as written in the frontmatter.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Memory => "memory",
+        }
+    }
+}
 
 /// Parsed metadata from an agent definition's YAML frontmatter.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -30,6 +65,7 @@ struct AgentFrontmatter {
     tools: Option<OneOrMany<String>>,
     permission: Option<String>,
     skills: Option<OneOrMany<String>>,
+    role: Option<String>,
 }
 
 /// Helper accepting either a single value or a list.
@@ -64,6 +100,9 @@ pub struct AgentDefinition {
     pub permission: Option<String>,
     /// Skill names to activate. May contain "inherit".
     pub skills: Vec<String>,
+    /// Special responsibility marker (`main`/`memory`); `None` for plain
+    /// subagents. `main.md` gets an implicit `Main` role.
+    pub role: Option<AgentRole>,
     /// Markdown body used as the system prompt.
     pub body: String,
     /// Source file path.
@@ -141,6 +180,17 @@ impl AgentDefinition {
                     .collect()
             })
             .unwrap_or_default();
+        let role = match frontmatter.role.as_deref().map(str::trim) {
+            None | Some("") => {
+                // `main.md` carries an implicit main role.
+                if name == "main" {
+                    Some(AgentRole::Main)
+                } else {
+                    None
+                }
+            }
+            Some(raw) => Some(AgentRole::parse(raw)?),
+        };
 
         Ok(Self {
             name,
@@ -149,6 +199,7 @@ impl AgentDefinition {
             allowed_tools,
             permission,
             skills,
+            role,
             body: body.to_string(),
             source_path: path.to_path_buf(),
         })
@@ -234,6 +285,7 @@ impl AgentRegistry {
             }
         }
         registry.agents.sort_by(|a, b| a.name.cmp(&b.name));
+        registry.validate_roles()?;
         Ok(registry)
     }
 
@@ -245,6 +297,31 @@ impl AgentRegistry {
     /// Return the agent with the given name, if any.
     pub fn get(&self, name: &str) -> Option<&AgentDefinition> {
         self.agents.iter().find(|a| a.name == name)
+    }
+
+    /// Return the first agent carrying the given role, if any.
+    pub fn get_by_role(&self, role: AgentRole) -> Option<&AgentDefinition> {
+        self.agents.iter().find(|a| a.role == Some(role))
+    }
+
+    /// Ensure each special role is held by at most one agent.
+    fn validate_roles(&self) -> Result<(), String> {
+        for role in [AgentRole::Main, AgentRole::Memory] {
+            let holders: Vec<&str> = self
+                .agents
+                .iter()
+                .filter(|a| a.role == Some(role))
+                .map(|a| a.name.as_str())
+                .collect();
+            if holders.len() > 1 {
+                return Err(format!(
+                    "role '{}' is claimed by multiple agents: {}",
+                    role.as_str(),
+                    holders.join(", ")
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Return true if no agents were discovered.
@@ -424,6 +501,89 @@ mod tests {
         .unwrap();
         let err = AgentDefinition::load(&dir.join("bad.md")).unwrap_err();
         assert!(err.contains("unknown model tier"), "unexpected: {}", err);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_role_frontmatter() {
+        let dir = std::env::temp_dir().join(format!("catus_agent_role_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("memory.md"),
+            "---\nname: memory\ndescription: D.\nrole: memory\n---\nBody",
+        )
+        .unwrap();
+        let agent = AgentDefinition::load(&dir.join("memory.md")).unwrap();
+        assert_eq!(agent.role, Some(AgentRole::Memory));
+
+        // main.md gets an implicit main role.
+        std::fs::write(
+            dir.join("main.md"),
+            "---\nname: main\ndescription: D.\n---\nBody",
+        )
+        .unwrap();
+        let agent = AgentDefinition::load(&dir.join("main.md")).unwrap();
+        assert_eq!(agent.role, Some(AgentRole::Main));
+
+        // Plain agents have no role.
+        std::fs::write(
+            dir.join("coder.md"),
+            "---\nname: coder\ndescription: D.\n---\nBody",
+        )
+        .unwrap();
+        let agent = AgentDefinition::load(&dir.join("coder.md")).unwrap();
+        assert_eq!(agent.role, None);
+
+        // Unknown role values make the definition invalid.
+        std::fs::write(
+            dir.join("bad.md"),
+            "---\nname: bad\ndescription: D.\nrole: janitor\n---\nBody",
+        )
+        .unwrap();
+        let err = AgentDefinition::load(&dir.join("bad.md")).unwrap_err();
+        assert!(err.contains("unknown agent role"), "unexpected: {}", err);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn registry_get_by_role_and_rejects_duplicates() {
+        let dir =
+            std::env::temp_dir().join(format!("catus_agent_roles_reg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_agent(&dir, "main", "Main.", "Main agent.");
+        std::fs::write(
+            dir.join("memory.md"),
+            "---\nname: memory\ndescription: M.\nrole: memory\n---\nMemory agent.",
+        )
+        .unwrap();
+
+        let registry = AgentRegistry::discover(&[dir.clone()]).unwrap();
+        assert_eq!(
+            registry
+                .get_by_role(AgentRole::Memory)
+                .map(|a| a.name.as_str()),
+            Some("memory")
+        );
+        assert_eq!(
+            registry
+                .get_by_role(AgentRole::Main)
+                .map(|a| a.name.as_str()),
+            Some("main")
+        );
+        drop(registry);
+
+        // A second memory-role agent makes discovery fail.
+        std::fs::write(
+            dir.join("other.md"),
+            "---\nname: other\ndescription: O.\nrole: memory\n---\nBody",
+        )
+        .unwrap();
+        let err = AgentRegistry::discover(&[dir.clone()]).unwrap_err();
+        assert!(err.contains("memory"), "unexpected: {}", err);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

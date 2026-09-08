@@ -18,6 +18,8 @@ pub const CONFIG_TOML: &str = include_str!("../resources/config.toml");
 pub const AGENT_MAIN_MD: &str = include_str!("../resources/agents/main.md");
 /// Default coder subagent definition.
 pub const AGENT_CODER_MD: &str = include_str!("../resources/agents/coder.md");
+/// Default memory subagent definition (Agent Memory subsystem).
+pub const AGENT_MEMORY_MD: &str = include_str!("../resources/agents/memory.md");
 /// Example skill: git commit workflow.
 pub const SKILL_COMMIT_MD: &str = include_str!("../resources/skills/commit/SKILL.md");
 
@@ -26,6 +28,7 @@ pub const PROJECT_FILES: &[(&str, &str)] = &[
     ("config.toml", CONFIG_TOML),
     ("agents/main.md", AGENT_MAIN_MD),
     ("agents/coder.md", AGENT_CODER_MD),
+    ("agents/memory.md", AGENT_MEMORY_MD),
     ("skills/commit/SKILL.md", SKILL_COMMIT_MD),
 ];
 
@@ -101,6 +104,8 @@ mod tests {
         assert!(CONFIG_TOML.contains("[agent.models]"));
         assert!(AGENT_MAIN_MD.starts_with("---\nname: main\n"));
         assert!(AGENT_CODER_MD.starts_with("---\nname: coder\n"));
+        assert!(AGENT_MEMORY_MD.starts_with("---\nname: memory\n"));
+        assert!(AGENT_MEMORY_MD.contains("role: memory"));
         assert!(SKILL_COMMIT_MD.starts_with("---\nname: commit\n"));
     }
 
@@ -128,5 +133,19 @@ mod tests {
         let cfg: crate::config::AppConfig = toml::from_str(CONFIG_TOML).unwrap();
         cfg.resolve_models().unwrap();
         cfg.validate_tier_models().unwrap();
+    }
+
+    #[test]
+    fn embedded_agent_definitions_parse() {
+        for (name, contents) in [
+            ("main", AGENT_MAIN_MD),
+            ("coder", AGENT_CODER_MD),
+            ("memory", AGENT_MEMORY_MD),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{}.md", name));
+            std::fs::write(&path, contents).unwrap();
+            crate::agents::AgentDefinition::load(&path).unwrap();
+        }
     }
 }

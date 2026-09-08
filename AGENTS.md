@@ -59,6 +59,14 @@ Agent definitions are discovered from:
 
 Additional paths can be added via `[agent].agent_paths` in `config.toml`.
 
+### Agent roles
+
+Agents with special responsibilities are marked through a `role` frontmatter field instead of relying on file names:
+
+- `role: main` — the main agent. `main.md` carries this role implicitly; only one agent may hold it.
+- `role: memory` — the Agent Memory subagent (see "Agent Memory" below); only one agent may hold it. It stays visible in `/agent list` and can still be dispatched manually via `task`/`@name`, but catus also drives it automatically around each user turn.
+- Agents without a `role` are plain subagents. Duplicate role claims make `AgentRegistry::discover` fail; unknown role values make the definition invalid.
+
 ### Main agent
 
 The file `main.md` is required. Its body becomes the main system prompt, and its frontmatter controls the main agent's tools and permissions. If `main.md` is missing, the binary prints a warning and exits.
@@ -71,6 +79,15 @@ The file `main.md` is required. Its body becomes the main system prompt, and its
 - Subagent permissions always follow their declaration: both context modes rebuild the shell's `PermissionPolicy` from the agent's `permission` frontmatter (falling back to the configured `[shell]` policy), so parent session grants or `/auto` never leak into subagents. `fork` still inherits the parent's env/vars/cwd.
 - Use `@agent_name <task>` in the input line as a shorthand for `/agent use <agent_name> <task>`.
 - Use `/agent list`, `/agent status`, `/agent use`, `/agent watch`, and `/agent close` to manage and observe subagents.
+
+## Agent Memory
+
+`catus` maintains long-term memory as an mdbook project (`book.toml` + `src/SUMMARY.md` + topical chapter files) driven by the `role: memory` subagent (`catus/src/memory.rs` holds the task prompts, JSON result parsing, and `MemoryState`). Both passes run through the regular subagent runtime in `create` mode (independent context/toolbox/shell permissions; `App` spawns them with `parent_call_id: None` and intercepts their events in `handle_subagent_event`).
+
+- **Recall** (before the main LLM request): `submit_user_message` dispatches the pass; `main.rs` withholds `start_llm_stream` while `awaiting_memory_recall()`. The memory agent decides whether the request is a simple task (no memory, `{"recall": false}`); otherwise it searches the store and returns `{"recall": true, "memory": "..."}`, which is injected into the main conversation as a system message. A failed/unparseable pass degrades to "no memory".
+- **Write** (after the turn): `handle_llm_done`'s turn-complete branch dispatches a background summarize pass with a transcript of the current user turn (`memory::format_transcript`). The agent updates the mdbook store (initializing the scaffold if missing; `mdbook build` is optional and skipped when the binary is absent) and returns `{"written": bool, "summary": ...}`; the result is logged as an event message.
+- Configured under `[agent.memory]`: `enabled` (master switch, default off), `path` (store dir, default `.sutcac/memory`), `auto_recall`, `auto_write`. Enabling requires a `role: memory` agent definition — otherwise catus warns and keeps the subsystem disabled. `catus --install-project-config` installs a default `agents/memory.md`.
+- Runtime toggle: `/memory status|on|off|path`; the session toggle is persisted via `STATE_MEMORY_ENABLED` in `session_state` and restored by `/resume`. Interrupted passes are not restarted on resume. The memory agent is still callable manually (`task`/`@memory <question>`) for one-off memory queries.
 
 ## Commands
 
@@ -91,7 +108,7 @@ cargo run -p mcp-calc-server              # calculator MCP server (stdio)
 cargo test -p mcp-calc-server             # unit + integration tests against catus MCP client
 ```
 
-No CI, lint config, or integration tests exist. Tests currently pass (~64 + 4 in sutcac-sh, ~170 in catus, ~9 in mcp-calc-server).
+No CI, lint config, or integration tests exist. Tests currently pass (~64 + 4 in sutcac-sh, ~246 in catus, ~9 in mcp-calc-server).
 
 ## Configuration
 

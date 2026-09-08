@@ -7,7 +7,7 @@ use sutcac_sh::config::ShellConfig;
 use sutcac_sh::exec::ShellState;
 use tokio::sync::mpsc;
 
-use crate::agents::{AgentDefinition, AgentRegistry};
+use crate::agents::{AgentDefinition, AgentRegistry, AgentRole};
 use crate::config::{AppConfig, TierModels};
 use crate::llm::{LlmClient, LlmError, Model, StreamEvent, Usage};
 use crate::mcp::McpManager;
@@ -110,6 +110,8 @@ pub struct App {
     pub todos: TodoList,
     /// Connected MCP servers, if any.
     pub mcp_manager: Option<Arc<McpManager>>,
+    /// Agent Memory subsystem state (recall/write passes and toggles).
+    pub memory: crate::memory::MemoryState,
     /// All tools available to the LLM: built-in plus MCP-converted.
     pub toolbox: Toolbox,
     /// Input-line state (cursor, history, completion candidates).
@@ -238,6 +240,8 @@ impl App {
 
         let system_prompt = Self::build_system_prompt(&main_agent, &config, &skill_registry);
 
+        let memory = crate::memory::MemoryState::init(&config, &agent_registry);
+
         let (history_store, session_name) = match &config.agent.history_path {
             Some(dir) => match crate::history::SessionStore::open(dir) {
                 Ok(store) => (Some(store), new_session_name()),
@@ -270,6 +274,7 @@ impl App {
             active_skills: Vec::new(),
             todos: TodoList::new(),
             mcp_manager: None,
+            memory,
             toolbox,
             status: AppStatus::Idle,
             status_message: String::new(),
@@ -321,6 +326,7 @@ impl App {
             allowed_tools: Vec::new(),
             permission: config.shell.as_ref().and_then(|s| s.perm_mode.clone()),
             skills: Vec::new(),
+            role: Some(AgentRole::Main),
             body: String::new(),
             source_path: std::path::PathBuf::new(),
         };
@@ -396,6 +402,11 @@ impl App {
     }
 
     /// Take the current input and append it as a user message.
+    ///
+    /// When the Agent Memory subsystem is enabled with `auto_recall`, this
+    /// also dispatches the memory subagent's recall pass; the caller must
+    /// wait for it to finish (via `awaiting_memory_recall`) before starting
+    /// the main LLM stream.
     pub fn submit_user_message(&mut self) -> Option<String> {
         let text = self.input_state.take_input()?;
         self.messages.push(Message::user(text.clone()));
@@ -403,6 +414,7 @@ impl App {
 
         self.tool_rounds_this_turn = 0;
         self.chat_state.scroll_to_bottom();
+        self.maybe_dispatch_memory_recall(&text);
         self.persist_session();
         Some(text)
     }
@@ -596,6 +608,141 @@ impl App {
     /// Switch the TUI chat view back to the main agent.
     pub fn watch_main_agent(&mut self) {
         self.current_subagent_view = None;
+    }
+
+    /// Dispatch the memory subagent's recall pass for a just-submitted user
+    /// message.
+    ///
+    /// No-op unless memory is enabled with `auto_recall` and no recall pass
+    /// is already running. The main stream is withheld until the pass
+    /// completes (see [`App::awaiting_memory_recall`]).
+    pub fn maybe_dispatch_memory_recall(&mut self, user_prompt: &str) {
+        if !self.memory.enabled() || !self.config.agent.memory.auto_recall {
+            return;
+        }
+        if self.memory.pending_recall.is_some() || self.memory.pending_write.is_some() {
+            return;
+        }
+        let Some(definition) = self.agent_registry.get_by_role(AgentRole::Memory).cloned() else {
+            return;
+        };
+        let task = crate::memory::recall_task(user_prompt, &self.memory.memory_dir);
+        let id = self.spawn_memory_subagent(&definition, task);
+        self.memory.pending_recall = Some(id);
+        self.status = AppStatus::RunningTool;
+        self.status_message = "Recalling memory...".to_string();
+    }
+
+    /// Dispatch the memory subagent's summarize/write pass for the turn that
+    /// just completed.
+    ///
+    /// Runs in the background: the finished turn is already visible to the
+    /// user, and the pass reports through a subagent event when done.
+    pub fn maybe_dispatch_memory_write(&mut self) {
+        if !self.memory.enabled() || !self.config.agent.memory.auto_write {
+            return;
+        }
+        if self.memory.pending_recall.is_some() || self.memory.pending_write.is_some() {
+            return;
+        }
+        let Some(definition) = self.agent_registry.get_by_role(AgentRole::Memory).cloned() else {
+            return;
+        };
+        let transcript = crate::memory::format_transcript(&self.messages);
+        if transcript.trim().is_empty() {
+            return;
+        }
+        let task = crate::memory::summarize_task(&transcript, &self.memory.memory_dir);
+        let id = self.spawn_memory_subagent(&definition, task);
+        log::info!("memory write pass dispatched as {}", id);
+        self.memory.pending_write = Some(id);
+    }
+
+    fn spawn_memory_subagent(
+        &mut self,
+        definition: &AgentDefinition,
+        task: String,
+    ) -> crate::subagent::SubagentId {
+        self.subagents.spawn(
+            definition,
+            task,
+            crate::subagent::SubagentContextMode::Create,
+            self.messages.clone(),
+            self.shell_state.clone(),
+            self.active_skills.clone(),
+            self.skill_registry.clone(),
+            None,
+        )
+    }
+
+    /// Whether a user-submitted message is still waiting for its memory
+    /// recall pass to finish (the main stream must not start yet).
+    pub fn awaiting_memory_recall(&self) -> bool {
+        self.memory.pending_recall.is_some()
+    }
+
+    /// Drive the subagent event loop until both pending memory passes have
+    /// finished. Used by headless (`--test`) mode where nothing else drains
+    /// `subagents.event_rx`.
+    pub async fn await_memory_passes(&mut self) {
+        while self.memory.pending_recall.is_some() || self.memory.pending_write.is_some() {
+            match self.subagents.event_rx.recv().await {
+                Some(event) => {
+                    self.handle_subagent_event(event);
+                }
+                None => {
+                    self.memory.pending_recall = None;
+                    self.memory.pending_write = None;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Human-readable summary of the memory subsystem, shown by `/memory`.
+    pub fn memory_status_list(&self) -> String {
+        let mut lines = vec![format!(
+            "memory store: {}",
+            self.memory.memory_dir.display()
+        )];
+        lines.push(format!(
+            "state: {}",
+            if self.memory.available {
+                if self.memory.session_enabled {
+                    "enabled"
+                } else {
+                    "disabled for this session (/memory on)"
+                }
+            } else {
+                "unavailable (enable [agent.memory] and provide a role: memory agent)"
+            }
+        ));
+        lines.push(format!(
+            "auto_recall: {}, auto_write: {}",
+            self.config.agent.memory.auto_recall, self.config.agent.memory.auto_write
+        ));
+        if self.memory.pending_recall.is_some() {
+            lines.push("recall pass: running".to_string());
+        }
+        if self.memory.pending_write.is_some() {
+            lines.push("write pass: running".to_string());
+        }
+        lines.join("\n")
+    }
+
+    /// Toggle the session-level memory switch (`/memory on|off`).
+    pub fn set_memory_enabled(&mut self, enabled: bool) -> String {
+        if !self.memory.available {
+            return "memory is unavailable; enable [agent.memory] and provide a role: memory agent"
+                .to_string();
+        }
+        self.memory.session_enabled = enabled;
+        self.persist_session();
+        if enabled {
+            "memory enabled for this session".to_string()
+        } else {
+            "memory disabled for this session".to_string()
+        }
     }
 
     /// Return a human-readable status list of running subagents.
@@ -1159,8 +1306,8 @@ impl App {
     /// Build the key/value state persisted alongside the conversation.
     fn persist_state(&self) -> std::collections::HashMap<String, String> {
         use crate::history::{
-            STATE_PENDING_INTERACTION, STATE_PENDING_TOOL_CALLS, STATE_SHELL_CWD,
-            STATE_SHELL_EXPORTED, STATE_SHELL_VARS, STATE_TODOS,
+            STATE_MEMORY_ENABLED, STATE_PENDING_INTERACTION, STATE_PENDING_TOOL_CALLS,
+            STATE_SHELL_CWD, STATE_SHELL_EXPORTED, STATE_SHELL_VARS, STATE_TODOS,
         };
         let mut state = std::collections::HashMap::new();
         state.insert(
@@ -1185,6 +1332,10 @@ impl App {
         if let Ok(json) = serde_json::to_string(&self.todos) {
             state.insert(STATE_TODOS.to_string(), json);
         }
+        state.insert(
+            STATE_MEMORY_ENABLED.to_string(),
+            self.memory.session_enabled.to_string(),
+        );
         state
     }
 
@@ -1283,9 +1434,39 @@ impl App {
                     id,
                     result.len()
                 ));
-                // Inject the result as a tool response if the parent is waiting
-                // for this subagent.
-                if let Some(sub) = self.subagents.get(id) {
+                // Memory passes are dispatched internally (no parent call id)
+                // and resume the turn differently from `task` results.
+                if self.memory.pending_recall.as_deref() == Some(id.as_str()) {
+                    self.memory.pending_recall = None;
+                    match crate::memory::parse_recall_result(result) {
+                        Some(parsed) if parsed.recall => {
+                            let memory = crate::memory::truncate_recall(&parsed.memory);
+                            if !memory.trim().is_empty() {
+                                self.messages.push(Message::system(format!(
+                                    "Recalled memory from the Agent Memory store:\n{}",
+                                    memory.trim()
+                                )));
+                            }
+                        }
+                        Some(_) => log::info!("memory recall pass returned recall=false"),
+                        None => log::warn!("memory recall pass returned an unparseable result"),
+                    }
+                    // The user's turn was withheld for the recall pass; start
+                    // the main stream with whatever was injected.
+                    should_resume = true;
+                } else if self.memory.pending_write.as_deref() == Some(id.as_str()) {
+                    self.memory.pending_write = None;
+                    match crate::memory::parse_write_result(result) {
+                        Some(parsed) if parsed.written => {
+                            log::info!("memory write pass recorded: {}", parsed.summary);
+                            self.add_event_message(format!("memory updated: {}", parsed.summary));
+                        }
+                        Some(_) => log::info!("memory write pass recorded nothing"),
+                        None => log::warn!("memory write pass returned an unparseable result"),
+                    }
+                } else if let Some(sub) = self.subagents.get(id) {
+                    // Inject the result as a tool response if the parent is
+                    // waiting for this subagent.
                     if sub.parent_call_id.is_some() {
                         let call_id = sub.parent_call_id.clone().unwrap();
                         self.messages.push(Message::tool(
@@ -1299,7 +1480,16 @@ impl App {
             SubagentEvent::Error { id, error } => {
                 log::error!("subagent {} error: {}", id, error);
                 self.add_event_message(format!("subagent {} error: {}", id, error));
-                if let Some(sub) = self.subagents.get(id) {
+                // A failed memory pass degrades to "no memory" instead of
+                // blocking the user's turn.
+                if self.memory.pending_recall.as_deref() == Some(id.as_str()) {
+                    self.memory.pending_recall = None;
+                    log::warn!("memory recall pass failed; continuing without memory");
+                    should_resume = true;
+                } else if self.memory.pending_write.as_deref() == Some(id.as_str()) {
+                    self.memory.pending_write = None;
+                    log::warn!("memory write pass failed: {}", error);
+                } else if let Some(sub) = self.subagents.get(id) {
                     if sub.parent_call_id.is_some() {
                         let call_id = sub.parent_call_id.clone().unwrap();
                         self.messages.push(Message::tool(
@@ -1448,6 +1638,18 @@ impl App {
             self.todos = todos;
         }
 
+        // Session-level memory toggle. Interrupted memory passes are not
+        // restarted; they degrade to "no memory" for the resumed turn.
+        if let Some(enabled) = snapshot
+            .state
+            .get(crate::history::STATE_MEMORY_ENABLED)
+            .and_then(|s| s.parse::<bool>().ok())
+        {
+            self.memory.session_enabled = enabled;
+        }
+        self.memory.pending_recall = None;
+        self.memory.pending_write = None;
+
         // Subagents: terminal records restore as-is; still-running ones
         // restart their turn loop from the saved messages.
         let parent_shell = self.shell_state.clone();
@@ -1553,6 +1755,9 @@ impl App {
                     self.clear_pending_tool_calls();
                 } else {
                     log::info!("no pending tool call; turn complete");
+                    // Turn finished: hand the transcript to the memory
+                    // subagent's summarize/write pass (runs in background).
+                    self.maybe_dispatch_memory_write();
                 }
                 self.persist_session();
             }
@@ -1603,6 +1808,12 @@ mod tests {
                     performance: "test-model".to_string(),
                     efficient: None,
                 },
+                memory: crate::config::MemoryConfig {
+                    enabled: false,
+                    path: dir.join("memory"),
+                    auto_recall: true,
+                    auto_write: true,
+                },
             },
             shell: None,
             mcp: None,
@@ -1630,6 +1841,7 @@ mod tests {
             allowed_tools: Vec::new(),
             permission: None,
             skills: Vec::new(),
+            role: Some(AgentRole::Main),
             body: "test prompt".to_string(),
             source_path: std::path::PathBuf::new(),
         };
@@ -1660,6 +1872,7 @@ mod tests {
             allowed_tools: Vec::new(),
             permission: None,
             skills: Vec::new(),
+            role: Some(AgentRole::Main),
             body: "test prompt".to_string(),
             source_path: std::path::PathBuf::new(),
         };
@@ -2810,5 +3023,222 @@ log_level = "info"
         assert!(!app.complete_interaction(Vec::new()));
         assert!(!app.cancel_interaction());
         assert!(app.messages.iter().all(|m| m.role != Role::Tool));
+    }
+
+    /// Build a config whose agent definitions live in `dir` (must contain
+    /// `main.md` and, optionally, a `role: memory` agent) with memory enabled.
+    fn memory_test_config(dir: &std::path::Path, auto_write: bool) -> AppConfig {
+        let mut config = test_config_with_history_dir(dir);
+        config.agent.agent_paths = Some(vec![dir.to_path_buf()]);
+        config.agent.memory = crate::config::MemoryConfig {
+            enabled: true,
+            path: dir.join("memory-book"),
+            auto_recall: true,
+            auto_write,
+        };
+        // Keep the spawned memory runner away from real hosts.
+        config.providers[0].base_url = "http://127.0.0.1:9/v1".to_string();
+        config
+    }
+
+    fn write_agent_files(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("main.md"),
+            "---\nname: main\ndescription: Main agent.\n---\nMain body.",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("memory.md"),
+            "---\nname: memory\ndescription: Memory agent.\nrole: memory\nmodel: efficient\n\
+             tools: [shell, read, edit]\n---\nMemory agent body.",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_recall_dispatch_withholds_and_injects() {
+        let dir = std::env::temp_dir().join(format!("catus_memory_recall_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_agent_files(&dir);
+
+        let config = memory_test_config(&dir, false);
+        let mut app = App::new(config);
+        assert!(app.memory.available, "memory should be available");
+        assert!(app.memory.warnings.is_empty());
+
+        // Submitting a user message dispatches the recall pass and withholds
+        // the main stream.
+        app.input_state.input = "how do I configure the release profile?".to_string();
+        assert!(app.submit_user_message().is_some());
+        assert!(app.awaiting_memory_recall());
+        assert_eq!(app.status, AppStatus::RunningTool);
+
+        // A recall=true completion injects the memory as a system message and
+        // clears the pending state.
+        let id = app.memory.pending_recall.clone().unwrap();
+        app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {
+            id: id.clone(),
+            result: r#"{"recall": true, "memory": "user prefers release.profile opt-level=3"}"#
+                .to_string(),
+        });
+        assert!(!app.awaiting_memory_recall());
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.is_system() && m.content.contains("opt-level=3"))
+        );
+
+        // A recall=false completion injects nothing (the recall injected for
+        // the first turn stays in the conversation).
+        app.input_state.input = "hi".to_string();
+        assert!(app.submit_user_message().is_some());
+        assert!(app.awaiting_memory_recall());
+        let id = app.memory.pending_recall.clone().unwrap();
+        let recalled = app
+            .messages
+            .iter()
+            .filter(|m| m.is_system() && m.content.contains("Recalled memory"))
+            .count();
+        app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {
+            id,
+            result: r#"{"recall": false}"#.to_string(),
+        });
+        assert!(!app.awaiting_memory_recall());
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|m| m.is_system() && m.content.contains("Recalled memory"))
+                .count(),
+            recalled
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_recall_failure_degrades_to_no_memory() {
+        let dir = std::env::temp_dir().join(format!("catus_memory_err_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_agent_files(&dir);
+
+        let config = memory_test_config(&dir, false);
+        let mut app = App::new(config);
+        app.input_state.input = "hello".to_string();
+        assert!(app.submit_user_message().is_some());
+        assert!(app.awaiting_memory_recall());
+
+        let id = app.memory.pending_recall.clone().unwrap();
+        app.handle_subagent_event(crate::subagent::SubagentEvent::Error {
+            id,
+            error: "llm unavailable".to_string(),
+        });
+        assert!(!app.awaiting_memory_recall());
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.is_system() && m.content.contains("Recalled memory"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_write_pass_runs_after_turn_completion() {
+        let dir = std::env::temp_dir().join(format!("catus_memory_write_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_agent_files(&dir);
+
+        let config = memory_test_config(&dir, true);
+        let mut app = App::new(config);
+
+        // No user message yet: nothing to summarize.
+        app.maybe_dispatch_memory_write();
+        assert!(app.memory.pending_write.is_none());
+
+        app.messages.push(Message::user("remember I like rust"));
+        app.messages.push(Message::assistant("noted"));
+        app.maybe_dispatch_memory_write();
+        let id = app.memory.pending_write.clone().expect("write dispatched");
+        // The dispatched task contains the turn transcript and the store path.
+        let task = &app.subagents.get(&id).unwrap().task;
+        assert!(task.contains("remember I like rust"));
+        assert!(task.contains("memory-book"));
+
+        // A written=false result clears the pass without an event line.
+        app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {
+            id: id.clone(),
+            result: r#"{"written": false}"#.to_string(),
+        });
+        assert!(app.memory.pending_write.is_none());
+
+        // A written=true result reports what was recorded.
+        app.maybe_dispatch_memory_write();
+        let id = app.memory.pending_write.clone().unwrap();
+        app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {
+            id,
+            result: r#"{"written": true, "summary": "likes rust"}"#.to_string(),
+        });
+        assert!(app.memory.pending_write.is_none());
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.is_event() && m.content.contains("memory updated: likes rust"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_disabled_config_never_dispatches() {
+        let dir = std::env::temp_dir().join(format!("catus_memory_off_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_agent_files(&dir);
+
+        let mut config = memory_test_config(&dir, true);
+        config.agent.memory.enabled = false;
+        let mut app = App::new(config);
+        assert!(!app.memory.available);
+
+        app.input_state.input = "hello".to_string();
+        assert!(app.submit_user_message().is_some());
+        assert!(!app.awaiting_memory_recall());
+        app.maybe_dispatch_memory_write();
+        assert!(app.memory.pending_write.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_session_toggle_is_persisted_and_restored() {
+        let dir = std::env::temp_dir().join(format!("catus_memory_toggle_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_agent_files(&dir);
+
+        let config = memory_test_config(&dir, true);
+        let mut app = App::new(config);
+        app.input_state.input = "remember this".to_string();
+        assert!(app.submit_user_message().is_some());
+        // Drain the recall pass before toggling (one pass at a time).
+        let id = app.memory.pending_recall.clone().unwrap();
+        app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {
+            id,
+            result: r#"{"recall": false}"#.to_string(),
+        });
+
+        // Turning memory off persists the toggle in the session state.
+        let msg = app.set_memory_enabled(false);
+        assert!(msg.contains("disabled"));
+        assert!(
+            app.persist_state()
+                .contains_key(crate::history::STATE_MEMORY_ENABLED)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
