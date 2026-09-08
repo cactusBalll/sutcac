@@ -199,6 +199,7 @@ mod tests {
             shell_state,
             skill_registry,
             active_skills,
+            todos: Box::leak(Box::new(crate::tool::TodoList::new())),
             messages,
             toolbox,
             agent_registry: None,

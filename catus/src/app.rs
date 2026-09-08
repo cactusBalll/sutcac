@@ -16,8 +16,8 @@ use crate::skills::SkillRegistry;
 use crate::subagent::SubagentManager;
 use crate::tool::{
     AskAnswer, AskPermissionTool, AskQuestion, AskUserTool, EditTool, GRANT_SESSION, ShellTool,
-    SkillTool, TaskSyncTool, TaskTool, Tool, ToolCall, ToolContext, ToolResult, Toolbox,
-    parse_ask_permission_tags,
+    SkillTool, TaskSyncTool, TaskTool, TodoList, TodoTool, Tool, ToolCall, ToolContext, ToolResult,
+    Toolbox, parse_ask_permission_tags,
 };
 
 pub mod chat_state;
@@ -105,6 +105,8 @@ pub struct App {
     pub skill_registry: SkillRegistry,
     /// Names of skills currently active in the conversation.
     pub active_skills: Vec<String>,
+    /// Session TODO list, only used by the main agent's `todo` tool.
+    pub todos: TodoList,
     /// Connected MCP servers, if any.
     pub mcp_manager: Option<Arc<McpManager>>,
     /// All tools available to the LLM: built-in plus MCP-converted.
@@ -214,6 +216,8 @@ impl App {
         // Task dispatch tools are only available to the main agent.
         toolbox.register(std::sync::Arc::new(TaskTool));
         toolbox.register(std::sync::Arc::new(TaskSyncTool));
+        // The TODO list is a main-agent-only session tool.
+        toolbox.register(std::sync::Arc::new(TodoTool));
 
         // Apply the main agent's allowed-tools filter if it specifies any.
         let toolbox = if main_agent.allowed_tools.is_empty() || main_agent.inherits_tools() {
@@ -262,6 +266,7 @@ impl App {
             current_subagent_view: None,
             skill_registry,
             active_skills: Vec::new(),
+            todos: TodoList::new(),
             mcp_manager: None,
             toolbox,
             status: AppStatus::Idle,
@@ -957,6 +962,7 @@ impl App {
                     shell_state: &mut self.shell_state,
                     skill_registry: &mut self.skill_registry,
                     active_skills: &mut self.active_skills,
+                    todos: &mut self.todos,
                     messages: &mut self.messages,
                     toolbox: &self.toolbox,
                     agent_registry: Some(&mut self.agent_registry),
@@ -1132,7 +1138,7 @@ impl App {
     fn persist_state(&self) -> std::collections::HashMap<String, String> {
         use crate::history::{
             STATE_PENDING_INTERACTION, STATE_PENDING_TOOL_CALLS, STATE_SHELL_CWD,
-            STATE_SHELL_EXPORTED, STATE_SHELL_VARS,
+            STATE_SHELL_EXPORTED, STATE_SHELL_VARS, STATE_TODOS,
         };
         let mut state = std::collections::HashMap::new();
         state.insert(
@@ -1153,6 +1159,9 @@ impl App {
         }
         if let Ok(json) = serde_json::to_string(&self.shell_state.exported) {
             state.insert(STATE_SHELL_EXPORTED.to_string(), json);
+        }
+        if let Ok(json) = serde_json::to_string(&self.todos) {
+            state.insert(STATE_TODOS.to_string(), json);
         }
         state
     }
@@ -1406,6 +1415,15 @@ impl App {
             .and_then(|j| serde_json::from_str(j).ok())
         {
             self.shell_state.exported = exported;
+        }
+
+        // Main agent's TODO list.
+        if let Some(todos) = snapshot
+            .state
+            .get(crate::history::STATE_TODOS)
+            .and_then(|j| serde_json::from_str(j).ok())
+        {
+            self.todos = todos;
         }
 
         // Subagents: terminal records restore as-is; still-running ones
@@ -1717,6 +1735,51 @@ mod tests {
         let id = store.find_session("existing").unwrap().unwrap();
         let snap = store.load_session(id).unwrap().unwrap();
         assert!(snap.messages.iter().any(|m| m.content == "new"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn todo_list_survives_resume() {
+        let dir = std::env::temp_dir().join(format!("catus_resume_todo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Drive the todo tool through the normal dispatch path so persistence
+        // happens exactly as it does in production.
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.pending_tool_calls.push(ToolCall {
+            id: "call-todo-1".to_string(),
+            name: "todo".to_string(),
+            arguments: r#"{"action":"add","items":["write lexer","write parser"]}"#.to_string(),
+        });
+        app.run_pending_tool().await;
+        app.pending_tool_calls.push(ToolCall {
+            id: "call-todo-2".to_string(),
+            name: "todo".to_string(),
+            arguments: r#"{"action":"complete","id":1}"#.to_string(),
+        });
+        app.run_pending_tool().await;
+        assert!(app.todos.items()[0].done);
+        assert_eq!(app.todos.items()[1].text, "write parser");
+        let name = app.session_name.clone();
+
+        // A fresh process resumes the session and finds the same list.
+        let mut app2 = App::new(test_config_with_history_dir(&dir));
+        app2.resume_history(Some(&name)).await.unwrap();
+        assert_eq!(app2.todos, app.todos);
+        assert!(app2.todos.items()[0].done);
+        assert!(!app2.todos.items()[1].done);
+
+        // The tool stays usable after the resume and keeps ids stable.
+        app2.pending_tool_calls.push(ToolCall {
+            id: "call-todo-3".to_string(),
+            name: "todo".to_string(),
+            arguments: r#"{"action":"add","items":["write exec"]}"#.to_string(),
+        });
+        app2.run_pending_tool().await;
+        assert_eq!(app2.todos.items()[2].id, 3);
+        assert!(app2.todos.items()[2].text == "write exec");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

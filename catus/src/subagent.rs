@@ -512,6 +512,8 @@ fn build_subagent_toolbox(parent_toolbox: &Toolbox, definition: &AgentDefinition
 
     // Subagents never get task-dispatch tools.
     allowed.retain(|n| n != "task" && n != "taskSync");
+    // Subagents never get the main agent's TODO list tool.
+    allowed.retain(|n| n != "todo");
     // Subagents always get completeTask.
     if !allowed.iter().any(|n| n == "completeTask") {
         allowed.push("completeTask".to_string());
@@ -807,10 +809,12 @@ impl SubagentRunner {
                             AppConfig::default(),
                             None,
                         );
+                        let mut dummy_todos = crate::tool::TodoList::new();
                         let mut ctx = ToolContext {
                             shell_state: &mut self.shell_state,
                             skill_registry: &mut self.skill_registry,
                             active_skills: &mut self.active_skills,
+                            todos: &mut dummy_todos,
                             messages: &mut self.messages,
                             toolbox: &self.toolbox,
                             agent_registry: Some(&mut dummy_agent_registry),

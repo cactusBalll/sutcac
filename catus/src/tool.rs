@@ -10,6 +10,7 @@
 //! - `skill` — the built-in `use_skill` tool ([`SkillTool`]);
 //! - `ask_user` — the built-in interactive `ask_user` tool ([`AskUserTool`]);
 //! - `ask_permission` — the built-in `ask_permission` tool ([`AskPermissionTool`]);
+//! - `todo` — the built-in main-agent-only `todo` tool ([`TodoTool`]);
 //! - `crate::mcp` — tools converted from MCP servers (`McpTool`).
 //!
 //! The application (`app.rs`) acts as the composition root: it registers the
@@ -23,6 +24,7 @@ mod shell;
 mod skill;
 mod task;
 mod task_sync;
+mod todo;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -46,6 +48,7 @@ pub use shell::ShellTool;
 pub use skill::SkillTool;
 pub use task::TaskTool;
 pub use task_sync::TaskSyncTool;
+pub use todo::{TodoItem, TodoList, TodoTool};
 
 /// Mutable host state made available to tools while they execute.
 ///
@@ -54,6 +57,8 @@ pub struct ToolContext<'a> {
     pub shell_state: &'a mut ShellState,
     pub skill_registry: &'a mut SkillRegistry,
     pub active_skills: &'a mut Vec<String>,
+    /// Session TODO list. Only the main agent's `todo` tool uses it.
+    pub todos: &'a mut TodoList,
     pub messages: &'a mut Vec<Message>,
     pub toolbox: &'a Toolbox,
     pub agent_registry: Option<&'a mut AgentRegistry>,

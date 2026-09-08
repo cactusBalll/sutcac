@@ -38,6 +38,8 @@ pub const STATE_SHELL_CWD: &str = "shell_cwd";
 pub const STATE_SHELL_VARS: &str = "shell_vars";
 /// `session_state` key holding the shell's exported variable names.
 pub const STATE_SHELL_EXPORTED: &str = "shell_exported";
+/// `session_state` key holding the JSON of the main agent's TODO list.
+pub const STATE_TODOS: &str = "todos";
 
 /// Wire-format mirror of [`ToolCall`] for persistence. [`ToolCall`]'s own
 /// `Serialize` impl produces the API request shape (`{"function": {...}}`),
