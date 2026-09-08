@@ -68,6 +68,7 @@ The file `main.md` is required. Its body becomes the main system prompt, and its
 - The main agent can dispatch tasks to subagents via the `task` (async) or `taskSync` (blocks until completion) tools.
 - Subagents report results by calling `completeTask`.
 - Subagents cannot spawn further subagents.
+- Subagent permissions always follow their declaration: both context modes rebuild the shell's `PermissionPolicy` from the agent's `permission` frontmatter (falling back to the configured `[shell]` policy), so parent session grants or `/auto` never leak into subagents. `fork` still inherits the parent's env/vars/cwd.
 - Use `@agent_name <task>` in the input line as a shorthand for `/agent use <agent_name> <task>`.
 - Use `/agent list`, `/agent status`, `/agent use`, `/agent watch`, and `/agent close` to manage and observe subagents.
 
@@ -127,7 +128,7 @@ Checked before every external command and redirection; denials return non-zero a
 
 - `perm_mode = "allow_all" | allow:<tags> | deny:<tags> | allow:<tags> deny:<tags> | allow1:<cmds> | deny1:<cmds>`
 - Tags are arbitrary custom strings (`read`, `write`, `network`, …); required set must be covered by allow and disjoint from deny. `deny1` beats `allow1`.
-- Per-command tags come from `[shell.commands]`; unlisted external commands default to READ+WRITE. Shorthand `read = [...]` / `write = [...]` under `[shell]` tags whole command lists; explicit `commands` entries win.
+- Per-command tags come from `[shell.commands]`; unlisted external commands default to READ+WRITE. Shorthand `read = [...]` / `write = [...]` / `rw = [...]` under `[shell]` tags whole command lists (`rw` grants both READ and WRITE); explicit `commands` entries win.
 - Path-based access control: `read_paths = ["/home/user/data"]` restricts command arguments and input redirects to those directories; `write_paths = ["/home/user/projects"]` restricts output redirects and the arguments of commands that require WRITE. Empty lists disable the restriction. Commands must be tagged READ to read from `read_paths` without also being in `write_paths`.
 
 ## Non-obvious implementation facts
@@ -142,6 +143,7 @@ Checked before every external command and redirection; denials return non-zero a
 - MCP tool names are prefixed with `{server_name}__` so the LLM can call the right server; each discovered tool is wrapped in an `McpTool` (`mcp.rs`) holding a shared `Arc<McpManager>`.
 - All LLM-callable tools implement the `Tool` trait defined in `tool.rs` (dyn-safe via a boxed-future `execute`, no `async-trait` dependency) and live in a `Toolbox` on `App`. Two sources: built-ins, one per file under `tool/` (`tool/shell.rs` = `ShellTool`, `tool/skill.rs` = `SkillTool`), and MCP-converted (`McpTool` in `mcp.rs`). `tool.rs` is generic infrastructure — `ToolCall` carries no per-tool semantics (argument parsing lives in each tool, e.g. `parse_command` in `tool/shell.rs`), and `App::new` is the composition root that registers the built-ins. `app.rs::run_pending_tool` dispatches purely by advertised tool name through `Toolbox::get`; `llm.rs` receives the full definition list from the caller and hardcodes nothing.
 - `SkillTool` (`use_skill`) activates skills via tool calls, not text markers: it loads the skill instructions through a `ToolContext` (`shell_state`, `skill_registry`, `active_skills`, `messages`) passed in by `App` at dispatch time.
+- `AskPermissionTool` (`ask_permission`, `tool/ask_permission.rs`) lets the model request one or more permission tags after a denial (`{"tags": [...]}`, comma-separated strings accepted too). It returns an `InteractionRequest` like `ask_user`; the user picks "Allow for this session" / "Deny" in the ask overlay, and `App::complete_interaction` applies the choice via `PermissionPolicy::grant_tag` (`sutcac-sh`). Grants persist for the rest of the session and bypass the mode's allow/deny sets. Inside subagents the interaction is rejected like `ask_user`.
 - `AskUserTool` (`ask_user`, `tool/ask_user.rs`) never blocks on user input — `run_pending_tool` awaits tools inline in the event loop, so a blocking tool would deadlock. Instead `execute` validates the questions and returns a `ToolResult` whose `interaction` field is `Some(InteractionRequest)`; `run_pending_tool` then stashes the call in `App.pending_interaction`, opens `Overlay::Ask`, and returns without pushing a result message. The overlay collects answers (one question at a time; the last row is always an "Other" free-text option), and `App::complete_interaction` / `cancel_interaction` append the final `ToolResult` message and resume the turn via `AppAction::StartStream`.
 
 ## Conventions
@@ -160,6 +162,7 @@ Checked before every external command and redirection; denials return non-zero a
 - The `ask_user` tool opens the question overlay (`Overlay::Ask`): one question at a time with progress `i/N`, ↑/↓ move across options plus a final "Other" row where typing edits the text; Enter chooses the focused option (single-select) or confirms the checked options (multi-select, Space toggles); Esc cancels the whole question and reports "user cancelled" back to the model.
 - `/mcp list` shows configured MCP servers and their discovered tools; `/mcp status` shows how many servers are connected.
 - `/model list` lists configured models (current one marked); `/model <name>` switches by id or display name; bare `/model` opens the model picker overlay. Switching rebuilds the `LlmClient` and takes effect on the next request.
+- `/permission [grant <tags> | revoke <tags> | reset]` inspects and adjusts the main agent's session permission policy (grants apply only to the main agent; subagents always use the permissions declared in their definition); `/auto` switches the session policy to `allow_all` (path restrictions kept, session grants cleared).
 - Status bar keeps a compact right-aligned `ctx N tok | total M`; full details are in the /status page.
 - Streaming requests set `stream_options.include_usage`; the returned `Usage` (incl. cached tokens) accumulates in `App.usage`.
 

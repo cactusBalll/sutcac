@@ -9,11 +9,13 @@
 //! - `edit` — the built-in precise file-editing `edit` tool ([`EditTool`]);
 //! - `skill` — the built-in `use_skill` tool ([`SkillTool`]);
 //! - `ask_user` — the built-in interactive `ask_user` tool ([`AskUserTool`]);
+//! - `ask_permission` — the built-in `ask_permission` tool ([`AskPermissionTool`]);
 //! - `crate::mcp` — tools converted from MCP servers (`McpTool`).
 //!
 //! The application (`app.rs`) acts as the composition root: it registers the
 //! built-in tools at startup and MCP tools as servers connect.
 
+mod ask_permission;
 mod ask_user;
 mod complete_task;
 mod edit;
@@ -34,6 +36,7 @@ use crate::message::Message;
 use crate::skills::SkillRegistry;
 use crate::subagent::SubagentManager;
 
+pub use ask_permission::{AskPermissionTool, GRANT_DENY, GRANT_SESSION, parse_ask_permission_tags};
 pub use ask_user::{
     Answer, AskAnswer, AskOption, AskQuestion, AskUserTool, InteractionRequest, collect_answer,
 };

@@ -15,8 +15,9 @@ use crate::message::{Message, Role};
 use crate::skills::SkillRegistry;
 use crate::subagent::SubagentManager;
 use crate::tool::{
-    AskAnswer, AskQuestion, AskUserTool, EditTool, ShellTool, SkillTool, TaskSyncTool, TaskTool,
-    Tool, ToolCall, ToolContext, ToolResult, Toolbox,
+    AskAnswer, AskPermissionTool, AskQuestion, AskUserTool, EditTool, GRANT_SESSION, ShellTool,
+    SkillTool, TaskSyncTool, TaskTool, Tool, ToolCall, ToolContext, ToolResult, Toolbox,
+    parse_ask_permission_tags,
 };
 
 pub mod chat_state;
@@ -209,6 +210,7 @@ impl App {
         toolbox.register(std::sync::Arc::new(EditTool));
         toolbox.register(std::sync::Arc::new(SkillTool));
         toolbox.register(std::sync::Arc::new(AskUserTool));
+        toolbox.register(std::sync::Arc::new(AskPermissionTool));
         // Task dispatch tools are only available to the main agent.
         toolbox.register(std::sync::Arc::new(TaskTool));
         toolbox.register(std::sync::Arc::new(TaskSyncTool));
@@ -827,6 +829,91 @@ impl App {
         self.pending_tool_calls.len()
     }
 
+    /// Human-readable summary of the main agent's current shell permission
+    /// policy: mode, interactively granted session tags, and path
+    /// restrictions.
+    pub fn permission_summary(&self) -> String {
+        let policy = &self.shell_state.permissions;
+        let mode = match &policy.mode {
+            sutcac_sh::permissions::PermissionMode::AllowAll => "allow_all".to_string(),
+            sutcac_sh::permissions::PermissionMode::Deny(deny) => format!("deny:{}", deny),
+            sutcac_sh::permissions::PermissionMode::AllowOnly(allow) => format!("allow:{}", allow),
+            sutcac_sh::permissions::PermissionMode::Restrict { allow, deny } => {
+                format!("allow:{} deny:{}", allow, deny)
+            }
+        };
+        let mut lines = vec![
+            format!("mode: {}", mode),
+            format!(
+                "session grants: {}",
+                if policy.session_grants.is_empty() {
+                    "none".to_string()
+                } else {
+                    policy.session_grants.to_string()
+                }
+            ),
+            format!(
+                "path restrictions: {}",
+                if policy.read_paths.is_empty() && policy.write_paths.is_empty() {
+                    "none".to_string()
+                } else {
+                    format!(
+                        "read: {} dir(s), write: {} dir(s)",
+                        policy.read_paths.len(),
+                        policy.write_paths.len()
+                    )
+                }
+            ),
+        ];
+        if !policy.command_permissions.is_empty() {
+            lines.push(format!(
+                "per-command tags: {} command(s)",
+                policy.command_permissions.len()
+            ));
+        }
+        lines.join("\n")
+    }
+
+    /// Grant permission tags to the main agent's shell for the rest of the
+    /// session. `tags` is a comma-separated list (case-insensitive).
+    pub fn grant_session_permissions(&mut self, tags: &str) {
+        self.shell_state.permissions.grant_tag(tags);
+        log::info!("session permissions granted via /permission: {}", tags);
+    }
+
+    /// Revoke previously granted session permission tags from the main
+    /// agent's shell policy. `tags` is a comma-separated list.
+    pub fn revoke_session_permissions(&mut self, tags: &str) {
+        self.shell_state.permissions.revoke_grants(tags);
+        log::info!("session permissions revoked via /permission: {}", tags);
+    }
+
+    /// Reset the main agent's shell permission policy to the configured
+    /// default (drops all session grants).
+    pub fn reset_session_permissions(&mut self) {
+        let (permissions, audit_logger) = self
+            .config
+            .shell
+            .clone()
+            .map(|s| (s.permission_policy(), s.audit_logger()))
+            .unwrap_or_else(|| {
+                let default = ShellConfig::default();
+                (default.permission_policy(), default.audit_logger())
+            });
+        self.shell_state.set_permission_policy(permissions);
+        self.shell_state.set_audit_logger(audit_logger);
+        log::info!("session permissions reset via /permission");
+    }
+
+    /// Switch the main agent's shell permission policy to allow-all for the
+    /// rest of the session. Path restrictions are kept.
+    pub fn set_session_permissions_allow_all(&mut self) {
+        self.shell_state.permissions.mode = sutcac_sh::permissions::PermissionMode::AllowAll;
+        self.shell_state.permissions.session_grants =
+            sutcac_sh::permissions::PermissionSet::empty();
+        log::info!("session permissions switched to allow_all via /auto");
+    }
+
     /// Return true if the per-turn tool round limit has been reached.
     pub fn is_tool_round_limit_reached(&self) -> bool {
         self.tool_rounds_this_turn >= self.max_tool_rounds
@@ -925,6 +1012,52 @@ impl App {
     /// result message, and resume the LLM turn. Returns false when there is
     /// no paused interaction (nothing was done).
     pub fn complete_interaction(&mut self, answers: Vec<AskAnswer>) -> bool {
+        // An `ask_permission` call applies the user's decision to the shell
+        // permission policy instead of returning raw answer JSON.
+        if self
+            .pending_interaction
+            .as_ref()
+            .is_some_and(|(call, _)| call.name == "ask_permission")
+        {
+            let (call, _) = self.pending_interaction.as_ref().unwrap();
+            let tags = parse_ask_permission_tags(&call.arguments);
+            let choice = answers.first().map(|a| match &a.answer {
+                crate::tool::Answer::One(label) => label.as_str(),
+                crate::tool::Answer::Many(labels) => {
+                    labels.first().map(String::as_str).unwrap_or_default()
+                }
+            });
+            let (status, stdout) = match (tags, choice) {
+                (Some(tags), Some(GRANT_SESSION)) => {
+                    for tag in &tags {
+                        self.shell_state.permissions.grant_tag(tag);
+                    }
+                    log::info!("session permissions granted: {}", tags.join(", "));
+                    (
+                        0,
+                        format!(
+                            "granted: permission(s) \"{}\" for this session",
+                            tags.join(", ")
+                        ),
+                    )
+                }
+                (tags, _) => (
+                    1,
+                    format!(
+                        "denied: the user did not grant permission(s) {}",
+                        tags.map(|t| format!("\"{}\"", t.join(", ")))
+                            .unwrap_or_else(|| "(unknown)".to_string())
+                    ),
+                ),
+            };
+            return self.finish_interaction(|call| ToolResult {
+                call,
+                status,
+                stdout,
+                stderr: String::new(),
+                interaction: None,
+            });
+        }
         let stdout = serde_json::to_string(&answers).unwrap_or_else(|e| {
             log::warn!("failed to serialize ask_user answers: {}", e);
             "[]".to_string()
@@ -2518,6 +2651,72 @@ log_level = "info"
         let last = app.messages.last().expect("tool result message");
         assert!(last.content.contains("user cancelled"));
         assert!(app.messages.iter().filter(|m| m.role == Role::Tool).count() == 1);
+    }
+
+    #[test]
+    fn ask_permission_interaction_grants_session_tags() {
+        let mut app = App::new(AppConfig::default());
+        app.shell_state.permissions =
+            sutcac_sh::permissions::PermissionPolicy::parse("deny:network").unwrap();
+        let call = ToolCall {
+            id: "call_perm".to_string(),
+            name: "ask_permission".to_string(),
+            arguments: r#"{"tags":["network","write"],"reason":"curl"}"#.to_string(),
+        };
+        app.messages.push(Message::assistant(String::new()));
+        app.add_tool_call(call.clone());
+        app.pending_interaction = Some((call, Vec::new()));
+
+        let answers = vec![AskAnswer {
+            prompt: "Grant shell permission(s) \"NETWORK, WRITE\"?".to_string(),
+            answer: crate::tool::Answer::One(GRANT_SESSION.to_string()),
+        }];
+        assert!(app.complete_interaction(answers));
+        assert!(!app.has_pending_interaction());
+        let last = app.messages.last().expect("tool result message");
+        assert!(
+            last.content
+                .contains("granted: permission(s) \"NETWORK, WRITE\" for this session")
+        );
+        let mut network = sutcac_sh::permissions::PermissionSet::empty();
+        network.insert(sutcac_sh::permissions::Permission::Custom(
+            "NETWORK".to_string(),
+        ));
+        assert!(app.shell_state.permissions.check(&network).is_ok());
+        assert!(
+            app.shell_state
+                .permissions
+                .check(&sutcac_sh::permissions::PermissionSet::write())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn ask_permission_interaction_deny_reports_denial() {
+        let mut app = App::new(AppConfig::default());
+        app.shell_state.permissions =
+            sutcac_sh::permissions::PermissionPolicy::parse("deny:network").unwrap();
+        let call = ToolCall {
+            id: "call_perm".to_string(),
+            name: "ask_permission".to_string(),
+            arguments: r#"{"tags":["network"]}"#.to_string(),
+        };
+        app.messages.push(Message::assistant(String::new()));
+        app.add_tool_call(call.clone());
+        app.pending_interaction = Some((call, Vec::new()));
+
+        let answers = vec![AskAnswer {
+            prompt: "Grant shell permission(s) \"NETWORK\"?".to_string(),
+            answer: crate::tool::Answer::One(crate::tool::GRANT_DENY.to_string()),
+        }];
+        assert!(app.complete_interaction(answers));
+        let last = app.messages.last().expect("tool result message");
+        assert!(last.content.contains("denied"));
+        let mut network = sutcac_sh::permissions::PermissionSet::empty();
+        network.insert(sutcac_sh::permissions::Permission::Custom(
+            "NETWORK".to_string(),
+        ));
+        assert!(app.shell_state.permissions.check(&network).is_err());
     }
 
     #[test]

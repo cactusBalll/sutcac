@@ -40,6 +40,10 @@ pub struct ShellConfig {
     /// equivalent to listing each command under `[shell.commands]` with
     /// `tags = ["write"]`. Entries in `commands` take precedence.
     pub write: Option<Vec<String>>,
+    /// Shorthand for read-write commands: `rw = ["cp", "ls", ...]` is
+    /// equivalent to listing each command under `[shell.commands]` with
+    /// `tags = ["read", "write"]`. Entries in `commands` take precedence.
+    pub rw: Option<Vec<String>>,
     /// Allowed read-only paths. Commands that read files may only access paths
     /// inside these directories (or inside `write_paths`). Empty means no restriction.
     pub read_paths: Option<Vec<String>>,
@@ -58,6 +62,7 @@ impl Default for ShellConfig {
             commands: None,
             read: None,
             write: None,
+            rw: None,
             read_paths: None,
             write_paths: None,
         }
@@ -168,6 +173,14 @@ impl ShellConfig {
                 }
             }
         }
+        if let Some(names) = &self.rw {
+            for name in names {
+                let mut set = PermissionSet::empty();
+                set.insert(Permission::Read);
+                set.insert(Permission::Write);
+                map.insert(name.clone(), set);
+            }
+        }
         if let Some(commands) = &self.commands {
             for (name, tags) in commands {
                 let mut set = PermissionSet::empty();
@@ -253,6 +266,26 @@ write = ["mkdir"]
         assert_eq!(
             policy.permissions_for_command("mkdir"),
             Some(&PermissionSet::write())
+        );
+        assert!(policy.permissions_for_command("curl").is_none());
+    }
+
+    #[test]
+    fn shorthand_rw_list() {
+        let input = r#"
+[shell]
+perm_mode = "allow:read"
+rw = ["cp", "ls"]
+"#;
+        let file: ConfigFile = toml::from_str(input).unwrap();
+        let shell = file.shell.unwrap();
+        let policy = shell.permission_policy();
+        let perms = policy.permissions_for_command("cp").unwrap();
+        assert!(perms.contains(&Permission::Read));
+        assert!(perms.contains(&Permission::Write));
+        assert_eq!(
+            policy.permissions_for_command("ls"),
+            Some(&PermissionSet::read_write())
         );
         assert!(policy.permissions_for_command("curl").is_none());
     }

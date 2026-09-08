@@ -88,6 +88,11 @@ write = [
   "chmod", "chown", "ln", "mkdir", "rm", "rmdir", "tee", "touch", "truncate",
 ]
 
+# Shorthand for commands needing both tags: equivalent to
+# `tags = ["read", "write"]` under [shell.commands]. Entries in
+# [shell.commands] still take precedence.
+# rw = ["cp", "mv", "dd"]
+
 # Per-command permission tags. Any external command not listed here defaults
 # to READ+WRITE. Entries here override the shorthand lists above.
 [shell.commands]

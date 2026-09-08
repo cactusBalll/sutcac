@@ -615,15 +615,30 @@ impl SubagentRunner {
         parent: &ParentSnapshot,
     ) -> (ShellState, Vec<String>, SkillRegistry) {
         match mode {
-            SubagentContextMode::Fork => (
-                parent.shell_state.clone(),
-                if definition.inherits_skills() {
-                    parent.active_skills.clone()
-                } else {
-                    definition.explicit_skills()
-                },
-                parent.skill_registry.clone(),
-            ),
+            SubagentContextMode::Fork => {
+                // Fork inherits the parent's environment, variables, and cwd,
+                // but permissions always follow the subagent's own
+                // declaration (or the config default) — never the parent's
+                // session-adjusted policy or interactive grants.
+                let mut shell_state = parent.shell_state.clone();
+                let shell_config = {
+                    let mut shell = parent.config.shell.clone().unwrap_or_default();
+                    if let Some(perm) = &definition.permission {
+                        shell.perm_mode = Some(perm.clone());
+                    }
+                    shell
+                };
+                shell_state.set_permission_policy(shell_config.permission_policy());
+                (
+                    shell_state,
+                    if definition.inherits_skills() {
+                        parent.active_skills.clone()
+                    } else {
+                        definition.explicit_skills()
+                    },
+                    parent.skill_registry.clone(),
+                )
+            }
             SubagentContextMode::Create => {
                 let shell_config = {
                     let mut shell = parent.config.shell.clone().unwrap_or_default();
@@ -944,6 +959,80 @@ mod tests {
                 Message::tool("partial result", "call-2"),
             ],
         }
+    }
+
+    #[test]
+    fn fork_context_permissions_follow_agent_declaration() {
+        use sutcac_sh::permissions::{Permission, PermissionSet};
+
+        fn custom_network() -> PermissionSet {
+            let mut set = PermissionSet::empty();
+            set.insert(Permission::Custom("NETWORK".to_string()));
+            set
+        }
+
+        // The parent has an interactive session grant; it must not leak into
+        // the subagent.
+        let mut parent_shell = ShellState::new();
+        parent_shell.permissions =
+            sutcac_sh::permissions::PermissionPolicy::parse("allow:read").unwrap();
+        parent_shell.permissions.grant_tag("network,write");
+        parent_shell
+            .vars
+            .insert("from_parent".to_string(), "1".to_string());
+
+        let dir = std::env::temp_dir().join(format!("catus_sub_fork_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("declared.md"),
+            "---\nname: declared\ndescription: d\npermission: allow:read\n---\nBody.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("undeclared.md"),
+            "---\nname: undeclared\ndescription: u\n---\nBody.\n",
+        )
+        .unwrap();
+        let registry = AgentRegistry::discover(&[dir.to_path_buf()]).unwrap();
+
+        // Config default denies write; the parent's session state is ignored.
+        let mut config = AppConfig::default();
+        config.shell = Some(sutcac_sh::config::ShellConfig {
+            perm_mode: Some("deny:write".to_string()),
+            ..Default::default()
+        });
+        let parent = ParentSnapshot {
+            messages: Vec::new(),
+            shell_state: parent_shell,
+            toolbox: Toolbox::default(),
+            active_skills: Vec::new(),
+            tier_models: TierModels::default(),
+            current_model: unreachable_model(),
+            skill_registry: SkillRegistry::new(),
+            config,
+            mcp_manager: None,
+        };
+
+        // Declared agent: its own permission string wins.
+        let declared = registry.get("declared").unwrap();
+        let (shell, _, _) =
+            SubagentRunner::build_runtime_context(declared, SubagentContextMode::Fork, &parent);
+        assert!(shell.permissions.check(&PermissionSet::read()).is_ok());
+        assert!(shell.permissions.check(&PermissionSet::write()).is_err());
+        assert!(shell.permissions.check(&custom_network()).is_err());
+        // The fork still inherits the parent's environment.
+        assert_eq!(shell.vars.get("from_parent").map(String::as_str), Some("1"));
+
+        // Undeclared agent: falls back to the configured policy, again
+        // without the parent's session grants.
+        let undeclared = registry.get("undeclared").unwrap();
+        let (shell, _, _) =
+            SubagentRunner::build_runtime_context(undeclared, SubagentContextMode::Fork, &parent);
+        assert!(shell.permissions.check(&PermissionSet::write()).is_err());
+        assert!(shell.permissions.check(&custom_network()).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

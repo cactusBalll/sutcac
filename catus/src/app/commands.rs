@@ -489,6 +489,151 @@ impl SlashCommand for ModelCommand {
     }
 }
 
+/// Show or adjust the current session's shell permissions.
+pub struct PermissionCommand;
+
+impl SlashCommand for PermissionCommand {
+    fn name(&self) -> &'static str {
+        "permission"
+    }
+
+    fn description(&self) -> &'static str {
+        "Show or adjust the current session's shell permissions"
+    }
+
+    fn usage(&self) -> &'static str {
+        "/permission [grant <tags> | revoke <tags> | reset]"
+    }
+
+    fn subcommands(&self) -> &[&'static str] {
+        &["grant", "revoke", "reset"]
+    }
+
+    fn help(&self, subcommand: Option<&str>) -> String {
+        match subcommand {
+            Some("grant") => "Usage: /permission grant <tags>\n\
+                 Grant permission tags to the main agent's shell for this session.\n\
+                 Tags are case-insensitive and may be comma-separated, e.g. `network,write`."
+                .to_string(),
+            Some("revoke") => "Usage: /permission revoke <tags>\n\
+                 Revoke previously granted session permission tags (comma-separated)."
+                .to_string(),
+            Some("reset") => "Usage: /permission reset\n\
+                 Reset the session policy to the configured default, dropping all session grants."
+                .to_string(),
+            Some(sub) => format!("Unknown subcommand '{}' for /permission", sub),
+            None => format!(
+                "Usage: {}\n\n\
+                 Without arguments, shows the current permission policy.\n\
+                 Grants apply to the main agent only; subagents always use the permissions\n\
+                 declared in their agent definition.",
+                self.usage()
+            ),
+        }
+    }
+
+    fn execute<'a>(
+        &'a self,
+        app: &'a mut App,
+        args: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), CommandError>> {
+        Box::pin(async move {
+            app.status = AppStatus::Idle;
+            match args.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(args) => {
+                    let mut parts = args.splitn(2, ' ');
+                    let sub = parts.next().unwrap_or("");
+                    let rest = parts.next().map(str::trim).filter(|s| !s.is_empty());
+                    match (sub, rest) {
+                        ("grant", Some(tags)) => {
+                            app.grant_session_permissions(tags);
+                            app.add_event_message(format!(
+                                "granted session permissions: {}",
+                                tags.to_ascii_uppercase()
+                            ));
+                            app.set_transient_message("session permissions granted");
+                        }
+                        ("revoke", Some(tags)) => {
+                            app.revoke_session_permissions(tags);
+                            app.add_event_message(format!(
+                                "revoked session permissions: {}",
+                                tags.to_ascii_uppercase()
+                            ));
+                            app.set_transient_message("session permissions revoked");
+                        }
+                        ("reset", None) => {
+                            app.reset_session_permissions();
+                            app.add_event_message(
+                                "session permissions reset to the configured default".to_string(),
+                            );
+                            app.set_transient_message("session permissions reset");
+                        }
+                        ("grant", None) | ("revoke", None) => {
+                            return Err(format!("usage: /permission {} <tags>", sub).into());
+                        }
+                        ("reset", Some(_)) => {
+                            return Err("usage: /permission reset".into());
+                        }
+                        _ => {
+                            return Err(format!(
+                                "unknown /permission subcommand: {}. Try /permission grant|revoke|reset",
+                                sub
+                            )
+                            .into());
+                        }
+                    }
+                }
+                None => {
+                    app.add_event_message(app.permission_summary());
+                    app.set_transient_message("session permissions listed");
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Switch the current session's shell permissions to allow-all.
+pub struct AutoCommand;
+
+impl SlashCommand for AutoCommand {
+    fn name(&self) -> &'static str {
+        "auto"
+    }
+
+    fn description(&self) -> &'static str {
+        "Switch the current session's shell permissions to allow_all"
+    }
+
+    fn usage(&self) -> &'static str {
+        "/auto"
+    }
+
+    fn help(&self, _subcommand: Option<&str>) -> String {
+        "Usage: /auto\n\n\
+         Sets the main agent's session policy to allow_all and clears session grants.\n\
+         Path restrictions from the config are kept. Subagents always use the permissions\n\
+         declared in their agent definition."
+            .to_string()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        app: &'a mut App,
+        _args: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), CommandError>> {
+        Box::pin(async move {
+            app.status = AppStatus::Idle;
+            app.set_session_permissions_allow_all();
+            app.add_event_message(
+                "session permissions switched to allow_all (path restrictions kept)".to_string(),
+            );
+            app.set_transient_message("session permissions: allow_all");
+            Ok(())
+        })
+    }
+}
+
 /// Show MCP servers and tools.
 pub struct McpCommand;
 
@@ -576,6 +721,8 @@ pub static BUILT_IN_REGISTRY: LazyLock<CommandRegistry> = LazyLock::new(|| {
         Box::new(ModelCommand),
         Box::new(AgentCommand),
         Box::new(SkillCommand),
+        Box::new(PermissionCommand),
+        Box::new(AutoCommand),
         Box::new(McpCommand),
     ])
 });
@@ -688,5 +835,91 @@ mod tests {
             app.status_message
         );
         assert_eq!(app.current_model.id, "model-b");
+    }
+
+    #[tokio::test]
+    async fn permission_command_shows_and_adjusts_session_policy() {
+        use crate::config::AppConfig;
+        use sutcac_sh::permissions::{Permission, PermissionSet};
+
+        fn custom_network() -> PermissionSet {
+            let mut set = PermissionSet::empty();
+            set.insert(Permission::Custom("NETWORK".to_string()));
+            set
+        }
+
+        let mut app = App::new(AppConfig::default());
+        app.shell_state.permissions =
+            sutcac_sh::permissions::PermissionPolicy::parse("deny:network,write").unwrap();
+
+        // Bare /permission shows the current policy.
+        assert!(app.handle_command("/permission").await);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("mode: deny:NETWORK,WRITE"))
+        );
+
+        // Grant tags for the session.
+        assert!(app.handle_command("/permission grant network,write").await);
+        assert!(app.shell_state.permissions.check(&custom_network()).is_ok());
+        assert!(
+            app.shell_state
+                .permissions
+                .check(&PermissionSet::write())
+                .is_ok()
+        );
+        assert!(app.messages.iter().any(|m| {
+            m.content
+                .contains("granted session permissions: NETWORK,WRITE")
+        }));
+
+        // Revoke them again.
+        assert!(app.handle_command("/permission revoke network,write").await);
+        assert!(
+            app.shell_state
+                .permissions
+                .check(&custom_network())
+                .is_err()
+        );
+        assert!(
+            app.shell_state
+                .permissions
+                .check(&PermissionSet::write())
+                .is_err()
+        );
+
+        // Missing argument is an error.
+        assert!(app.handle_command("/permission grant").await);
+        assert!(
+            app.status_message
+                .contains("usage: /permission grant <tags>")
+        );
+
+        // Unknown subcommand is an error.
+        assert!(app.handle_command("/permission bogus").await);
+        assert!(
+            app.status_message
+                .contains("unknown /permission subcommand")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_command_switches_session_policy_to_allow_all() {
+        use crate::config::AppConfig;
+        use sutcac_sh::permissions::{Permission, PermissionSet};
+
+        let mut app = App::new(AppConfig::default());
+        app.shell_state.permissions =
+            sutcac_sh::permissions::PermissionPolicy::parse("deny:network").unwrap();
+        app.shell_state.permissions.grant_tag("network");
+
+        assert!(app.handle_command("/auto").await);
+        assert!(app.messages.iter().any(|m| m.content.contains("allow_all")));
+        let mut network = PermissionSet::empty();
+        network.insert(Permission::Custom("NETWORK".to_string()));
+        assert!(app.shell_state.permissions.check(&network).is_ok());
+        // Session grants are cleared along with the mode switch.
+        assert!(app.shell_state.permissions.session_grants.is_empty());
     }
 }

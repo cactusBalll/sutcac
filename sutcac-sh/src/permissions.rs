@@ -62,6 +62,13 @@ impl PermissionSet {
         }
     }
 
+    pub fn read_write() -> Self {
+        Self {
+            bits: 3,
+            custom: HashSet::new(),
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
             bits: 0,
@@ -217,6 +224,9 @@ pub struct PermissionPolicy {
     pub read_paths: Vec<PathBuf>,
     /// Allowed read-write paths. Empty means no path restriction.
     pub write_paths: Vec<PathBuf>,
+    /// Tags granted interactively for the rest of the session. They bypass
+    /// the mode restrictions (including `deny` lists) for matching checks.
+    pub session_grants: PermissionSet,
 }
 
 /// Error returned when a required permission is denied.
@@ -270,6 +280,7 @@ impl PermissionPolicy {
             deny1: HashSet::new(),
             read_paths: Vec::new(),
             write_paths: Vec::new(),
+            session_grants: PermissionSet::empty(),
         }
     }
 
@@ -357,6 +368,7 @@ impl PermissionPolicy {
             deny1,
             read_paths: Vec::new(),
             write_paths: Vec::new(),
+            session_grants: PermissionSet::empty(),
         };
         for (name, perms) in command_permissions {
             policy.command_permissions.insert(name, perms);
@@ -370,11 +382,15 @@ impl PermissionPolicy {
     }
 
     /// Check whether `required` permissions are allowed under this policy.
+    ///
+    /// Interactively granted session tags count as allowed even when the
+    /// mode would deny them.
     pub fn check(&self, required: &PermissionSet) -> Result<(), PermissionError> {
+        let granted = self.session_grants.clone();
         match &self.mode {
             PermissionMode::AllowAll => Ok(()),
             PermissionMode::Deny(denied) => {
-                let blocked = denied.intersection(required);
+                let blocked = denied.intersection(required).difference(&granted);
                 if blocked.is_empty() {
                     Ok(())
                 } else {
@@ -382,7 +398,8 @@ impl PermissionPolicy {
                 }
             }
             PermissionMode::AllowOnly(allowed) => {
-                let blocked = required.difference(allowed);
+                let allowed = allowed.clone().union(granted.clone());
+                let blocked = required.difference(&allowed);
                 if blocked.is_empty() {
                     Ok(())
                 } else {
@@ -390,8 +407,9 @@ impl PermissionPolicy {
                 }
             }
             PermissionMode::Restrict { allow, deny } => {
-                let missing = required.difference(allow);
-                let blocked = deny.intersection(required);
+                let allowed = allow.clone().union(granted.clone());
+                let missing = required.difference(&allowed);
+                let blocked = deny.intersection(required).difference(&granted);
                 let denied = missing.union(blocked);
                 if denied.is_empty() {
                     Ok(())
@@ -400,6 +418,22 @@ impl PermissionPolicy {
                 }
             }
         }
+    }
+
+    /// Grant a permission tag interactively for the rest of the session.
+    ///
+    /// `tag` is case-insensitive; `read`/`write` map to the built-in classes
+    /// and anything else becomes a custom tag. Multiple tags may be given
+    /// comma-separated (e.g. `"read,write"`).
+    pub fn grant_tag(&mut self, tag: &str) {
+        let granted = parse_set(tag);
+        self.session_grants = self.session_grants.clone().union(granted);
+    }
+
+    /// Revoke previously granted session tags. `tags` is a comma-separated
+    /// list; unknown tags are ignored.
+    pub fn revoke_grants(&mut self, tags: &str) {
+        self.session_grants = self.session_grants.difference(&parse_set(tags));
     }
 
     /// Check a single command by name.  `allow1`/`deny1` take precedence over
@@ -797,5 +831,44 @@ mod tests {
                 .check_paths(&[CommandPath::new(&outside, PathAccess::Read)], &tmp)
                 .is_err()
         );
+    }
+
+    fn custom_set(tag: &str) -> PermissionSet {
+        let mut set = PermissionSet::empty();
+        set.insert(Permission::Custom(tag.to_string()));
+        set
+    }
+
+    #[test]
+    fn session_grant_overrides_mode() {
+        let mut policy = PermissionPolicy::parse("allow:read deny:write").unwrap();
+        assert!(policy.check(&PermissionSet::write()).is_err());
+        policy.grant_tag("write");
+        assert!(policy.check(&PermissionSet::write()).is_ok());
+        // Session grants persist across checks.
+        assert!(policy.check(&PermissionSet::write()).is_ok());
+        // Unrelated tags are still denied.
+        assert!(policy.check(&custom_set("NETWORK")).is_err());
+    }
+
+    #[test]
+    fn revoke_grants_removes_session_tags() {
+        let mut policy = PermissionPolicy::parse("deny:write").unwrap();
+        policy.grant_tag("write,my_tag");
+        assert!(policy.check(&PermissionSet::write()).is_ok());
+        policy.revoke_grants("WRITE");
+        assert!(policy.check(&PermissionSet::write()).is_err());
+        assert!(policy.check(&custom_set("MY_TAG")).is_ok());
+        policy.revoke_grants("unknown_tag");
+        assert!(policy.check(&custom_set("MY_TAG")).is_ok());
+    }
+
+    #[test]
+    fn grant_tag_is_case_insensitive_and_accepts_lists() {
+        let mut policy = PermissionPolicy::parse("allow:read").unwrap();
+        policy.grant_tag("Read,WRITE");
+        assert!(policy.check(&PermissionSet::read_write()).is_ok());
+        policy.grant_tag("my_tag");
+        assert!(policy.check(&custom_set("MY_TAG")).is_ok());
     }
 }
