@@ -1,10 +1,21 @@
 //! Configuration for the catus Agent tool.
 //!
-//! All settings live in a single TOML file, searched in this order:
+//! All settings live in TOML files under the XDG base directory
+//! (`$XDG_CONFIG_HOME/catus/`, falling back to `~/.config/catus/`):
 //!
-//! 1. `./.sutcac/config.toml` (current working directory)
-//! 2. `$XDG_CONFIG_HOME/catus/config.toml`
-//! 3. `~/.config/catus/config.toml`
+//! 1. On startup the XDG directory is created and initialized from the
+//!    embedded resources (`config.toml`, agent definitions, skills) when it
+//!    does not exist yet.
+//! 2. The XDG `config.toml` is loaded as the base configuration.
+//! 3. `./.sutcac/config.toml` (the workspace configuration) is loaded on top
+//!    when present: scalar and table fields set there override the XDG base;
+//!    `[[providers]]` (by `name`), `[[models]]` (by `id`) and `[[mcp.servers]]`
+//!    (by `name`) are merged entry by entry.
+//!
+//! Logs, the audit trail, the session history database and the Agent Memory
+//! store live at fixed locations under the XDG directory and are not
+//! configurable; see [`xdg_log_path`], [`xdg_history_dir`] and
+//! [`xdg_memory_dir`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +41,12 @@ pub struct AppConfig {
     /// configured MCP servers and exposes their tools to the LLM alongside the
     /// built-in `shell` tool.
     pub mcp: Option<McpConfig>,
+    /// Runtime storage directories. Not configurable via TOML; production
+    /// binaries set them from the XDG base directory via
+    /// [`AppDirs::from_xdg`], tests keep the disabled default so persistence
+    /// stays hermetic.
+    #[serde(skip)]
+    pub dirs: AppDirs,
 }
 
 /// Configuration form of a model: like [`Model`], but `provider` names a
@@ -241,6 +258,87 @@ impl Default for McpServerConfig {
     }
 }
 
+/// Runtime storage directories for the Agent (history database and memory
+/// store). Not part of the TOML configuration: production wires them to the
+/// XDG base directory, tests use the disabled default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppDirs {
+    /// Directory of the SQLite session-history database; `None` disables
+    /// session persistence.
+    pub history: Option<PathBuf>,
+    /// Root directory of the Agent Memory mdbook store.
+    pub memory: PathBuf,
+}
+
+impl Default for AppDirs {
+    fn default() -> Self {
+        Self {
+            history: None,
+            memory: PathBuf::from(".sutcac/memory"),
+        }
+    }
+}
+
+impl AppDirs {
+    /// Production directories under the XDG base directory
+    /// ([`xdg_history_dir`] and [`xdg_memory_dir`]).
+    pub fn from_xdg() -> Self {
+        Self {
+            history: Some(xdg_history_dir()),
+            memory: xdg_memory_dir(),
+        }
+    }
+}
+
+/// Base XDG directory for catus: `$XDG_CONFIG_HOME/catus`, falling back to
+/// `~/.config/catus` (and `./` when even the home directory is unknown).
+pub fn xdg_catus_dir() -> PathBuf {
+    let mut base = dirs::config_dir().unwrap_or_else(|| {
+        dirs::home_dir()
+            .map(|h| h.join(".config"))
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+    base.push("catus");
+    base
+}
+
+/// The XDG configuration file (`<xdg>/catus/config.toml`).
+pub fn xdg_config_path() -> PathBuf {
+    xdg_catus_dir().join("config.toml")
+}
+
+/// The workspace configuration file (`./.sutcac/config.toml`), which overrides
+/// the XDG base configuration when present.
+pub fn workspace_config_path() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".sutcac")
+        .join("config.toml")
+}
+
+/// The application log file (`<xdg>/catus/catus.log`). Not configurable.
+pub fn xdg_log_path() -> PathBuf {
+    xdg_catus_dir().join("catus.log")
+}
+
+/// The shell audit log (`<xdg>/catus/audit.log`). Not configurable.
+pub fn xdg_audit_log_path() -> PathBuf {
+    xdg_catus_dir().join("audit.log")
+}
+
+/// Directory of the SQLite session history
+/// (`<xdg>/catus/history/sessions.db`). Not configurable; sessions are
+/// distinguished by the working directory they were created in.
+pub fn xdg_history_dir() -> PathBuf {
+    xdg_catus_dir().join("history")
+}
+
+/// Root of the Agent Memory mdbook store (`<xdg>/catus/memory`). Not
+/// configurable; one global store is shared by all working directories.
+pub fn xdg_memory_dir() -> PathBuf {
+    xdg_catus_dir().join("memory")
+}
+
 /// Agent Memory configuration (`[agent.memory]`).
 ///
 /// The memory store is an mdbook project: `book.toml` plus a `src/`
@@ -255,8 +353,6 @@ pub struct MemoryConfig {
     /// Master switch. Disabled by default so existing configurations are
     /// unaffected.
     pub enabled: bool,
-    /// Root directory of the mdbook memory store.
-    pub path: PathBuf,
     /// Whether to dispatch a recall pass before each user turn.
     pub auto_recall: bool,
     /// Whether to dispatch a summarize/write pass after each turn completes.
@@ -267,7 +363,6 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            path: PathBuf::from(".sutcac/memory"),
             auto_recall: true,
             auto_write: true,
         }
@@ -279,13 +374,8 @@ impl Default for MemoryConfig {
 #[serde(default)]
 pub struct AgentConfig {
     pub max_tool_rounds: usize,
-    /// Optional directory holding the SQLite session-history database
-    /// (`sessions.db`). When set, catus persists each conversation
-    /// incrementally and can resume it later with the `/resume` command.
-    pub history_path: Option<PathBuf>,
-    /// Optional log file path. When omitted, defaults to `.sutcac/catus.log`.
-    pub log_path: Option<PathBuf>,
-    /// Optional log level: trace, debug, info, warn, error. Defaults to info.
+    /// Log level: trace, debug, info, warn, error. Defaults to info. The log
+    /// file itself lives at [`xdg_log_path`] and is not configurable.
     pub log_level: String,
     /// Optional additional directories to scan for Agent Skills.
     pub skill_paths: Option<Vec<PathBuf>>,
@@ -297,7 +387,8 @@ pub struct AgentConfig {
     /// `[[models]]` entry; `efficient` is optional and falls back to
     /// `performance`.
     pub models: TierModelConfig,
-    /// Agent Memory subsystem settings (`[agent.memory]`).
+    /// Agent Memory subsystem settings (`[agent.memory]`). The store root is
+    /// fixed at [`xdg_memory_dir`].
     pub memory: MemoryConfig,
 }
 
@@ -309,6 +400,7 @@ impl Default for AppConfig {
             agent: AgentConfig::default(),
             shell: None,
             mcp: None,
+            dirs: AppDirs::default(),
         }
     }
 }
@@ -441,8 +533,6 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_tool_rounds: 30,
-            history_path: None,
-            log_path: None,
             log_level: "info".to_string(),
             skill_paths: None,
             auto_include_skills: true,
@@ -454,23 +544,46 @@ impl Default for AgentConfig {
 }
 
 impl AppConfig {
-    /// Load the configuration from the first available config file.
+    /// Load the effective configuration.
+    ///
+    /// When the XDG directory does not exist yet it is created and
+    /// initialized from the embedded resources. The XDG `config.toml` is the
+    /// base; a workspace `./.sutcac/config.toml` is merged on top with
+    /// workspace values taking priority (see [`merge_toml_values`]).
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
-        let path = Self::find_config_file().ok_or(
-            "no config file found; create .sutcac/config.toml or ~/.config/catus/config.toml",
-        )?;
-        let contents = std::fs::read_to_string(&path)?;
-        let cfg: AppConfig = toml::from_str(&contents)?;
+        let dir = xdg_catus_dir();
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)?;
+            if let Err(e) = crate::resources::install_xdg_config() {
+                log::warn!("failed to initialize XDG config directory: {}", e);
+            }
+        }
+
+        let xdg_path = xdg_config_path();
+        let xdg_contents = std::fs::read_to_string(&xdg_path)
+            .map_err(|e| format!("cannot read {}: {}", xdg_path.display(), e))?;
+        let mut merged: toml::Value = toml::from_str(&xdg_contents)
+            .map_err(|e| format!("invalid TOML in {}: {}", xdg_path.display(), e))?;
+
+        let ws_path = workspace_config_path();
+        if ws_path.exists() {
+            let ws_contents = std::fs::read_to_string(&ws_path)
+                .map_err(|e| format!("cannot read {}: {}", ws_path.display(), e))?;
+            let ws: toml::Value = toml::from_str(&ws_contents)
+                .map_err(|e| format!("invalid TOML in {}: {}", ws_path.display(), e))?;
+            merge_toml_values(&mut merged, &ws);
+        }
+
+        let cfg: AppConfig = merged
+            .try_into()
+            .map_err(|e| format!("invalid configuration: {}", e))?;
         Ok(cfg)
     }
 
-    /// Return the effective log file path. Uses `agent.log_path` if set,
-    /// otherwise defaults to `.sutcac/catus.log` in the current directory.
+    /// Return the effective log file path: the fixed XDG location
+    /// (`<xdg>/catus/catus.log`).
     pub fn effective_log_path(&self) -> PathBuf {
-        self.agent
-            .log_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(".sutcac/catus.log"))
+        xdg_log_path()
     }
 
     /// Return the effective log level. Parses `agent.log_level`; unrecognized
@@ -496,34 +609,71 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Return the path of the config file that would be used.
-    pub fn find_config_file() -> Option<PathBuf> {
-        let candidates = [Self::workspace_config(), Self::xdg_config()];
-        for path in &candidates {
-            if path.exists() {
-                return Some(path.clone());
-            }
+    /// Return the path configuration changes should be saved to: the
+    /// workspace config when it exists, otherwise the XDG config.
+    pub fn config_save_path() -> Option<PathBuf> {
+        let ws = workspace_config_path();
+        if ws.exists() {
+            return Some(ws);
         }
-        None
+        let xdg = xdg_config_path();
+        xdg.exists().then_some(xdg)
     }
+}
 
-    fn workspace_config() -> PathBuf {
-        let mut path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        path.push(".sutcac");
-        path.push("config.toml");
-        path
+/// Recursively merge `over` into `base` (workspace over XDG).
+///
+/// Tables are merged key by key; any other conflicting value in `over`
+/// replaces the base value. `[[providers]]`, `[[models]]` and `[[mcp.servers]]`
+/// arrays are merged by key (`name`/`id`): entries present on both sides are
+/// merged field-wise, entries only in `over` are appended.
+pub fn merge_toml_values(base: &mut toml::Value, over: &toml::Value) {
+    let (Some(base_table), Some(over_table)) = (base.as_table_mut(), over.as_table()) else {
+        *base = over.clone();
+        return;
+    };
+    for (key, over_value) in over_table {
+        let merge_arrays_by_key = matches!(key.as_str(), "providers" | "models" | "servers")
+            && base_table.get(key).is_some_and(toml::Value::is_array)
+            && over_value.is_array();
+        if merge_arrays_by_key {
+            let key_field = if key == "models" { "id" } else { "name" };
+            merge_array_by_key(base_table.get_mut(key).unwrap(), over_value, key_field);
+        } else if base_table.get(key).is_some_and(toml::Value::is_table) && over_value.is_table() {
+            merge_toml_values(base_table.get_mut(key).unwrap(), over_value);
+        } else {
+            base_table.insert(key.clone(), over_value.clone());
+        }
     }
+}
 
-    fn xdg_config() -> PathBuf {
-        let base = dirs::config_dir().unwrap_or_else(|| {
-            let mut home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            home.push(".config");
-            home
-        });
-        let mut path = base;
-        path.push("catus");
-        path.push("config.toml");
-        path
+/// Merge arrays of tables by key: `over` entries are merged field-wise into
+/// matching base entries or appended. Models are matched by `id`, providers
+/// and MCP servers by `name`.
+fn merge_array_by_key(base: &mut toml::Value, over: &toml::Value, key_field: &str) {
+    let Some(over_items) = over.as_array() else {
+        *base = over.clone();
+        return;
+    };
+    if !base.is_array() {
+        *base = over.clone();
+        return;
+    }
+    let entry_key = |item: &toml::Value| item.as_table().and_then(|t| t.get(key_field)).cloned();
+    let base_items = base.as_array_mut().unwrap();
+    for item in over_items {
+        match entry_key(item) {
+            Some(key) => {
+                let slot = base_items
+                    .iter_mut()
+                    .find(|b| entry_key(b).as_ref() == Some(&key));
+                match slot {
+                    Some(slot) => merge_toml_values(slot, item),
+                    None => base_items.push(item.clone()),
+                }
+            }
+            None => base_items.push(item.clone()),
+        }
     }
 }
 
@@ -558,9 +708,135 @@ audit_format = "json"
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.models[0].id, "gpt-4o");
         assert_eq!(cfg.agent.max_tool_rounds, 5);
-        assert!(cfg.agent.history_path.is_none());
         let shell = cfg.shell.unwrap();
         assert_eq!(shell.perm_mode.as_deref(), Some("deny:write"));
+    }
+
+    #[test]
+    fn parse_config_ignores_removed_path_keys() {
+        // Keys that are no longer configurable must be silently ignored so
+        // old configuration files keep loading.
+        let input = r#"
+[[providers]]
+name = "openai"
+base_url = "https://api.example.com/v1"
+api_key = "sk-test"
+
+[[models]]
+id = "gpt-4o"
+provider = "openai"
+
+[agent]
+history_path = ".sutcac/history"
+log_path = ".sutcac/catus.log"
+
+[agent.memory]
+enabled = true
+path = ".sutcac/memory"
+
+[shell]
+audit_log = ".sutcac/audit.log"
+"#;
+        let cfg: AppConfig = toml::from_str(input).unwrap();
+        assert!(cfg.agent.memory.enabled);
+        assert_eq!(cfg.effective_log_path(), xdg_log_path());
+    }
+
+    #[test]
+    fn merge_workspace_overrides_xdg_scalars() {
+        let mut base: toml::Value =
+            toml::from_str("[agent]\nmax_tool_rounds = 30\n[shell]\nperm_mode = \"allow_all\"\n")
+                .unwrap();
+        let over: toml::Value =
+            toml::from_str("[agent]\nmax_tool_rounds = 5\n[shell]\nperm_mode = \"deny:write\"\n")
+                .unwrap();
+        merge_toml_values(&mut base, &over);
+        let cfg: AppConfig = base.try_into().unwrap();
+        assert_eq!(cfg.agent.max_tool_rounds, 5);
+        assert_eq!(cfg.shell.unwrap().perm_mode.as_deref(), Some("deny:write"));
+    }
+
+    #[test]
+    fn merge_keeps_xdg_fields_not_set_in_workspace() {
+        let mut base: toml::Value = toml::from_str(
+            "[agent]\nmax_tool_rounds = 30\nlog_level = \"debug\"\n[shell]\nperm_mode = \"deny:write\"\naudit_format = \"json\"\n",
+        )
+        .unwrap();
+        let over: toml::Value =
+            toml::from_str("[agent]\nmax_tool_rounds = 5\n[shell]\nperm_mode = \"allow_all\"\n")
+                .unwrap();
+        merge_toml_values(&mut base, &over);
+        let cfg: AppConfig = base.try_into().unwrap();
+        assert_eq!(cfg.agent.max_tool_rounds, 5);
+        // log_level and audit_format come from the XDG base.
+        assert_eq!(cfg.agent.log_level, "debug");
+        let shell = cfg.shell.unwrap();
+        assert_eq!(shell.perm_mode.as_deref(), Some("allow_all"));
+        assert_eq!(shell.audit_format.as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn merge_providers_and_models_by_key() {
+        let mut base: toml::Value = toml::from_str(
+            r#"
+[[providers]]
+name = "openai"
+base_url = "https://xdg.example.com/v1"
+api_key = "sk-xdg"
+
+[[providers]]
+name = "other"
+base_url = "https://other.example.com/v1"
+api_key = "sk-other"
+
+[[models]]
+id = "m1"
+name = "Model One"
+context_window = 4096
+provider = "openai"
+"#,
+        )
+        .unwrap();
+        let over: toml::Value = toml::from_str(
+            r#"
+[[providers]]
+name = "openai"
+api_key = "sk-workspace"
+
+[[providers]]
+name = "extra"
+base_url = "https://extra.example.com/v1"
+api_key = "sk-extra"
+
+[[models]]
+id = "m1"
+context_window = 8192
+
+[[models]]
+id = "m2"
+provider = "openai"
+"#,
+        )
+        .unwrap();
+        merge_toml_values(&mut base, &over);
+        let cfg: AppConfig = base.try_into().unwrap();
+
+        // Same-name provider: workspace fields override, XDG fields survive.
+        let openai = cfg.providers.iter().find(|p| p.name == "openai").unwrap();
+        assert_eq!(openai.api_key, "sk-workspace");
+        assert_eq!(openai.base_url, "https://xdg.example.com/v1");
+        // Unrelated XDG provider survives; workspace-only provider appended.
+        assert_eq!(cfg.providers.len(), 3);
+        assert!(cfg.providers.iter().any(|p| p.name == "other"));
+        assert!(cfg.providers.iter().any(|p| p.name == "extra"));
+
+        // Same-id model: field-wise merge; XDG-only model survives.
+        assert_eq!(cfg.models.len(), 2);
+        let m1 = cfg.models.iter().find(|m| m.id == "m1").unwrap();
+        assert_eq!(m1.context_window, 8192);
+        assert_eq!(m1.name, "Model One");
+        assert_eq!(m1.provider, "openai");
+        assert!(cfg.models.iter().any(|m| m.id == "m2"));
     }
 
     #[test]
@@ -808,13 +1084,11 @@ api_key = "sk-test"
 
 [agent.memory]
 enabled = true
-path = "custom/memory-book"
 auto_recall = false
 "#;
         let cfg: AppConfig = toml::from_str(input).unwrap();
         let memory = &cfg.agent.memory;
         assert!(memory.enabled);
-        assert_eq!(memory.path, PathBuf::from("custom/memory-book"));
         assert!(!memory.auto_recall);
         // Unset sub-switch falls back to its default.
         assert!(memory.auto_write);
@@ -822,7 +1096,6 @@ auto_recall = false
         // The whole section is optional; defaults keep memory disabled.
         let cfg: AppConfig = toml::from_str("").unwrap();
         assert!(!cfg.agent.memory.enabled);
-        assert_eq!(cfg.agent.memory.path, PathBuf::from(".sutcac/memory"));
         assert!(cfg.agent.memory.auto_recall);
         assert!(cfg.agent.memory.auto_write);
     }

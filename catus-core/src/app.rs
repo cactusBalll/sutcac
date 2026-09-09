@@ -114,12 +114,16 @@ pub struct App {
     /// in the ask overlay. The turn resumes via `complete_interaction` or
     /// `cancel_interaction` once the overlay closes.
     pending_interaction: Option<(ToolCall, Vec<AskQuestion>)>,
-    /// SQLite-backed session history, when `[agent].history_path` is set.
+    /// SQLite-backed session history (XDG location, per-`config.dirs`; `None`
+    /// disables persistence, e.g. in tests).
     pub history_store: Option<crate::history::SessionStore>,
     /// Database row id of the session currently being continued, if any.
     pub current_session_id: Option<i64>,
     /// Name for the not-yet-persisted current session (timestamp-based).
     session_name: String,
+    /// Working directory recorded with the session history rows; sessions are
+    /// listed per workspace.
+    pub session_cwd: String,
     /// Cumulative token usage across all completed LLM requests.
     pub usage: Usage,
     /// Number of completed LLM requests in this session.
@@ -185,6 +189,15 @@ fn new_session_name() -> String {
         "history_{}",
         chrono::Local::now().format("%Y-%m-%dT%H_%M_%S")
     )
+}
+
+/// Canonical working directory string recorded with history sessions.
+pub fn session_cwd() -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    cwd.canonicalize()
+        .unwrap_or(cwd)
+        .to_string_lossy()
+        .to_string()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -285,7 +298,7 @@ impl App {
 
         let memory = crate::memory::MemoryState::init(&config, &agent_registry);
 
-        let (history_store, session_name) = match &config.agent.history_path {
+        let (history_store, session_name) = match &config.dirs.history {
             Some(dir) => match crate::history::SessionStore::open(dir) {
                 Ok(store) => (Some(store), new_session_name()),
                 Err(e) => {
@@ -295,6 +308,7 @@ impl App {
             },
             None => (None, String::new()),
         };
+        let session_cwd = session_cwd();
 
         let (stream_tx, stream_rx) = mpsc::channel(128);
         let (done_tx, done_rx) = mpsc::channel(1);
@@ -330,11 +344,12 @@ impl App {
             history_store,
             current_session_id: None,
             session_name,
+            session_cwd,
             usage: Usage::default(),
             request_count: 0,
             should_quit: false,
             status_message_clear_at: None,
-            config_path: AppConfig::find_config_file(),
+            config_path: AppConfig::config_save_path(),
             pending_events: VecDeque::new(),
             stream_tx,
             stream_rx,
@@ -689,7 +704,8 @@ impl App {
         let Some(definition) = self.agent_registry.get_by_role(AgentRole::Memory).cloned() else {
             return;
         };
-        let task = crate::memory::recall_task(user_prompt, &self.memory.memory_dir);
+        let task =
+            crate::memory::recall_task(user_prompt, &self.memory.memory_dir, &self.shell_state.cwd);
         let id = self.spawn_memory_subagent(&definition, task);
         self.memory.pending_recall = Some(id);
         self.status = AppStatus::RunningTool;
@@ -715,7 +731,11 @@ impl App {
         if transcript.trim().is_empty() {
             return;
         }
-        let task = crate::memory::summarize_task(&transcript, &self.memory.memory_dir);
+        let task = crate::memory::summarize_task(
+            &transcript,
+            &self.memory.memory_dir,
+            &self.shell_state.cwd,
+        );
         let id = self.spawn_memory_subagent(&definition, task);
         log::info!("memory write pass dispatched as {}", id);
         self.memory.pending_write = Some(id);
@@ -1347,7 +1367,7 @@ impl App {
         let Some(store) = self.history_store.as_ref() else {
             return Vec::new();
         };
-        match store.list_sessions() {
+        match store.list_sessions(&self.session_cwd) {
             Ok(sessions) => sessions.into_iter().map(|s| s.name).collect(),
             Err(e) => {
                 log::warn!("failed to list sessions: {}", e);
@@ -1420,7 +1440,12 @@ impl App {
             let mut name = base.clone();
             let mut created = None;
             for attempt in 1..100u32 {
-                match store.create_session(&name, &self.session_id, &self.current_model.id) {
+                match store.create_session(
+                    &name,
+                    &self.session_id,
+                    &self.current_model.id,
+                    &self.session_cwd,
+                ) {
                     Ok(id) => {
                         created = Some(id);
                         break;
@@ -1579,15 +1604,14 @@ impl App {
         &mut self,
         name: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        if self.history_store.is_none() {
-            return Err("history_path is not configured".into());
-        }
         let Some(name) = name.map(str::trim).filter(|s| !s.is_empty()) else {
             return Ok(self.history_names_list());
         };
-        let store = self.history_store.as_ref().unwrap();
+        let Some(store) = self.history_store.as_ref() else {
+            return Err("session history is unavailable".into());
+        };
         let id = store
-            .find_session(name)?
+            .find_session(name, &self.session_cwd)?
             .ok_or_else(|| format!("history not found: {}", name))?;
         let snapshot = store
             .load_session(id)?
@@ -1864,8 +1888,6 @@ mod tests {
             }],
             agent: crate::config::AgentConfig {
                 max_tool_rounds: 5,
-                history_path: Some(dir.to_path_buf()),
-                log_path: None,
                 log_level: "info".to_string(),
                 skill_paths: None,
                 auto_include_skills: false,
@@ -1876,13 +1898,16 @@ mod tests {
                 },
                 memory: crate::config::MemoryConfig {
                     enabled: false,
-                    path: dir.join("memory"),
                     auto_recall: true,
                     auto_write: true,
                 },
             },
             shell: None,
             mcp: None,
+            dirs: crate::config::AppDirs {
+                history: Some(dir.to_path_buf()),
+                memory: dir.join("memory-book"),
+            },
         }
     }
 
@@ -1953,6 +1978,8 @@ mod tests {
     }
 
     /// Seed a session row with messages directly in the store under test.
+    /// The row records the test process's working directory so the `App`
+    /// under test lists it.
     fn seed_session(
         dir: &std::path::Path,
         name: &str,
@@ -1960,7 +1987,7 @@ mod tests {
     ) -> crate::history::SessionStore {
         let store = crate::history::SessionStore::open(dir).unwrap();
         let id = store
-            .create_session(name, "catus-seed", "test-model")
+            .create_session(name, "catus-seed", "test-model", &session_cwd())
             .unwrap();
         store
             .replace_messages(id, crate::history::MAIN_AGENT_ID, messages)
@@ -1998,7 +2025,10 @@ mod tests {
             "session",
             &[Message::user("previous"), Message::assistant("ok")],
         );
-        let id = store.find_session("session").unwrap().unwrap();
+        let id = store
+            .find_session("session", &session_cwd())
+            .unwrap()
+            .unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
         assert!(app.current_session_id.is_none());
@@ -2033,7 +2063,10 @@ mod tests {
         app.messages.push(Message::user("new"));
         app.persist_session();
 
-        let id = store.find_session("existing").unwrap().unwrap();
+        let id = store
+            .find_session("existing", &session_cwd())
+            .unwrap()
+            .unwrap();
         let snap = store.load_session(id).unwrap().unwrap();
         assert!(snap.messages.iter().any(|m| m.content == "new"));
 
@@ -2098,7 +2131,7 @@ mod tests {
         assert!(dir.join("sessions.db").exists());
 
         let store = crate::history::SessionStore::open(&dir).unwrap();
-        let names = store.list_sessions().unwrap();
+        let names = store.list_sessions(&session_cwd()).unwrap();
         assert_eq!(names.len(), 1);
         assert!(names[0].name.starts_with("history_"));
 
@@ -2126,7 +2159,7 @@ mod tests {
         app.persist_session();
         let name = {
             let store = app.history_store.as_ref().unwrap();
-            store.list_sessions().unwrap()[0].name.clone()
+            store.list_sessions(&session_cwd()).unwrap()[0].name.clone()
         };
 
         // A fresh app resumes the persisted session.
@@ -2799,7 +2832,6 @@ log_level = "info"
         config.agent.agent_paths = Some(vec![dir.to_path_buf()]);
         config.agent.memory = crate::config::MemoryConfig {
             enabled: true,
-            path: dir.join("memory-book"),
             auto_recall: true,
             auto_write,
         };

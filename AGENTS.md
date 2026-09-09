@@ -7,7 +7,7 @@ Guide for AI agents working in this repo. All commands run from the workspace ro
 Rust workspace (edition 2024, needs Rust 1.85+) with four crates:
 
 - `sutcac-sh` — simplified Bash-compatible shell: hand-written lexer → recursive-descent parser (`ast.rs`) → word expansion (`expand.rs`, `glob.rs`, `arith.rs`) → execution (`exec.rs`). Also a library consumed by catus-core.
-- `catus-core` — the frontend-independent Agent runtime: OpenAI-compatible streaming client (`llm.rs`), tool dispatch (`tool/`, `tool.rs`), subagents (`subagent.rs`), MCP client (`mcp.rs`), SQLite session history (`history.rs`, rusqlite/bundled, `<history_path>/sessions.db`), Agent Memory (`memory.rs`), and the turn state machine in `app.rs` orchestrated by `runtime.rs`. Zero UI dependencies (no ratatui/crossterm).
+- `catus-core` — the frontend-independent Agent runtime: OpenAI-compatible streaming client (`llm.rs`), tool dispatch (`tool/`, `tool.rs`), subagents (`subagent.rs`), MCP client (`mcp.rs`), SQLite session history (`history.rs`, rusqlite/bundled, `~/.config/catus/history/sessions.db`), Agent Memory (`memory.rs`), and the turn state machine in `app.rs` orchestrated by `runtime.rs`. Zero UI dependencies (no ratatui/crossterm).
 - `catus` — the TUI frontend binary: ratatui UI (`ui/`), terminal lifecycle + OSC (`tui.rs`), and TUI-owned view state (`ui/state.rs` = `UiState`: input line, chat scroll, overlays). It depends on `catus-core` and drives the runtime through semantic actions (`App::handle_input_line`, `complete_interaction`, …) while consuming `RuntimeEvent`s from `Runtime::next_event`. The headless `--test` mode runs the same event loop.
 - `mcp-calc-server` — standalone calculator MCP server used to test catus's MCP client support. Exposes arithmetic tools (`sum`, `sub`, `mul`, `div`, `modulo`). Serves stdio by default, or Streamable HTTP with `--http <addr>`.
 
@@ -90,11 +90,11 @@ The file `main.md` is required. Its body becomes the main system prompt, and its
 
 ## Agent Memory
 
-`catus` maintains long-term memory as an mdbook project (`book.toml` + `src/SUMMARY.md` + topical chapter files) driven by the `role: memory` subagent (`catus-core/src/memory.rs` holds the task prompts, JSON result parsing, and `MemoryState`). Both passes run through the regular subagent runtime in `create` mode (independent context/toolbox/shell permissions; `App` spawns them with `parent_call_id: None` and intercepts their events in `handle_subagent_event`).
+`catus` maintains long-term memory as a single global mdbook project (`book.toml` + `src/SUMMARY.md` + topical chapter files) shared by all workspaces, driven by the `role: memory` subagent. The store distinguishes cross-workspace memory (`src/global/` chapters) from per-workspace memory (`src/workspaces/<slug>/` chapters, indexed by absolute path in `src/workspaces/README.md`). The recall/write judgment rules and the mdbook layout live in the memory agent's definition (`agents/memory.md`); `catus-core/src/memory.rs` carries only the control-chain contract (pass type, store/workspace paths, the exact `completeTask` JSON schema, size limits) plus result parsing and `MemoryState`. Both passes run through the regular subagent runtime in `create` mode (independent context/toolbox/shell permissions; `App` spawns them with `parent_call_id: None` and intercepts their events in `handle_subagent_event`).
 
 - **Recall** (before the main LLM request): `submit_user_message` dispatches the pass; the runtime withholds `start_llm_stream` while `awaiting_memory_recall()` (`Runtime::maybe_resume_stream` gates internally, and the stream starts when the recall pass completes). The memory agent decides whether the request is a simple task (no memory, `{"recall": false}`); otherwise it searches the store and returns `{"recall": true, "memory": "..."}`, which is injected into the main conversation as a system message. A failed/unparseable pass degrades to "no memory".
 - **Write** (after the turn): `handle_llm_done`'s turn-complete branch dispatches a background summarize pass with a transcript of the current user turn (`memory::format_transcript`). The agent updates the mdbook store (initializing the scaffold if missing; `mdbook build` is optional and skipped when the binary is absent) and returns `{"written": bool, "summary": ...}`; the result is logged as an event message.
-- Configured under `[agent.memory]`: `enabled` (master switch, default off), `path` (store dir, default `.sutcac/memory`), `auto_recall`, `auto_write`. Enabling requires a `role: memory` agent definition — otherwise catus warns and keeps the subsystem disabled. `catus --install-project-config` installs a default `agents/memory.md`.
+- Configured under `[agent.memory]`: `enabled` (master switch, default off), `auto_recall`, `auto_write`. The store lives at the fixed path `~/.config/catus/memory`. Enabling requires a `role: memory` agent definition — otherwise catus warns and keeps the subsystem disabled. catus installs a default `agents/memory.md` into the XDG directory on first startup; `--install-project-config` installs one into `.sutcac/`.
 - Runtime toggle: `/memory status|on|off|path`; the session toggle is persisted via `STATE_MEMORY_ENABLED` in `session_state` and restored by `/resume`. Interrupted passes are not restarted on resume. The memory agent is still callable manually (`task`/`@memory <question>`) for one-off memory queries.
 
 ## Commands
@@ -111,22 +111,36 @@ cargo run -p sutcac-sh                   # interactive REPL (rustyline)
 
 cargo run -p catus                        # Agent TUI
 cargo run -p catus -- --test "prompt"     # headless one-shot test prompt
+cargo run -p catus -- -w <dir> --test "p" # -w/--workspace: run against another
+                                          # working directory (workspace config,
+                                          # agents/skills, and session cwd)
 
 cargo run -p mcp-calc-server              # calculator MCP server (stdio)
 cargo test -p mcp-calc-server             # unit + integration tests against catus MCP client
 ```
 
+Both binaries accept `-w/--workspace <dir>`: the process switches into the directory before config loading, so the workspace config (`<dir>/.sutcac/config.toml`), workspace agents/skills, and (for catus) the session-history cwd are all resolved against it.
+
 No CI, lint config, or integration tests exist. Tests currently pass (~105 + 4 in sutcac-sh, ~197 in catus-core, ~43 in catus, ~9 in mcp-calc-server).
 
 ## Configuration
 
-Both binaries read the same TOML file, first match wins:
+All paths (logs, audit trail, session history, memory store) live under one XDG base directory: `$XDG_CONFIG_HOME/catus/` (fallback `~/.config/catus/`):
 
-1. `./.sutcac/config.toml`
-2. `$XDG_CONFIG_HOME/catus/config.toml`
-3. `~/.config/catus/config.toml`
+- `config.toml` — configuration (initialized from embedded resources on first startup)
+- `agents/`, `skills/` — installed agent definitions and skills
+- `catus.log` — application log (fixed; only `log_level` is configurable)
+- `audit.log` — shell audit trail (fixed)
+- `history/sessions.db` — SQLite session history (fixed); each session row records the working directory it was created in, and `/resume` lists only the current workspace's sessions
+- `memory/` — global Agent Memory mdbook store (fixed, shared by all projects)
 
-Copy the root-level `config.toml.example` to `.sutcac/config.toml` and fill in the provider API keys. Sections: `[[providers]]`/`[[models]]`/`[agent]` for catus only; `[shell]` shared by both; `[mcp]` for catus only.
+Config loading (`AppConfig::load` in `catus-core/src/config.rs`):
+
+1. If the XDG directory does not exist, it is created and initialized from the embedded resources (`resources::install_xdg_config`; existing files are never overwritten).
+2. The XDG `config.toml` is loaded as the base.
+3. If `./.sutcac/config.toml` (workspace config) exists, it is merged on top: scalar/table fields set in the workspace override the XDG base; `[[providers]]` (by `name`), `[[models]]` (by `id`) and `[[mcp.servers]]` (by `name`) are merged entry by entry (same-key entries merged field-wise, new entries appended). Config changes from `/model`-style commands are saved back to the workspace config when it exists, otherwise to the XDG config.
+
+The removed keys `agent.history_path`, `agent.log_path`, `agent.memory.path`, and `shell.audit_log` are silently ignored in old config files. Copy the root-level `config.toml.example` to `~/.config/catus/config.toml` (or `.sutcac/config.toml` for per-workspace overrides) and fill in the provider API keys. Sections: `[[providers]]`/`[[models]]`/`[agent]` for catus only; `[shell]` shared by both (sutcac-sh applies the same XDG-base + workspace-merge loading to the `[shell]` section); `[mcp]` for catus only.
 
 ### Providers and models (`[[providers]]`, `[[models]]`)
 
@@ -182,7 +196,7 @@ Checked before every external command and redirection; denials return non-zero a
 
 - Rendering lives in `catus/src/ui/` (`chat.rs` = history/input/status bar; `overlay.rs` = modal pages); `tui.rs` manages the terminal raw-mode lifecycle and emits OSC sequences: the tab title tracks app status (`catus · 正在输出`/`空闲`/`错误`), the taskbar shows an indeterminate ConEmu `OSC 9;4;3` animation while busy and hides on completion, and a BEL alert rings when a busy turn returns to idle. TUI interaction logic lives in `catus/src/ui.rs` + `ui/`; core turn/interaction logic lives in `catus-core/src/app.rs` + `runtime.rs`.
 - Keys: Enter send, Esc/Ctrl+C quit, Up/Down/PageUp/PageDown scroll, Home/End jump.
-- `/resume <name>` loads a session from the SQLite history (`<history_path>/sessions.db`); bare `/resume` opens a List-based picker overlay (↑/↓ select, Enter load, Esc cancel); `/status` opens a Table overlay with model/requests/token usage. Overlays swallow keys before the input line (`ui::overlay::handle_overlay_key` on `UiState`).
+- `/resume <name>` loads a session from the SQLite history (`~/.config/catus/history/sessions.db`, filtered by the current working directory); bare `/resume` opens a List-based picker overlay (↑/↓ select, Enter load, Esc cancel); `/status` opens a Table overlay with model/requests/token usage. Overlays swallow keys before the input line (`ui::overlay::handle_overlay_key` on `UiState`).
 - Session history lives in the dedicated `catus-core/src/history.rs` + `history/` subsystem (`SessionStore`, rusqlite/bundled). Persistence is incremental: `App::persist_session` rewrites the full snapshot after every LLM turn, tool result, usage report, subagent event, and on exit. A session stores main + subagent messages, token usage, request count, provider session id, current model, active skills, pending tool calls / `ask_user` interaction, the main agent's TODO list, and shell cwd/vars. Resume restores all of it; still-running subagents restart their turn loop from the saved messages (`SubagentManager::restore`), and `task`/`taskSync` dispatches interrupted mid-flight are answered with an error tool result instead of being re-run. Old JSON history files are ignored.
 - The `ask_user` tool emits `RuntimeEvent::InteractionRequested`; the TUI opens the question overlay (`Overlay::Ask`): one question at a time with progress `i/N`, ↑/↓ move across options plus a final "Other" row where typing edits the text; Enter chooses the focused option (single-select) or confirms the checked options (multi-select, Space toggles); Esc cancels the whole question and reports "user cancelled" back to the model.
 - `/mcp list` shows configured MCP servers and their discovered tools; `/mcp status` shows how many servers are connected.
@@ -193,5 +207,5 @@ Checked before every external command and redirection; denials return non-zero a
 
 ## Security notes
 
-- Do not commit `.sutcac/config.toml` (contains a plain-text API key).
+- Do not commit `.sutcac/config.toml` or `~/.config/catus/config.toml` (they contain a plain-text API key).
 - The Agent executes arbitrary shell commands via the real filesystem/process; use an appropriate `perm_mode` in trusted environments only.

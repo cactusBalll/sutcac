@@ -23,7 +23,8 @@ pub const AGENT_MEMORY_MD: &str = include_str!("../resources/agents/memory.md");
 /// Example skill: git commit workflow.
 pub const SKILL_COMMIT_MD: &str = include_str!("../resources/skills/commit/SKILL.md");
 
-/// Files written by [`install_project_config`], relative to `.sutcac/`.
+/// Files written by [`install_project_config`] / [`install_into`], relative
+/// to the install root (`.sutcac/` or the XDG directory).
 pub const PROJECT_FILES: &[(&str, &str)] = &[
     ("config.toml", CONFIG_TOML),
     ("agents/main.md", AGENT_MAIN_MD),
@@ -73,7 +74,25 @@ impl InstallReport {
 /// Missing parent directories are created; files that already exist are
 /// skipped so user configuration is never overwritten.
 pub fn install_project_config(target_root: &Path) -> std::io::Result<InstallReport> {
-    let target_dir = target_root.join(".sutcac");
+    install_into(&target_root.join(".sutcac"))
+}
+
+/// Initialize the XDG configuration directory from the embedded resources.
+///
+/// Called by [`crate::config::AppConfig::load`] when
+/// `~/.config/catus/` (see [`crate::config::xdg_catus_dir`]) does not exist
+/// yet; also used by `catus --install-project-config` for opt-in installs.
+pub fn install_xdg_config() -> std::io::Result<InstallReport> {
+    let dir = crate::config::xdg_catus_dir();
+    std::fs::create_dir_all(&dir)?;
+    install_into(&dir)
+}
+
+/// Dump the embedded default resources directly into `target_dir`.
+///
+/// Missing parent directories are created; files that already exist are
+/// skipped so user configuration is never overwritten.
+pub fn install_into(target_dir: &Path) -> std::io::Result<InstallReport> {
     let mut files = Vec::new();
 
     for (relative, contents) in PROJECT_FILES {
@@ -90,7 +109,10 @@ pub fn install_project_config(target_root: &Path) -> std::io::Result<InstallRepo
         files.push((*relative, action));
     }
 
-    Ok(InstallReport { target_dir, files })
+    Ok(InstallReport {
+        target_dir: target_dir.to_path_buf(),
+        files,
+    })
 }
 
 #[cfg(test)]
@@ -125,6 +147,21 @@ mod tests {
         // A second run must not overwrite anything.
         let report = install_project_config(root).unwrap();
         assert_eq!(report.written(), 0);
+        assert_eq!(report.skipped(), PROJECT_FILES.len());
+    }
+
+    #[test]
+    fn install_into_writes_directly_into_target_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("custom-root");
+        let report = install_into(&target).unwrap();
+        assert_eq!(report.target_dir, target);
+        assert_eq!(report.written(), PROJECT_FILES.len());
+        for (relative, _) in PROJECT_FILES {
+            assert!(target.join(relative).is_file());
+        }
+        // Re-running keeps existing files.
+        let report = install_into(&target).unwrap();
         assert_eq!(report.skipped(), PROJECT_FILES.len());
     }
 

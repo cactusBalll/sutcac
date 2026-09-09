@@ -17,8 +17,15 @@
 //! protocol) in `create` mode, so the memory agent has its own context,
 //! toolbox, and shell permissions. `mdbook build` is optional: when the
 //! `mdbook` binary is unavailable the store is maintained as plain Markdown.
+//!
+//! The task prompts built here carry only the control-chain contract: pass
+//! type, store and workspace paths, the user request / turn transcript, and
+//! the exact `completeTask` JSON schema. All judgment rules (when recall is
+//! worthwhile, what is worth keeping) and the store layout (mdbook scaffold,
+//! `src/global/` vs. `src/workspaces/<slug>/` chapters) live in the memory
+//! agent's definition (`agents/memory.md`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -52,11 +59,13 @@ pub struct MemoryState {
 
 impl MemoryState {
     /// Initialize the memory subsystem from the config and agent registry.
+    /// The store directory comes from the runtime `AppDirs` (`config.dirs`);
+    /// production points it at the fixed XDG location.
     pub fn init(config: &AppConfig, registry: &AgentRegistry) -> Self {
         let mut state = Self {
             available: false,
             session_enabled: true,
-            memory_dir: config.agent.memory.path.clone(),
+            memory_dir: config.dirs.memory.clone(),
             pending_recall: None,
             pending_write: None,
             warnings: Vec::new(),
@@ -92,62 +101,51 @@ impl MemoryState {
 }
 
 /// Build the task prompt for the pre-turn recall pass.
-pub fn recall_task(user_prompt: &str, memory_dir: &std::path::Path) -> String {
+///
+/// Carries only the control-chain contract; the judgment rules live in the
+/// memory agent's definition (`agents/memory.md`).
+pub fn recall_task(user_prompt: &str, memory_dir: &Path, workspace: &Path) -> String {
     format!(
         "Memory recall pass.\n\n\
-         Memory store directory: {}\n\n\
+         Memory store directory: {}\n\
+         Current workspace: {}\n\n\
          The main agent is about to handle this user request:\n\
          <user_request>\n{}\n</user_request>\n\n\
-         Decide whether recalling long-term memory would help fulfill it. \
-         Simple requests — greetings, small talk, one-off syntax or \
-         translation questions, trivial single-file operations — do not \
-         need memory; when in doubt, skip it.\n\n\
-         If recall is unnecessary, call completeTask with exactly \
-         {{\"recall\": false}} and nothing else.\n\n\
-         Otherwise search the store (list the directory, grep, and read the \
-         chapter files under {}/src) and call completeTask with exactly:\n\
-         {{\"recall\": true, \"memory\": \"<the relevant memory, trimmed to \
-         the essentials>\"}}\n\
+         Follow your memory-management instructions to decide whether \
+         recalling long-term memory would help; if so, search the store \
+         (the current workspace's chapters first, then the global chapters) \
+         and return the relevant memory.\n\n\
+         Call completeTask with exactly one of:\n\
+         - {{\"recall\": false}}\n\
+         - {{\"recall\": true, \"memory\": \"<the relevant memory>\"}}\n\
          The `memory` value must be at most {} characters.",
         memory_dir.display(),
+        workspace.display(),
         user_prompt,
-        memory_dir.display(),
         RECALL_MAX_CHARS
     )
 }
 
 /// Build the task prompt for the post-turn summarize/write pass.
-pub fn summarize_task(transcript: &str, memory_dir: &std::path::Path) -> String {
+///
+/// Same split as [`recall_task`]: only the contract, no judgment rules.
+pub fn summarize_task(transcript: &str, memory_dir: &Path, workspace: &Path) -> String {
     format!(
         "Memory write pass.\n\n\
-         Memory store directory: {}\n\n\
+         Memory store directory: {}\n\
+         Current workspace: {}\n\n\
          Below is the transcript of the conversation turn that just \
          finished:\n<turn_transcript>\n{}\n</turn_transcript>\n\n\
-         Extract the key facts worth remembering long-term: user \
-         preferences and conventions, project decisions, environment or \
-         toolchain facts, and user corrections of past behavior. Skip \
-         ephemeral details (exact commands, file contents, intermediate \
-         debugging output).\n\n\
-         First read the existing store so you do not duplicate or contradict \
-         what is already recorded. If nothing is worth keeping, call \
-         completeTask with exactly {{\"written\": false}} and nothing else.\n\n\
-         Otherwise update the mdbook store:\n\
-         - Keep a valid mdbook structure: book.toml at the root plus \
-         src/SUMMARY.md and topical chapter files under src/. Create it if \
-         it does not exist yet (a minimal book.toml with \
-         `authors = [\"catus\"]`, `language = \"zh\"`, `src = \"src\"` is \
-         enough).\n\
-         - Keep chapter files organized by topic and listed in SUMMARY.md.\n\
-         - Write durable, concise facts; merge with related chapters instead \
-         of creating near-duplicates.\n\
-         - If the `mdbook` command is available, run `mdbook build {}` and \
-         ignore failures; otherwise leave the store as plain Markdown.\n\n\
-         Call completeTask with exactly:\n\
-         {{\"written\": true, \"summary\": \"<one line describing what was \
-         recorded>\"}}",
+         Follow your memory-management instructions to decide whether any \
+         fact is worth keeping long-term; if so, update the store \
+         accordingly (workspace-specific facts under the current workspace's \
+         chapters, cross-workspace facts in the global chapters).\n\n\
+         Call completeTask with exactly one of:\n\
+         - {{\"written\": false}}\n\
+         - {{\"written\": true, \"summary\": \"<one line describing what was recorded>\"}}",
         memory_dir.display(),
-        transcript,
-        memory_dir.display()
+        workspace.display(),
+        transcript
     )
 }
 
@@ -277,7 +275,6 @@ mod tests {
         let mut config = AppConfig::default();
         config.agent.memory = MemoryConfig {
             enabled,
-            path: PathBuf::from("/tmp/catus-memory-test"),
             auto_recall: true,
             auto_write: true,
         };
@@ -305,22 +302,31 @@ mod tests {
     }
 
     #[test]
-    fn recall_task_contains_prompt_and_store_path() {
-        let task = recall_task("fix the build", std::path::Path::new("/tmp/m"));
+    fn recall_task_carries_contract_paths_and_prompt() {
+        let task = recall_task(
+            "fix the build",
+            std::path::Path::new("/tmp/m"),
+            std::path::Path::new("/tmp/ws"),
+        );
         assert!(task.contains("fix the build"));
         assert!(task.contains("/tmp/m"));
+        assert!(task.contains("/tmp/ws"));
         assert!(task.contains("\"recall\": false"));
         assert!(task.contains("\"recall\": true"));
     }
 
     #[test]
-    fn summarize_task_contains_transcript_and_store_path() {
-        let task = summarize_task("user: hello", std::path::Path::new("/tmp/m"));
+    fn summarize_task_carries_contract_paths_and_transcript() {
+        let task = summarize_task(
+            "user: hello",
+            std::path::Path::new("/tmp/m"),
+            std::path::Path::new("/tmp/ws"),
+        );
         assert!(task.contains("user: hello"));
         assert!(task.contains("/tmp/m"));
+        assert!(task.contains("/tmp/ws"));
         assert!(task.contains("\"written\": false"));
         assert!(task.contains("\"written\": true"));
-        assert!(task.contains("mdbook build"));
     }
 
     #[test]

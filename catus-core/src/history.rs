@@ -7,11 +7,13 @@
 //! application state (pending tool calls, an open `ask_user` interaction,
 //! shell working directory and variables).
 //!
-//! The database lives at `<history_path>/sessions.db` where `<history_path>`
-//! comes from `[agent].history_path` in the configuration. Persistence is
-//! incremental: the app rewrites its snapshot after each LLM turn, tool
-//! result, usage report, and subagent event, so exiting (even while a
-//! subagent is running) always leaves a complete record on disk.
+//! The database lives at a fixed location under the XDG base directory
+//! (`~/.config/catus/history/sessions.db`); each session row records the
+//! working directory it was created in, so `/resume` only lists the sessions
+//! belonging to the current workspace. Persistence is incremental: the app
+//! rewrites its snapshot after each LLM turn, tool result, usage report, and
+//! subagent event, so exiting (even while a subagent is running) always
+//! leaves a complete record on disk.
 
 pub mod store;
 

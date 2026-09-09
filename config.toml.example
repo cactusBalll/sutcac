@@ -1,5 +1,6 @@
-# Copy this file to `.sutcac/config.toml` (or `~/.config/catus/config.toml`)
-# and fill in your OpenAI-compatible API key.
+# Copy this file to `~/.config/catus/config.toml` (the XDG base config) or to
+# `./.sutcac/config.toml` (the workspace config, merged on top of the XDG one
+# with workspace values winning) and fill in your OpenAI-compatible API key.
 
 # API vendor endpoints. Each provider names its base URL and API key.
 # `session_header` is optional: when set, every request carries one stable
@@ -37,14 +38,10 @@ provider = "openai"
 
 [agent]
 max_tool_rounds = 10
-# Optional directory for the SQLite session-history database (sessions.db).
-# When set, catus persists each conversation incrementally and you can load a
-# previous one with `/resume <name>`.
-history_path = ".sutcac/history"
-
-# Optional log file path. All catus diagnostics are written here; nothing is
-# printed to stderr while the TUI is running. Defaults to `.sutcac/catus.log`.
-# log_path = ".sutcac/catus.log"
+# Session history is always persisted at ~/.config/catus/history/sessions.db
+# (one global database; sessions are listed per working directory) and can be
+# loaded again with `/resume <name>`. Logs go to ~/.config/catus/catus.log and
+# the shell audit trail to ~/.config/catus/audit.log — none are configurable.
 
 # Optional log level: trace, debug, info, warn, error. Defaults to info.
 # log_level = "info"
@@ -66,13 +63,13 @@ history_path = ".sutcac/history"
 # Agent Memory subsystem. When enabled, catus dispatches the `memory`-role
 # subagent before each user turn (recall: simple tasks skip memory, otherwise
 # relevant memories are injected into the conversation) and after each turn
-# (summarize: key facts are written into an mdbook store). The store is an
-# mdbook project (book.toml + src/SUMMARY.md); `mdbook build` runs only when
-# the mdbook binary is available. `memory.md` (role: memory) must exist in the
-# agent search paths — `catus --install-project-config` installs a default.
+# (summarize: key facts are written into an mdbook store at the fixed path
+# ~/.config/catus/memory, shared by all projects). The store is an mdbook
+# project (book.toml + src/SUMMARY.md); `mdbook build` runs only when the
+# mdbook binary is available. `memory.md` (role: memory) must exist in the
+# agent search paths — catus installs a default into ~/.config/catus/agents/.
 # [agent.memory]
 # enabled = false
-# path = ".sutcac/memory"
 # auto_recall = true
 # auto_write = true
 
@@ -119,7 +116,7 @@ performance = "kimi-k2"
 [shell]
 # allow_all | allow:<tags> | deny:<tags> | allow:<tags> deny:<tags> | allow1:<cmds> | deny1:<cmds>
 perm_mode = "allow_all"
-audit_log = "/tmp/sutcac-audit.log"
+# The audit trail is always written to ~/.config/catus/audit.log.
 audit_format = "text"
 
 # Shorthand permission lists: every listed command gets the READ (or WRITE)

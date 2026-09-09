@@ -2,7 +2,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use crossterm::event::Event;
@@ -23,6 +23,11 @@ struct Cli {
     /// Headless one-shot mode: run this prompt without the TUI and exit.
     #[arg(long, value_name = "PROMPT")]
     test: Option<String>,
+    /// Working directory for this session: the workspace config
+    /// (`<dir>/.sutcac/config.toml`), workspace agents/skills, and the
+    /// recorded session history cwd are all resolved against it.
+    #[arg(short = 'w', long, value_name = "DIR")]
+    workspace: Option<PathBuf>,
     /// Dump the default config template, agents and skills into ./.sutcac/
     /// (existing files are never overwritten) and exit.
     #[arg(long)]
@@ -38,6 +43,13 @@ enum UiEvent {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    if let Some(dir) = &cli.workspace {
+        if let Err(e) = enter_workspace(dir) {
+            eprintln!("catus: {}", e);
+            std::process::exit(1);
+        }
+    }
 
     if cli.install_project_config {
         let root = std::env::current_dir()?;
@@ -84,14 +96,34 @@ fn init_logger(path: &Path, level: LevelFilter) {
     }
 }
 
+/// Switch the process into the requested workspace directory. Must run before
+/// config loading so the workspace config (`<dir>/.sutcac/config.toml`),
+/// workspace agents/skills, and the recorded session cwd all resolve there.
+fn enter_workspace(dir: &Path) -> Result<(), String> {
+    let resolved = dir
+        .canonicalize()
+        .map_err(|e| format!("cannot use workspace '{}': {}", dir.display(), e))?;
+    if !resolved.is_dir() {
+        return Err(format!(
+            "workspace '{}' is not a directory",
+            resolved.display()
+        ));
+    }
+    std::env::set_current_dir(&resolved)
+        .map_err(|e| format!("cannot enter workspace '{}': {}", resolved.display(), e))
+}
+
 fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
-    let config = match AppConfig::load() {
+    let mut config = match AppConfig::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("catus: failed to load config: {}", e);
             std::process::exit(1);
         }
     };
+    // Production storage directories (session history, memory store) live
+    // under the XDG base directory.
+    config.dirs = catus_core::config::AppDirs::from_xdg();
 
     if let Err(e) = config.resolve_models() {
         eprintln!("catus: invalid model configuration: {}", e);
@@ -109,7 +141,7 @@ fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
 
     if config.providers.iter().all(|p| p.api_key.is_empty()) {
         eprintln!(
-            "catus: all provider api_keys are empty; set api_key in .sutcac/config.toml or ~/.config/catus/config.toml"
+            "catus: all provider api_keys are empty; set api_key in ~/.config/catus/config.toml or .sutcac/config.toml"
         );
         std::process::exit(1);
     }

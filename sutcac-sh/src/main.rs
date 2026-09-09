@@ -61,7 +61,14 @@ impl Validator for ShellHelper {}
 impl Helper for ShellHelper {}
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let (workspace, args) = parse_args(std::env::args().skip(1));
+
+    if let Some(dir) = workspace {
+        match enter_workspace(&dir) {
+            Ok(()) => {}
+            Err(status) => std::process::exit(status),
+        }
+    }
 
     let (permissions, audit_logger) = match ShellConfig::load() {
         Ok(Some(cfg)) => (cfg.permission_policy(), cfg.audit_logger()),
@@ -80,14 +87,14 @@ fn main() {
     // The standalone shell binary should honour the `exit` builtin.
     state.exit_process = true;
 
-    if args.len() > 2 && args[1] == "-c" {
-        let command = &args[2];
+    if args.len() > 1 && args[0] == "-c" {
+        let command = &args[1];
         run_commands(command, &mut state);
         std::process::exit(state.last_status);
     }
 
-    if args.len() > 1 {
-        let path = &args[1];
+    if !args.is_empty() {
+        let path = &args[0];
         match std::fs::read_to_string(path) {
             Ok(contents) => {
                 run_commands(&contents, &mut state);
@@ -104,6 +111,55 @@ fn main() {
     if let Err(e) = run_interactive(&mut state) {
         eprintln!("sutcac-sh: {}", e);
     }
+}
+
+/// Split the raw CLI arguments into the optional `-w/--workspace <dir>` value
+/// and the remaining arguments (`-c <command>` or a script path).
+fn parse_args<I: Iterator<Item = String>>(mut args: I) -> (Option<String>, Vec<String>) {
+    let mut workspace = None;
+    let mut rest = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-w" | "--workspace" => match args.next() {
+                Some(dir) => workspace = Some(dir),
+                None => {
+                    eprintln!("sutcac-sh: {} requires a directory argument", arg);
+                    std::process::exit(2);
+                }
+            },
+            _ => rest.push(arg),
+        }
+    }
+    (workspace, rest)
+}
+
+/// Switch the shell into the requested workspace directory before config
+/// loading, so the workspace `[shell]` section is picked up from there.
+/// Exits with an appropriate status on failure.
+fn enter_workspace(dir: &str) -> Result<(), i32> {
+    let resolved = match std::path::Path::new(dir).canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("sutcac-sh: cannot use workspace '{}': {}", dir, e);
+            return Err(2);
+        }
+    };
+    if !resolved.is_dir() {
+        eprintln!(
+            "sutcac-sh: workspace '{}' is not a directory",
+            resolved.display()
+        );
+        return Err(2);
+    }
+    if let Err(e) = std::env::set_current_dir(&resolved) {
+        eprintln!(
+            "sutcac-sh: cannot enter workspace '{}': {}",
+            resolved.display(),
+            e
+        );
+        return Err(1);
+    }
+    Ok(())
 }
 
 fn run_interactive(state: &mut ShellState) -> Result<(), Box<dyn std::error::Error>> {
@@ -259,6 +315,28 @@ mod tests {
     #[test]
     fn unmatched_double_quote_triggers_incomplete() {
         assert!(matches!(try_parse("echo \"hello"), ParseResult::Incomplete));
+    }
+
+    #[test]
+    fn parse_args_splits_workspace_from_rest() {
+        let args = ["-w", "/tmp/ws", "-c", "echo hi"]
+            .into_iter()
+            .map(String::from);
+        let (workspace, rest) = parse_args(args);
+        assert_eq!(workspace.as_deref(), Some("/tmp/ws"));
+        assert_eq!(rest, vec!["-c".to_string(), "echo hi".to_string()]);
+
+        let args = ["--workspace", "/tmp/ws", "script.sh"]
+            .into_iter()
+            .map(String::from);
+        let (workspace, rest) = parse_args(args);
+        assert_eq!(workspace.as_deref(), Some("/tmp/ws"));
+        assert_eq!(rest, vec!["script.sh".to_string()]);
+
+        let args = ["-c", "echo hi"].into_iter().map(String::from);
+        let (workspace, rest) = parse_args(args);
+        assert!(workspace.is_none());
+        assert_eq!(rest, vec!["-c".to_string(), "echo hi".to_string()]);
     }
 
     #[test]

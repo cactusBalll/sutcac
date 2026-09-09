@@ -1502,20 +1502,20 @@ mod tests {
         use catus_core::message::Message;
 
         fn test_app_with_history_dir(dir: &std::path::Path) -> App {
-            let config = AppConfig {
-                agent: catus_core::config::AgentConfig {
-                    history_path: Some(dir.to_path_buf()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
+            let mut config = AppConfig::default();
+            config.dirs.history = Some(dir.to_path_buf());
             App::new(config)
         }
 
         fn seed_session(dir: &std::path::Path, name: &str, messages: &[Message]) {
             let store = SessionStore::open(dir).unwrap();
             let id = store
-                .create_session(name, "catus-seed", "test-model")
+                .create_session(
+                    name,
+                    "catus-seed",
+                    "test-model",
+                    &catus_core::app::session_cwd(),
+                )
                 .unwrap();
             store
                 .replace_messages(id, catus_core::history::MAIN_AGENT_ID, messages)
@@ -1556,7 +1556,12 @@ mod tests {
             match action {
                 OverlayAction::LoadHistory(name) => {
                     let store = SessionStore::open(&dir).unwrap();
-                    assert!(store.find_session(&name).unwrap().is_some());
+                    assert!(
+                        store
+                            .find_session(&name, &catus_core::app::session_cwd())
+                            .unwrap()
+                            .is_some()
+                    );
                 }
                 other => panic!("expected LoadHistory, got {:?}", other),
             }
