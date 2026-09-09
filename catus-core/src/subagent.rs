@@ -298,6 +298,13 @@ impl SubagentManager {
         &self.subagents
     }
 
+    /// Whether the subagent was dispatched through the synchronous `taskSync`
+    /// tool. Its result is delivered through the tool return, so the parent
+    /// must not also receive a completion notice.
+    pub fn is_sync(&self, id: &str) -> bool {
+        self.pending_sync.contains_key(id)
+    }
+
     /// Snapshot every subagent for persistence.
     pub fn snapshot(&self) -> Vec<crate::history::SubagentSnapshot> {
         self.subagents

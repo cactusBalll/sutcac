@@ -1521,8 +1521,9 @@ impl App {
     }
 
     /// Process a subagent event: update managed state, inject completion
-    /// results into the parent conversation, and resume the parent turn when
-    /// an asynchronous subagent finishes.
+    /// notices into the parent conversation (without the result itself; the
+    /// model fetches it via the `task` tool's `result` action), and resume
+    /// the parent turn when an asynchronous subagent finishes.
     ///
     /// Returns `true` when the parent agent should start a new LLM stream to
     /// react to an asynchronous `task` result.
@@ -1578,12 +1579,18 @@ impl App {
                         None => log::warn!("memory write pass returned an unparseable result"),
                     }
                 } else if let Some(sub) = self.subagents.get(id) {
-                    // Inject the result as a tool response if the parent is
-                    // waiting for this subagent.
-                    if sub.parent_call_id.is_some() {
+                    // Notify the parent that the subagent finished, without
+                    // injecting the full result: the model must fetch it via
+                    // the `task` tool's `result` action. `taskSync` dispatches
+                    // deliver the result through the tool return instead, so
+                    // they get no notice.
+                    if sub.parent_call_id.is_some() && !self.subagents.is_sync(id) {
                         let call_id = sub.parent_call_id.clone().unwrap();
                         self.messages.push(Message::tool(
-                            format!("status=0\nstdout=```\n{}\n```\nstderr=```\n\n```", result),
+                            format!(
+                                "status=0\nstdout=```\nsubagent {} ({}) completed; call the task tool with {{\"action\": \"result\", \"id\": \"{}\"}} to retrieve its output.\n```\nstderr=```\n\n```",
+                                id, sub.name, id
+                            ),
                             call_id,
                         ));
                         should_resume = self.status == AppStatus::Idle;
@@ -1603,10 +1610,13 @@ impl App {
                     self.memory.pending_write = None;
                     log::warn!("memory write pass failed: {}", error);
                 } else if let Some(sub) = self.subagents.get(id) {
-                    if sub.parent_call_id.is_some() {
+                    if sub.parent_call_id.is_some() && !self.subagents.is_sync(id) {
                         let call_id = sub.parent_call_id.clone().unwrap();
                         self.messages.push(Message::tool(
-                            format!("status=1\nstdout=```\n\n```\nstderr=```\n{}\n```", error),
+                            format!(
+                                "status=0\nstdout=```\nsubagent {} ({}) failed; call the task tool with {{\"action\": \"result\", \"id\": \"{}\"}} to retrieve the error details.\n```\nstderr=```\n\n```",
+                                id, sub.name, id
+                            ),
                             call_id,
                         ));
                         should_resume = self.status == AppStatus::Idle;
@@ -3144,6 +3154,140 @@ log_level = "info"
         assert!(!app.awaiting_memory_recall());
         app.maybe_dispatch_memory_write();
         assert!(app.memory.pending_write.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build an app for subagent-injection tests, with the spawned runners'
+    /// LLM endpoint unreachable so background tasks fail fast.
+    fn subagent_test_app(dir: &std::path::Path) -> App {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        write_agent_files(dir);
+        let _xdg = isolate_xdg_config(dir);
+
+        let mut config = test_config_with_history_dir(dir);
+        config.providers[0].base_url = "http://127.0.0.1:9".to_string();
+        App::new(config)
+    }
+
+    fn test_subagent_definition() -> AgentDefinition {
+        AgentDefinition {
+            name: "coder".to_string(),
+            description: "test agent".to_string(),
+            model_tier: None,
+            allowed_tools: Vec::new(),
+            permission: None,
+            skills: Vec::new(),
+            role: None,
+            body: "Do things.".to_string(),
+            source_path: std::path::PathBuf::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn async_subagent_completion_injects_notice_not_result() {
+        let dir = std::env::temp_dir().join(format!("catus_task_notice_{}", std::process::id()));
+        let mut app = subagent_test_app(&dir);
+        let definition = test_subagent_definition();
+        let id = app.subagents.spawn(
+            &definition,
+            "do things".to_string(),
+            crate::subagent::SubagentContextMode::Create,
+            Vec::new(),
+            ShellState::new(),
+            Vec::new(),
+            SkillRegistry::new(),
+            Some("call-task".to_string()),
+        );
+        app.subagents.get_mut(&id).unwrap().state = crate::subagent::SubagentState::Completed;
+        app.subagents.get_mut(&id).unwrap().result = Some("the secret result body".to_string());
+
+        let resumed = app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {
+            id: id.clone(),
+            result: "the secret result body".to_string(),
+        });
+        assert!(resumed, "the parent turn should resume on completion");
+
+        let notice = app
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-task"))
+            .expect("completion notice injected under the dispatch call id");
+        assert!(notice.content.contains("completed"));
+        assert!(notice.content.contains(&format!("\"id\": \"{}\"", id)));
+        assert!(notice.content.contains("\"action\": \"result\""));
+        // The result body itself must not leak into the conversation.
+        assert!(!notice.content.contains("the secret result body"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn async_subagent_failure_injects_notice_not_error() {
+        let dir = std::env::temp_dir().join(format!("catus_task_fnotice_{}", std::process::id()));
+        let mut app = subagent_test_app(&dir);
+        let definition = test_subagent_definition();
+        let id = app.subagents.spawn(
+            &definition,
+            "do things".to_string(),
+            crate::subagent::SubagentContextMode::Create,
+            Vec::new(),
+            ShellState::new(),
+            Vec::new(),
+            SkillRegistry::new(),
+            Some("call-task".to_string()),
+        );
+        app.subagents.get_mut(&id).unwrap().state = crate::subagent::SubagentState::Error;
+        app.subagents.get_mut(&id).unwrap().error = Some("llm unavailable".to_string());
+
+        app.handle_subagent_event(crate::subagent::SubagentEvent::Error {
+            id: id.clone(),
+            error: "llm unavailable".to_string(),
+        });
+
+        let notice = app
+            .messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("call-task"))
+            .expect("failure notice injected under the dispatch call id");
+        assert!(notice.content.contains("failed"));
+        assert!(notice.content.contains("\"action\": \"result\""));
+        assert!(!notice.content.contains("llm unavailable"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tasksync_completion_gets_no_notice() {
+        let dir = std::env::temp_dir().join(format!("catus_task_sync_{}", std::process::id()));
+        let mut app = subagent_test_app(&dir);
+        let definition = test_subagent_definition();
+        let (id, _rx) = app.subagents.spawn_sync(
+            &definition,
+            "do things".to_string(),
+            crate::subagent::SubagentContextMode::Create,
+            Vec::new(),
+            ShellState::new(),
+            Vec::new(),
+            SkillRegistry::new(),
+            Some("call-sync".to_string()),
+        );
+        app.subagents.get_mut(&id).unwrap().state = crate::subagent::SubagentState::Completed;
+        app.subagents.get_mut(&id).unwrap().result = Some("sync body".to_string());
+
+        app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {
+            id,
+            result: "sync body".to_string(),
+        });
+
+        // taskSync delivers the result through its own tool return; no extra
+        // notice message may be injected under the same call id.
+        assert!(
+            app.messages
+                .iter()
+                .all(|m| m.tool_call_id.as_deref() != Some("call-sync"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
