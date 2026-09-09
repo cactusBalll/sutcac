@@ -220,10 +220,18 @@ pub struct PermissionPolicy {
     pub allow1: HashSet<String>,
     /// Commands that are always denied, regardless of the mode.
     pub deny1: HashSet<String>,
-    /// Allowed read-only paths. Empty means no path restriction.
+    /// Allowed read-only paths. Empty means only the base directory
+    /// (see `base_dir`) is readable when a base directory is set.
     pub read_paths: Vec<PathBuf>,
-    /// Allowed read-write paths. Empty means no path restriction.
+    /// Allowed read-write paths. Empty means only the base directory
+    /// (see `base_dir`) is writable when a base directory is set.
     pub write_paths: Vec<PathBuf>,
+    /// Directory that is always readable and writable regardless of the
+    /// path lists (typically the workspace). Its presence also enables the
+    /// path checks: when it is set, every path outside the base directory
+    /// and the configured lists is denied. `None` keeps the legacy behavior
+    /// where empty path lists disable the path restriction entirely.
+    pub base_dir: Option<PathBuf>,
     /// Tags granted interactively for the rest of the session. They bypass
     /// the mode restrictions (including `deny` lists) for matching checks.
     pub session_grants: PermissionSet,
@@ -280,8 +288,17 @@ impl PermissionPolicy {
             deny1: HashSet::new(),
             read_paths: Vec::new(),
             write_paths: Vec::new(),
+            base_dir: None,
             session_grants: PermissionSet::empty(),
         }
+    }
+
+    /// Set the always-readable/writable base directory (typically the
+    /// workspace). The path is canonicalized; if that fails the policy keeps
+    /// the legacy unrestricted-path behavior.
+    pub fn with_base_dir(mut self, path: &Path) -> Self {
+        self.base_dir = path.canonicalize().ok();
+        self
     }
 
     /// Parse a permission policy string.
@@ -368,6 +385,7 @@ impl PermissionPolicy {
             deny1,
             read_paths: Vec::new(),
             write_paths: Vec::new(),
+            base_dir: None,
             session_grants: PermissionSet::empty(),
         };
         for (name, perms) in command_permissions {
@@ -456,10 +474,17 @@ impl PermissionPolicy {
     }
 
     /// Check whether the filesystem paths referenced by a command are allowed.
-    /// Empty path lists mean the feature is disabled and all paths are allowed.
-    /// `cwd` is the shell's current working directory, used to resolve relative paths.
+    ///
+    /// Path checks are enabled when `base_dir` is set (everything outside the
+    /// base directory and the configured lists is denied) or when any of the
+    /// path lists is non-empty. Otherwise the feature is disabled and all
+    /// paths are allowed.
+    /// `cwd` is the shell's current working directory, used to resolve
+    /// relative paths; containment is always checked against the base
+    /// directory (falling back to `cwd` when unset), so changing the working
+    /// directory cannot widen access.
     pub fn check_paths(&self, paths: &[CommandPath], cwd: &Path) -> Result<(), PermissionError> {
-        if self.read_paths.is_empty() && self.write_paths.is_empty() {
+        if self.base_dir.is_none() && self.read_paths.is_empty() && self.write_paths.is_empty() {
             return Ok(());
         }
         for cp in paths {
@@ -496,14 +521,21 @@ impl PermissionPolicy {
     }
 
     fn is_readable(&self, resolved: &Path, cwd: &Path) -> bool {
-        self.path_within_any(resolved, &[cwd.to_path_buf()])
+        self.path_within_any(resolved, &[self.allowed_base(cwd)])
             || self.path_within_any(resolved, &self.read_paths)
             || self.path_within_any(resolved, &self.write_paths)
     }
 
     fn is_writable(&self, resolved: &Path, cwd: &Path) -> bool {
-        self.path_within_any(resolved, &[cwd.to_path_buf()])
+        self.path_within_any(resolved, &[self.allowed_base(cwd)])
             || self.path_within_any(resolved, &self.write_paths)
+    }
+
+    /// The directory that is always readable and writable. Paths are checked
+    /// against this base (not the live working directory), so `cd` cannot
+    /// widen access.
+    fn allowed_base(&self, cwd: &Path) -> PathBuf {
+        self.base_dir.clone().unwrap_or_else(|| cwd.to_path_buf())
     }
 
     fn path_within_any(&self, resolved: &Path, allowed: &[PathBuf]) -> bool {
@@ -516,6 +548,29 @@ impl PermissionPolicy {
         self.read_paths = canonicalize_paths(read_paths);
         self.write_paths = canonicalize_paths(write_paths);
         self
+    }
+
+    /// Grant additional read/write path access for the rest of the session
+    /// (typically from an `ask_permission` interaction). Paths are resolved
+    /// against `cwd` and canonicalized the same way as `check_paths`
+    /// (nonexistent paths fall back to their nearest existing ancestor).
+    /// Writable paths are implicitly readable.
+    pub fn grant_paths(&mut self, read: &[PathBuf], write: &[PathBuf], cwd: &Path) {
+        for path in read {
+            Self::push_unique_path(&mut self.read_paths, path, cwd);
+        }
+        for path in write {
+            Self::push_unique_path(&mut self.write_paths, path, cwd);
+            Self::push_unique_path(&mut self.read_paths, path, cwd);
+        }
+    }
+
+    fn push_unique_path(paths: &mut Vec<PathBuf>, path: &Path, cwd: &Path) {
+        if let Some(resolved) = resolve_check_path(path, cwd) {
+            if !paths.contains(&resolved) {
+                paths.push(resolved);
+            }
+        }
     }
 }
 
@@ -711,7 +766,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_path_lists_allow_all_paths() {
+    fn empty_path_lists_allow_all_paths_without_base_dir() {
+        // Legacy behavior: without a base directory, empty path lists
+        // disable the path restriction entirely.
         let policy = PermissionPolicy::allow_all();
         policy
             .check_paths(
@@ -719,6 +776,73 @@ mod tests {
                 Path::new("/"),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn base_dir_enables_workspace_only_restriction() {
+        let tmp = std::env::temp_dir();
+        let base = tmp.join("sutcac_base_ws");
+        let outside = tmp.join("sutcac_base_outside");
+        let _ = std::fs::create_dir_all(&base);
+        let _ = std::fs::create_dir_all(&outside);
+
+        // Base directory set, empty path lists: only the base directory is
+        // readable and writable.
+        let policy = PermissionPolicy::allow_all().with_base_dir(&base);
+        policy
+            .check_paths(&[CommandPath::new(&base, PathAccess::Read)], &outside)
+            .unwrap();
+        policy
+            .check_paths(&[CommandPath::new(&base, PathAccess::Write)], &outside)
+            .unwrap();
+        policy
+            .check_paths(
+                &[CommandPath::new(base.join("new.txt"), PathAccess::Write)],
+                &outside,
+            )
+            .unwrap();
+        assert!(
+            policy
+                .check_paths(&[CommandPath::new(&outside, PathAccess::Read)], &base)
+                .is_err()
+        );
+        assert!(
+            policy
+                .check_paths(&[CommandPath::new(&outside, PathAccess::Write)], &base)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cd_outside_base_dir_does_not_widen_access() {
+        let tmp = std::env::temp_dir();
+        let base = tmp.join("sutcac_cd_base");
+        let outside = tmp.join("sutcac_cd_outside");
+        let _ = std::fs::create_dir_all(&base);
+        let _ = std::fs::create_dir_all(&outside);
+
+        // The agent cd'd into `outside`; the live cwd must NOT become an
+        // allowed root when a base directory is set.
+        let policy = PermissionPolicy::allow_all().with_base_dir(&base);
+        assert!(
+            policy
+                .check_paths(&[CommandPath::new(&outside, PathAccess::Read)], &outside)
+                .is_err()
+        );
+        assert!(
+            policy
+                .check_paths(&[CommandPath::new(&outside, PathAccess::Write)], &outside)
+                .is_err()
+        );
+        // Relative paths still resolve against the live cwd.
+        let relative = policy.check_paths(
+            &[CommandPath::new(
+                Path::new("../sutcac_cd_base/sub/rel.txt"),
+                PathAccess::Write,
+            )],
+            &outside,
+        );
+        assert!(relative.is_ok());
     }
 
     #[test]
@@ -829,6 +953,99 @@ mod tests {
         assert!(
             policy
                 .check_paths(&[CommandPath::new(&outside, PathAccess::Read)], &tmp)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn grant_paths_grants_session_path_access() {
+        let tmp = std::env::temp_dir();
+        let base = tmp.join("sutcac_grant_base");
+        let readable = tmp.join("sutcac_grant_read");
+        let writable = tmp.join("sutcac_grant_write");
+        let other = tmp.join("sutcac_grant_other");
+        for dir in [&base, &readable, &writable, &other] {
+            let _ = std::fs::create_dir_all(dir);
+        }
+
+        let mut policy = PermissionPolicy::allow_all().with_base_dir(&base);
+
+        // Before the grant everything outside the base is denied.
+        assert!(
+            policy
+                .check_paths(&[CommandPath::new(&readable, PathAccess::Read)], &base)
+                .is_err()
+        );
+
+        policy.grant_paths(&[readable.clone()], &[writable.clone()], &base);
+
+        // Granted read path is readable but not writable.
+        policy
+            .check_paths(&[CommandPath::new(&readable, PathAccess::Read)], &base)
+            .unwrap();
+        assert!(
+            policy
+                .check_paths(&[CommandPath::new(&readable, PathAccess::Write)], &base)
+                .is_err()
+        );
+
+        // Granted write path is writable and implicitly readable.
+        policy
+            .check_paths(&[CommandPath::new(&writable, PathAccess::Write)], &base)
+            .unwrap();
+        policy
+            .check_paths(&[CommandPath::new(&writable, PathAccess::Read)], &base)
+            .unwrap();
+
+        // Unrelated paths are still denied.
+        assert!(
+            policy
+                .check_paths(&[CommandPath::new(&other, PathAccess::Read)], &base)
+                .is_err()
+        );
+
+        // Duplicate grants do not pile up.
+        policy.grant_paths(&[readable.clone()], &[], &base);
+        assert_eq!(policy.read_paths.len(), 2); // readable + writable
+        assert_eq!(policy.write_paths.len(), 1); // writable
+    }
+
+    #[test]
+    fn grant_paths_resolves_nonexistent_children() {
+        let tmp = std::env::temp_dir();
+        let base = tmp.join("sutcac_grant_nb_base");
+        let target = tmp.join("sutcac_grant_nb_target");
+        let _ = std::fs::create_dir_all(&base);
+        let _ = std::fs::create_dir_all(&target);
+
+        let mut policy = PermissionPolicy::allow_all().with_base_dir(&base);
+        // Grant a not-yet-existing file path: it resolves via its existing
+        // parent and lands in the write list.
+        policy.grant_paths(
+            &[],
+            &[tmp.join("sutcac_grant_nb_target/new_file.txt")],
+            &base,
+        );
+        policy
+            .check_paths(
+                &[CommandPath::new(
+                    target.join("new_file.txt"),
+                    PathAccess::Write,
+                )],
+                &base,
+            )
+            .unwrap();
+        // Sibling files in the same directory remain denied: a granted file
+        // path only covers that file.
+        assert!(
+            policy
+                .check_paths(
+                    &[CommandPath::new(
+                        target.join("other.txt"),
+                        PathAccess::Write
+                    )],
+                    &base,
+                )
                 .is_err()
         );
     }

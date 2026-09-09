@@ -43,7 +43,10 @@ use crate::message::Message;
 use crate::skills::SkillRegistry;
 use crate::subagent::SubagentManager;
 
-pub use ask_permission::{AskPermissionTool, GRANT_DENY, GRANT_SESSION, parse_ask_permission_tags};
+pub use ask_permission::{
+    AskPermissionRequest, AskPermissionTool, GRANT_DENY, GRANT_SESSION,
+    parse_ask_permission_request, parse_ask_permission_tags,
+};
 pub use ask_user::{
     Answer, AskAnswer, AskOption, AskQuestion, AskUserTool, InteractionRequest, collect_answer,
 };

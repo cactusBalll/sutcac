@@ -10,7 +10,7 @@ use std::sync::Arc;
 use sutcac_sh::exec::ShellState;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::agents::{AgentDefinition, AgentRegistry};
+use crate::agents::{AgentDefinition, AgentRegistry, AgentRole};
 use crate::config::{AppConfig, ModelTier, TierModels};
 use crate::llm::{LlmClient, LlmError, Model, StreamEvent};
 use crate::mcp::McpManager;
@@ -432,6 +432,20 @@ impl SubagentManager {
         self.parent_mcp_manager = mcp_manager;
     }
 
+    /// Update the parent current-model snapshot used for future subagents.
+    ///
+    /// Tier-less agent definitions resolve against this model, so it must
+    /// track the main agent's `/model` switches and session restores.
+    pub fn update_parent_model(&mut self, model: Model) {
+        self.parent_current_model = model;
+    }
+
+    /// Snapshot of the parent model for tests.
+    #[cfg(test)]
+    pub(crate) fn parent_current_model_for_test(&self) -> &Model {
+        &self.parent_current_model
+    }
+
     /// Insert a subagent without a runner. Only for tests in other modules
     /// that need managed subagent state without spawning a task.
     #[cfg(test)]
@@ -650,6 +664,20 @@ impl SubagentRunner {
         mode: SubagentContextMode,
         parent: &ParentSnapshot,
     ) -> (ShellState, Vec<String>, SkillRegistry) {
+        // The memory subagent works exclusively on the Agent Memory store:
+        // its path-permission base (and working directory) is the memory
+        // directory, so it can neither read nor write the workspace.
+        let memory_dir = if definition.role == Some(AgentRole::Memory) {
+            let dir = parent.config.dirs.memory.clone();
+            let _ = std::fs::create_dir_all(&dir);
+            dir.canonicalize().ok()
+        } else {
+            None
+        };
+        // Every other subagent shares the parent's path base (the workspace).
+        let base_dir = memory_dir
+            .clone()
+            .or_else(|| parent.shell_state.permissions.base_dir.clone());
         match mode {
             SubagentContextMode::Fork => {
                 // Fork inherits the parent's environment, variables, and cwd,
@@ -664,7 +692,12 @@ impl SubagentRunner {
                     }
                     shell
                 };
-                shell_state.set_permission_policy(shell_config.permission_policy());
+                let mut policy = shell_config.permission_policy();
+                policy.base_dir = base_dir;
+                shell_state.set_permission_policy(policy);
+                if let Some(dir) = memory_dir {
+                    shell_state.cwd = dir;
+                }
                 (
                     shell_state,
                     if definition.inherits_skills() {
@@ -683,11 +716,15 @@ impl SubagentRunner {
                     }
                     shell
                 };
+                let mut policy = shell_config.permission_policy();
+                policy.base_dir = base_dir;
+                let mut shell_state =
+                    ShellState::with_policy_and_logger(policy, shell_config.audit_logger());
+                if let Some(dir) = memory_dir {
+                    shell_state.cwd = dir;
+                }
                 (
-                    ShellState::with_policy_and_logger(
-                        shell_config.permission_policy(),
-                        shell_config.audit_logger(),
-                    ),
+                    shell_state,
                     definition.explicit_skills(),
                     SkillRegistry::new(),
                 )
@@ -1071,6 +1108,97 @@ mod tests {
         assert!(shell.permissions.check(&custom_network()).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_subagent_is_confined_to_the_memory_directory() {
+        use sutcac_sh::permissions::{CommandPath, PathAccess};
+
+        let ws = std::env::temp_dir().join(format!("catus_sub_mem_ws_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let agent_dir =
+            std::env::temp_dir().join(format!("catus_sub_mem_agents_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&agent_dir);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("memory.md"),
+            "---\nname: memory\ndescription: memory agent\nrole: memory\n---\nBody.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("coder.md"),
+            "---\nname: coder\ndescription: coder agent\n---\nBody.\n",
+        )
+        .unwrap();
+        let registry = AgentRegistry::discover(&[agent_dir.to_path_buf()]).unwrap();
+
+        let mut config = AppConfig::default();
+        config.dirs.memory =
+            std::env::temp_dir().join(format!("catus_sub_mem_store_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config.dirs.memory);
+        let expected_base = config.dirs.memory.clone();
+
+        let mut parent_shell = ShellState::new();
+        parent_shell.permissions.base_dir = Some(ws.clone());
+        let parent = ParentSnapshot {
+            messages: Vec::new(),
+            shell_state: parent_shell,
+            toolbox: Toolbox::default(),
+            active_skills: Vec::new(),
+            tier_models: TierModels::default(),
+            current_model: unreachable_model(),
+            skill_registry: SkillRegistry::new(),
+            config,
+            mcp_manager: None,
+        };
+
+        let memory = registry.get("memory").unwrap();
+        let coder = registry.get("coder").unwrap();
+        for (definition, expect_memory_base) in [(memory, true), (coder, false)] {
+            for mode in [SubagentContextMode::Fork, SubagentContextMode::Create] {
+                let (shell, _, _) =
+                    SubagentRunner::build_runtime_context(definition, mode, &parent);
+                if expect_memory_base {
+                    // The memory agent is confined to the memory directory:
+                    // its base and cwd point there, the workspace is denied.
+                    assert_eq!(
+                        shell.permissions.base_dir.clone(),
+                        Some(expected_base.clone())
+                    );
+                    assert_eq!(shell.cwd, expected_base);
+                    assert!(
+                        shell
+                            .permissions
+                            .check_paths(&[CommandPath::new(&ws, PathAccess::Read)], &shell.cwd)
+                            .is_err()
+                    );
+                    assert!(
+                        shell
+                            .permissions
+                            .check_paths(&[CommandPath::new(&ws, PathAccess::Write)], &shell.cwd)
+                            .is_err()
+                    );
+                    assert!(
+                        shell
+                            .permissions
+                            .check_paths(
+                                &[CommandPath::new(&expected_base, PathAccess::Write)],
+                                &shell.cwd,
+                            )
+                            .is_ok()
+                    );
+                } else {
+                    // Plain subagents keep the workspace as their base.
+                    assert_eq!(shell.permissions.base_dir.clone(), Some(ws.clone()));
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&agent_dir);
+        let _ = std::fs::remove_dir_all(&expected_base);
     }
 
     #[tokio::test]

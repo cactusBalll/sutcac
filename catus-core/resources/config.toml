@@ -111,6 +111,12 @@ cp = ["read", "write"]
 mv = ["read", "write"]
 dd = ["read", "write"]
 
-# Optional path-based access control. Empty lists mean no restriction.
+# Optional path-based access control. The current working directory (the
+# workspace) is always readable and writable; every other directory is denied
+# by default. Writable directories are implicitly readable. Extra directories
+# can be granted per session via the `ask_permission` tool. To lift the
+# restriction entirely, allow the root:
+#   read_paths = ["/"]
+#   write_paths = ["/"]
 # read_paths = ["/home/user/data"]
 # write_paths = ["/home/user/projects"]

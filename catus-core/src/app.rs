@@ -20,7 +20,7 @@ use crate::tool::McpServerTool;
 use crate::tool::{
     AskAnswer, AskPermissionTool, AskQuestion, AskUserTool, EditTool, GRANT_SESSION, ReadTool,
     ShellTool, SkillTool, TaskSyncTool, TaskTool, TodoList, TodoTool, Tool, ToolCall, ToolContext,
-    ToolResult, Toolbox, parse_ask_permission_tags,
+    ToolResult, Toolbox, parse_ask_permission_request,
 };
 
 pub mod command;
@@ -252,6 +252,11 @@ impl App {
 
         let mut shell_state = ShellState::with_policy_and_logger(permissions, audit_logger);
         shell_state.args = Vec::new();
+        let session_cwd = session_cwd();
+        // Path-permission base: the session workspace is always readable and
+        // writable; everything else is denied unless explicitly allowed
+        // (config path lists, session grants via ask_permission).
+        shell_state.permissions.base_dir = std::path::Path::new(&session_cwd).canonicalize().ok();
 
         let mut search_paths = SkillRegistry::default_paths();
         if let Some(extra) = &config.agent.skill_paths {
@@ -308,7 +313,6 @@ impl App {
             },
             None => (None, String::new()),
         };
-        let session_cwd = session_cwd();
 
         let (stream_tx, stream_rx) = mpsc::channel(128);
         let (done_tx, done_rx) = mpsc::channel(1);
@@ -971,6 +975,10 @@ impl App {
         );
         self.current_model = model;
         self.rebuild_client();
+        // Tier-less subagent definitions resolve against the parent's current
+        // model, so keep the subagent manager's snapshot in sync.
+        self.subagents
+            .update_parent_model(self.current_model.clone());
         self.persist_session();
         Ok(msg)
     }
@@ -1014,17 +1022,7 @@ impl App {
             "shell.perm_mode" => {
                 let shell = self.config.shell.get_or_insert_with(ShellConfig::default);
                 shell.perm_mode = Some(value.to_string());
-                let (permissions, audit_logger) = self
-                    .config
-                    .shell
-                    .clone()
-                    .map(|s| (s.permission_policy(), s.audit_logger()))
-                    .unwrap_or_else(|| {
-                        let default = ShellConfig::default();
-                        (default.permission_policy(), default.audit_logger())
-                    });
-                self.shell_state.set_permission_policy(permissions);
-                self.shell_state.set_audit_logger(audit_logger);
+                self.rebuild_shell_policy();
             }
             _ => return Err(format!("unknown config field: {}", key).into()),
         }
@@ -1086,6 +1084,30 @@ impl App {
         self.pending_tool_calls.len()
     }
 
+    /// Rebuild the main agent's shell permission policy and audit logger from
+    /// the configured `[shell]` section, preserving the path-permission base
+    /// directory (the session workspace).
+    fn rebuild_shell_policy(&mut self) {
+        let (mut permissions, audit_logger) = self
+            .config
+            .shell
+            .clone()
+            .map(|s| (s.permission_policy(), s.audit_logger()))
+            .unwrap_or_else(|| {
+                let default = ShellConfig::default();
+                (default.permission_policy(), default.audit_logger())
+            });
+        permissions.base_dir = self.path_base_dir();
+        self.shell_state.set_permission_policy(permissions);
+        self.shell_state.set_audit_logger(audit_logger);
+    }
+
+    /// The directory that is always readable and writable for the main agent:
+    /// the canonicalized session workspace.
+    fn path_base_dir(&self) -> Option<std::path::PathBuf> {
+        std::path::Path::new(&self.session_cwd).canonicalize().ok()
+    }
+
     /// Human-readable summary of the main agent's current shell permission
     /// policy: mode, interactively granted session tags, and path
     /// restrictions.
@@ -1111,14 +1133,21 @@ impl App {
             ),
             format!(
                 "path restrictions: {}",
-                if policy.read_paths.is_empty() && policy.write_paths.is_empty() {
-                    "none".to_string()
-                } else {
-                    format!(
+                match policy.base_dir.as_deref() {
+                    Some(base) => format!(
+                        "base {}, read: {} dir(s), write: {} dir(s)",
+                        base.display(),
+                        policy.read_paths.len(),
+                        policy.write_paths.len()
+                    ),
+                    None if policy.read_paths.is_empty() && policy.write_paths.is_empty() => {
+                        "none".to_string()
+                    }
+                    None => format!(
                         "read: {} dir(s), write: {} dir(s)",
                         policy.read_paths.len(),
                         policy.write_paths.len()
-                    )
+                    ),
                 }
             ),
         ];
@@ -1148,17 +1177,7 @@ impl App {
     /// Reset the main agent's shell permission policy to the configured
     /// default (drops all session grants).
     pub fn reset_session_permissions(&mut self) {
-        let (permissions, audit_logger) = self
-            .config
-            .shell
-            .clone()
-            .map(|s| (s.permission_policy(), s.audit_logger()))
-            .unwrap_or_else(|| {
-                let default = ShellConfig::default();
-                (default.permission_policy(), default.audit_logger())
-            });
-        self.shell_state.set_permission_policy(permissions);
-        self.shell_state.set_audit_logger(audit_logger);
+        self.rebuild_shell_policy();
         log::info!("session permissions reset via /permission");
     }
 
@@ -1279,33 +1298,38 @@ impl App {
             .is_some_and(|(call, _)| call.name == "ask_permission")
         {
             let (call, _) = self.pending_interaction.as_ref().unwrap();
-            let tags = parse_ask_permission_tags(&call.arguments);
+            let request = parse_ask_permission_request(&call.arguments, &self.shell_state.cwd);
             let choice = answers.first().map(|a| match &a.answer {
                 crate::tool::Answer::One(label) => label.as_str(),
                 crate::tool::Answer::Many(labels) => {
                     labels.first().map(String::as_str).unwrap_or_default()
                 }
             });
-            let (status, stdout) = match (tags, choice) {
-                (Some(tags), Some(GRANT_SESSION)) => {
-                    for tag in &tags {
+            let (status, stdout) = match (request, choice) {
+                (Some(request), Some(GRANT_SESSION)) => {
+                    for tag in &request.tags {
                         self.shell_state.permissions.grant_tag(tag);
                     }
-                    log::info!("session permissions granted: {}", tags.join(", "));
+                    if !request.read_paths.is_empty() || !request.write_paths.is_empty() {
+                        self.shell_state.permissions.grant_paths(
+                            &request.read_paths,
+                            &request.write_paths,
+                            &self.shell_state.cwd,
+                        );
+                    }
+                    log::info!("session permissions granted: {}", request.summary());
                     (
                         0,
-                        format!(
-                            "granted: permission(s) \"{}\" for this session",
-                            tags.join(", ")
-                        ),
+                        format!("granted for this session: {}", request.summary()),
                     )
                 }
-                (tags, _) => (
+                (request, _) => (
                     1,
                     format!(
-                        "denied: the user did not grant permission(s) {}",
-                        tags.map(|t| format!("\"{}\"", t.join(", ")))
-                            .unwrap_or_else(|| "(unknown)".to_string())
+                        "denied: the user did not grant {}",
+                        request
+                            .map(|r| r.summary())
+                            .unwrap_or_else(|| "(unknown request)".to_string())
                     ),
                 ),
             };
@@ -1661,6 +1685,10 @@ impl App {
             self.current_model.clone(),
             &self.session_id,
         );
+        // Restored subagents resolve their tier-less model against this
+        // snapshot, so it must match the restored session model.
+        self.subagents
+            .update_parent_model(self.current_model.clone());
 
         // Pending tool calls: re-run them so the assistant's tool_calls keep
         // matching tool results in the conversation. task/taskSync dispatches
@@ -2438,15 +2466,29 @@ log_level = "info"
         });
         let mut app = App::new(config);
         assert_eq!(app.current_model.id, "test-model");
+        assert_eq!(
+            app.subagents.parent_current_model_for_test().id,
+            "test-model"
+        );
 
         let msg = app.set_model("Other").unwrap();
         assert!(msg.contains("Other"));
         assert_eq!(app.current_model.id, "other-model");
         assert_eq!(app.client.session_id(), app.session_id);
+        // Tier-less subagents resolve against the parent's current model, so
+        // the manager's snapshot must follow the switch.
+        assert_eq!(
+            app.subagents.parent_current_model_for_test().id,
+            "other-model"
+        );
 
         assert!(app.set_model("nosuch").is_err());
         // Failed switches keep the previous model.
         assert_eq!(app.current_model.id, "other-model");
+        assert_eq!(
+            app.subagents.parent_current_model_for_test().id,
+            "other-model"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2766,7 +2808,7 @@ log_level = "info"
         app.pending_interaction = Some((call, Vec::new()));
 
         let answers = vec![AskAnswer {
-            prompt: "Grant shell permission(s) \"NETWORK, WRITE\"?".to_string(),
+            prompt: "Grant shell permission(s)?\n\nRequest: tags NETWORK, WRITE".to_string(),
             answer: crate::tool::Answer::One(GRANT_SESSION.to_string()),
         }];
         assert!(app.complete_interaction(answers));
@@ -2774,7 +2816,7 @@ log_level = "info"
         let last = app.messages.last().expect("tool result message");
         assert!(
             last.content
-                .contains("granted: permission(s) \"NETWORK, WRITE\" for this session")
+                .contains("granted for this session: tags NETWORK, WRITE")
         );
         let mut network = sutcac_sh::permissions::PermissionSet::empty();
         network.insert(sutcac_sh::permissions::Permission::Custom(
@@ -2825,6 +2867,66 @@ log_level = "info"
         assert!(app.messages.iter().all(|m| m.role != Role::Tool));
     }
 
+    #[test]
+    fn ask_permission_interaction_grants_session_paths() {
+        use sutcac_sh::permissions::{CommandPath, PathAccess};
+
+        let mut app = App::new(AppConfig::default());
+        let ws = std::env::temp_dir().join(format!("catus_perm_ws_{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("catus_perm_out_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&ws);
+        let _ = std::fs::create_dir_all(&outside);
+        app.session_cwd = ws.display().to_string();
+        app.shell_state.permissions =
+            sutcac_sh::permissions::PermissionPolicy::allow_all().with_base_dir(&ws);
+        app.shell_state.cwd = ws.clone();
+
+        let call = ToolCall {
+            id: "call_perm_paths".to_string(),
+            name: "ask_permission".to_string(),
+            arguments: format!(
+                r#"{{"write_paths":["{}"],"reason":"build output"}}"#,
+                outside.display()
+            ),
+        };
+        app.messages.push(Message::assistant(String::new()));
+        app.add_tool_call(call.clone());
+        app.pending_interaction = Some((call, Vec::new()));
+
+        let answers = vec![AskAnswer {
+            prompt: "Grant shell permission(s)?".to_string(),
+            answer: crate::tool::Answer::One(crate::tool::GRANT_SESSION.to_string()),
+        }];
+        assert!(app.complete_interaction(answers));
+        let last = app.messages.last().expect("tool result message");
+        assert!(last.content.contains("granted for this session"));
+        assert!(last.content.contains("write"));
+
+        // The granted directory is now writable; the workspace stays allowed
+        // and unrelated directories remain denied.
+        app.shell_state
+            .permissions
+            .check_paths(&[CommandPath::new(&outside, PathAccess::Write)], &ws)
+            .unwrap();
+        app.shell_state
+            .permissions
+            .check_paths(&[CommandPath::new(&ws, PathAccess::Write)], &ws)
+            .unwrap();
+
+        let other = std::env::temp_dir().join(format!("catus_perm_other_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&other);
+        assert!(
+            app.shell_state
+                .permissions
+                .check_paths(&[CommandPath::new(&other, PathAccess::Write)], &ws)
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
     /// Build a config whose agent definitions live in `dir` (must contain
     /// `main.md` and, optionally, a `role: memory` agent) with memory enabled.
     fn memory_test_config(dir: &std::path::Path, auto_write: bool) -> AppConfig {
@@ -2855,12 +2957,47 @@ log_level = "info"
         .unwrap();
     }
 
+    /// Serialize XDG isolation and redirect `XDG_CONFIG_HOME` to a scratch
+    /// directory for the guard's lifetime, so ambient agent/skill definitions
+    /// under the real XDG directory cannot leak into agent discovery and
+    /// collide with the test's own definitions.
+    static XDG_ISOLATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct XdgIsolation {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for XdgIsolation {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
+                None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            }
+        }
+    }
+
+    fn isolate_xdg_config(base: &std::path::Path) -> XdgIsolation {
+        let lock = XDG_ISOLATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let xdg = base.join("xdg");
+        std::fs::create_dir_all(&xdg).unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &xdg) };
+        XdgIsolation {
+            _lock: lock,
+            previous,
+        }
+    }
+
     #[tokio::test]
     async fn memory_recall_dispatch_withholds_and_injects() {
         let dir = std::env::temp_dir().join(format!("catus_memory_recall_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         write_agent_files(&dir);
+        let _xdg = isolate_xdg_config(&dir);
 
         let config = memory_test_config(&dir, false);
         let mut app = App::new(config);
@@ -2920,6 +3057,7 @@ log_level = "info"
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         write_agent_files(&dir);
+        let _xdg = isolate_xdg_config(&dir);
 
         let config = memory_test_config(&dir, false);
         let mut app = App::new(config);
@@ -2947,6 +3085,7 @@ log_level = "info"
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         write_agent_files(&dir);
+        let _xdg = isolate_xdg_config(&dir);
 
         let config = memory_test_config(&dir, true);
         let mut app = App::new(config);
@@ -2994,6 +3133,7 @@ log_level = "info"
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         write_agent_files(&dir);
+        let _xdg = isolate_xdg_config(&dir);
 
         let mut config = memory_test_config(&dir, true);
         config.agent.memory.enabled = false;
@@ -3014,6 +3154,7 @@ log_level = "info"
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         write_agent_files(&dir);
+        let _xdg = isolate_xdg_config(&dir);
 
         let config = memory_test_config(&dir, true);
         let mut app = App::new(config);
