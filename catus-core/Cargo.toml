@@ -24,6 +24,7 @@ serde_json = "1.0.151"
 sutcac-sh = { path = "../sutcac-sh" }
 tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.4"
+toml_edit = "0.25"
 
 [dev-dependencies]
 tempfile = "3"

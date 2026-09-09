@@ -1,0 +1,15 @@
+{
+  "name": "catus-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./style.css": "./src/style.css",
+    "./*": "./src/*"
+  },
+  "dependencies": {
+    "pinia": "^4.0.3",
+    "vue": "^3.5.13"
+  }
+}

@@ -4,11 +4,14 @@ Guide for AI agents working in this repo. All commands run from the workspace ro
 
 ## Overview
 
-Rust workspace (edition 2024, needs Rust 1.85+) with four crates:
+Rust workspace (edition 2024, needs Rust 1.85+) with six crates:
 
 - `sutcac-sh` — simplified Bash-compatible shell: hand-written lexer → recursive-descent parser (`ast.rs`) → word expansion (`expand.rs`, `glob.rs`, `arith.rs`) → execution (`exec.rs`). Also a library consumed by catus-core.
-- `catus-core` — the frontend-independent Agent runtime: OpenAI-compatible streaming client (`llm.rs`), tool dispatch (`tool/`, `tool.rs`), subagents (`subagent.rs`), MCP client (`mcp.rs`), SQLite session history (`history.rs`, rusqlite/bundled, `~/.config/catus/history/sessions.db`), Agent Memory (`memory.rs`), and the turn state machine in `app.rs` orchestrated by `runtime.rs`. Zero UI dependencies (no ratatui/crossterm).
+- `catus-core` — the frontend-independent Agent runtime: OpenAI-compatible streaming client (`llm.rs`), tool dispatch (`tool/`, `tool.rs`), subagents (`subagent.rs`), MCP client (`mcp.rs`), SQLite session history (`history.rs`, rusqlite/bundled, `~/.config/catus/history/sessions.db`), Agent Memory (`memory.rs`), and the turn state machine in `app.rs` orchestrated by `runtime.rs`. Zero UI dependencies (no ratatui/crossterm). `bootstrap.rs` holds the shared startup for all frontends (`load_config`, `bootstrap_runtime`).
 - `catus` — the TUI frontend binary: ratatui UI (`ui/`), terminal lifecycle + OSC (`tui.rs`), and TUI-owned view state (`ui/state.rs` = `UiState`: input line, chat scroll, overlays). It depends on `catus-core` and drives the runtime through semantic actions (`App::handle_input_line`, `complete_interaction`, …) while consuming `RuntimeEvent`s from `Runtime::next_event`. The headless `--test` mode runs the same event loop.
+- `catus-web` — the Tauri 2 + Vue 3 web frontend (`catus-web/`): `src-tauri/` is a thin Rust bridge (a single actor task owns the `Runtime`, serving Tauri commands `send_input`/`complete_interaction`/`cancel_interaction`/`overlay_action`/`get_snapshot`/`get_subagent_messages`/`quit_app` and emitting `runtime-event` (serialized `RuntimeEvent`), `snapshot` (serialized `AppSnapshot`), `startup-error`); `src/` is a thin Vue shell (Tauri transport + entry), with all components/overlays/store shared from `catus-ui`. Run with `cd catus-web && npm run tauri dev`; accepts `-w/--workspace <dir>`. Linux needs the webkit2gtk-4.1 dev packages.
+- `catus-server` — the axum + tower HTTP/WebSocket server frontend (`catus-server/`): mirrors the Tauri bridge (`src/actor.rs` = the single `Runtime` owner with the same `Command` enum; events broadcast instead of emitted), exposes the same seven actions as REST routes (`/api/input`, `/api/interaction/complete`, `/api/interaction/cancel`, `/api/overlay`, `/api/snapshot`, `/api/subagents/{id}/messages`, `/api/quit`) plus `GET /ws` (frames `{"channel": "runtime-event"|"snapshot"|"startup-error"|"app-quit", "payload": ...}`; initial snapshot on connect; multi-client broadcast), `GET /api/completion?input=…` (slash-command candidates served straight from the static `BUILT_IN_REGISTRY`, no actor round-trip; the web UI completes plain text from its own session history), and `POST /api/config` + `POST /api/config/remove` (scope-aware config editing: `App::set_config_field_in`/`remove_config_field_in` write into the workspace `./.sutcac/config.toml` or the global XDG `config.toml` via `toml_edit` (comments/unknown keys preserved), snapshotting per-scope state in `AppSnapshot.config_scopes`; the runtime only adopts a value when its scope wins — workspace overrides global key by key; the editor is a three-tab layout (effective/workspace/global) opened from the status-bar `config` button). Editable fields are spec-driven (`CONFIG_FIELD_SPECS` in `catus-core/src/app.rs`: 9 fields — int `agent.max_tool_rounds`, strings `agent.log_level`/`shell.perm_mode`, bools `agent.auto_include_skills`/`agent.memory.{enabled,auto_recall,auto_write}`, lists `shell.{read,write}_paths`; `App::apply_config_field_effect` documents each field's live effect, e.g. bool/list values convert from `true|false` and comma-separated strings). The status-bar model name opens the model picker (the bare-`/model` menu; `switch_model` takes the model id, which `/model list` now shows per entry). The Vue UI (`web/`, thin shell over `catus-ui` with an HTTP/WS transport and auto-reconnect) is embedded via `rust-embed` from `web/dist` (debug builds read from disk; `--static-dir` overrides). Binds `127.0.0.1:3117` by default (`--host/--port`), accepts `-w/--workspace <dir>`. No auth — local use only.
+- `catus-ui` — the shared npm package (`catus-ui/`, npm workspaces): all frontend components + overlays, the Pinia store (`stores/runtime.ts`), TS payload types, `CatusApp.vue`, and the `CatusTransport` interface (`transport.ts`: 7 command methods + `subscribe(onRuntimeEvent/onSnapshot/onStartupError/onQuit)`). Backends are injected per frontend (`catus-web/src/transport/tauri.ts`, `catus-server/web/src/transport/http.ts`).
 - `mcp-calc-server` — standalone calculator MCP server used to test catus's MCP client support. Exposes arithmetic tools (`sum`, `sub`, `mul`, `div`, `modulo`). Serves stdio by default, or Streamable HTTP with `--http <addr>`.
 
 ### Frontend/runtime boundary (for future Web / ACP frontends)
@@ -115,13 +118,21 @@ cargo run -p catus -- -w <dir> --test "p" # -w/--workspace: run against another
                                           # working directory (workspace config,
                                           # agents/skills, and session cwd)
 
+cd catus-web && npm run tauri dev         # Agent web frontend (Tauri + Vue)
+
+cargo run -p catus-server                 # Agent HTTP/WS server + web UI (127.0.0.1:3117)
+cargo run -p catus-server -- -w <dir> --port 4000  # another workspace/port
+cd catus-server/web && npm run dev        # UI hot-reload dev (proxies /api + /ws to :3117)
+
 cargo run -p mcp-calc-server              # calculator MCP server (stdio)
 cargo test -p mcp-calc-server             # unit + integration tests against catus MCP client
 ```
 
-Both binaries accept `-w/--workspace <dir>`: the process switches into the directory before config loading, so the workspace config (`<dir>/.sutcac/config.toml`), workspace agents/skills, and (for catus) the session-history cwd are all resolved against it.
+All four frontends (TUI, Tauri web, HTTP server, headless) accept `-w/--workspace <dir>`: the process switches into the directory before config loading, so the workspace config (`<dir>/.sutcac/config.toml`), workspace agents/skills, and the session-history cwd are all resolved against it.
 
-No CI, lint config, or integration tests exist. Tests currently pass (~105 + 4 in sutcac-sh, ~197 in catus-core, ~43 in catus, ~9 in mcp-calc-server).
+npm packages are managed as a root-level npm workspace (`package.json` at the repo root: `catus-ui`, `catus-web`, `catus-server/web`; `npm install` at the root sets up everything).
+
+No CI, lint config, or integration tests exist. Tests currently pass (~105 + 4 in sutcac-sh, ~197 in catus-core, ~43 in catus, ~12 in catus-server, ~9 in mcp-calc-server).
 
 ## Configuration
 

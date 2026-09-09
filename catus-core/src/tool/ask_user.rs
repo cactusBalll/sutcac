@@ -52,7 +52,7 @@ pub struct AskOption {
 }
 
 /// The user's answer to one question, sent back to the model.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AskAnswer {
     /// The question that was answered (the full prompt text).
     pub prompt: String,
@@ -61,7 +61,7 @@ pub struct AskAnswer {
 }
 
 /// An answer value: a single label, or a list of labels for multi-select.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Answer {
     One(String),

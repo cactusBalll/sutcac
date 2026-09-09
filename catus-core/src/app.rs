@@ -59,8 +59,49 @@ pub enum RuntimeEvent {
     TurnComplete,
 }
 
+impl serde::Serialize for RuntimeEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        match self {
+            RuntimeEvent::StreamText(text) => {
+                map.serialize_entry("type", "stream_text")?;
+                map.serialize_entry("text", text)?;
+            }
+            RuntimeEvent::StreamReasoning(text) => {
+                map.serialize_entry("type", "stream_reasoning")?;
+                map.serialize_entry("text", text)?;
+            }
+            RuntimeEvent::ToolCallAdded(call) => {
+                map.serialize_entry("type", "tool_call_added")?;
+                map.serialize_entry("call", call)?;
+            }
+            RuntimeEvent::UsageUpdated(usage) => {
+                map.serialize_entry("type", "usage_updated")?;
+                map.serialize_entry("usage", usage)?;
+            }
+            RuntimeEvent::MessagesChanged => {
+                map.serialize_entry("type", "messages_changed")?;
+            }
+            RuntimeEvent::InteractionRequested(questions) => {
+                map.serialize_entry("type", "interaction_requested")?;
+                map.serialize_entry("questions", questions)?;
+            }
+            RuntimeEvent::SubagentEvent(event) => {
+                map.serialize_entry("type", "subagent_event")?;
+                map.serialize_entry("event", event)?;
+            }
+            RuntimeEvent::TurnComplete => {
+                map.serialize_entry("type", "turn_complete")?;
+            }
+        }
+        map.end()
+    }
+}
+
 /// Current high-level state of the application.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AppStatus {
     Idle,
     Streaming,
@@ -69,7 +110,8 @@ pub enum AppStatus {
 }
 
 /// Outcome of submitting one input line to the app.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputLineOutcome {
     /// The input was a slash command and has been handled.
     Handled(CommandOutcome),
@@ -89,6 +131,50 @@ pub enum TurnPhase {
     PausedInteraction,
     /// The turn has finished (or failed).
     Complete,
+}
+
+/// Summary of one subagent, as exposed to remote frontends.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubagentSummary {
+    pub id: String,
+    pub name: String,
+    pub task: String,
+    pub state: crate::subagent::SubagentState,
+    pub mode: crate::subagent::SubagentContextMode,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Serializable snapshot of the session state for remote frontends.
+///
+/// A frontend that cannot read `App` fields directly (e.g. a Tauri webview)
+/// pulls this once at startup and after every `MessagesChanged` it missed,
+/// instead of keeping a full parallel mirror of the core state.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AppSnapshot {
+    pub status: AppStatus,
+    pub status_message: String,
+    pub session_id: String,
+    pub session_cwd: String,
+    pub current_model: Model,
+    pub models: Vec<Model>,
+    pub messages: Vec<Message>,
+    pub usage: Usage,
+    pub request_count: usize,
+    pub active_skills: Vec<String>,
+    pub todos: TodoList,
+    pub subagents: Vec<SubagentSummary>,
+    pub should_quit: bool,
+    pub memory_available: bool,
+    pub memory_session_enabled: bool,
+    /// Editable config fields as (key, current_value) pairs (the config page).
+    pub config_fields: Vec<(String, String)>,
+    /// Metadata for the editable config fields (kind + description, drives
+    /// the web config editor's widgets).
+    pub config_field_specs: Vec<crate::config::ConfigFieldSpec>,
+    /// Per-scope config files with their editable field values (the web
+    /// config editor; workspace values override global ones).
+    pub config_scopes: Vec<crate::config::ConfigScopeSnapshot>,
 }
 
 /// Mutable application state shared between the TUI and async workers.
@@ -171,6 +257,146 @@ pub struct App {
 
 /// How long transient status-bar messages remain visible before clearing.
 const STATUS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Config fields editable through `/config set` and the web config editor.
+/// The kind drives value conversion and editor widgets; the runtime effect
+/// of each field is documented in [`App::apply_config_field_effect`].
+pub const CONFIG_FIELD_SPECS: &[crate::config::ConfigFieldSpec] = &[
+    crate::config::ConfigFieldSpec {
+        key: "agent.max_tool_rounds",
+        kind: crate::config::ConfigFieldKind::Int,
+        description: "max tool-call rounds per turn",
+    },
+    crate::config::ConfigFieldSpec {
+        key: "agent.log_level",
+        kind: crate::config::ConfigFieldKind::String,
+        description: "trace | debug | info | warn | error (applies on next start)",
+    },
+    crate::config::ConfigFieldSpec {
+        key: "agent.auto_include_skills",
+        kind: crate::config::ConfigFieldKind::Bool,
+        description: "append the skill catalog to the system prompt",
+    },
+    crate::config::ConfigFieldSpec {
+        key: "agent.memory.enabled",
+        kind: crate::config::ConfigFieldKind::Bool,
+        description: "master memory switch (needs a role: memory agent)",
+    },
+    crate::config::ConfigFieldSpec {
+        key: "agent.memory.auto_recall",
+        kind: crate::config::ConfigFieldKind::Bool,
+        description: "dispatch a recall pass before each user turn",
+    },
+    crate::config::ConfigFieldSpec {
+        key: "agent.memory.auto_write",
+        kind: crate::config::ConfigFieldKind::Bool,
+        description: "dispatch a summarize pass after each turn",
+    },
+    crate::config::ConfigFieldSpec {
+        key: "shell.perm_mode",
+        kind: crate::config::ConfigFieldKind::String,
+        description: "allow_all | allow:<tags> | deny:<tags> | allow1:<cmds> | deny1:<cmds>",
+    },
+    crate::config::ConfigFieldSpec {
+        key: "shell.read_paths",
+        kind: crate::config::ConfigFieldKind::List,
+        description: "additional readable directories (comma-separated)",
+    },
+    crate::config::ConfigFieldSpec {
+        key: "shell.write_paths",
+        kind: crate::config::ConfigFieldKind::List,
+        description: "additional writable directories (comma-separated)",
+    },
+];
+
+/// Parse a `true`/`false` (case-insensitive) config value.
+fn parse_bool_value(key: &str, value: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    match value.trim().to_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("'{}' expects true or false, got '{}'", key, value).into()),
+    }
+}
+
+/// Parse a comma-separated string list; empty segments are dropped.
+fn parse_string_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Convert a user-supplied value into the TOML item stored for `key`,
+/// rejecting unknown keys and unparseable values.
+fn config_field_toml_item(
+    key: &str,
+    value: &str,
+) -> Result<toml_edit::Item, Box<dyn std::error::Error>> {
+    let spec = CONFIG_FIELD_SPECS
+        .iter()
+        .find(|spec| spec.key == key)
+        .ok_or_else(|| format!("unknown config field: {}", key))?;
+    match spec.kind {
+        crate::config::ConfigFieldKind::Int => {
+            let rounds: i64 = value
+                .trim()
+                .parse()
+                .map_err(|_| format!("'{}' expects a number, got '{}'", key, value))?;
+            Ok(toml_edit::value(rounds))
+        }
+        crate::config::ConfigFieldKind::Bool => Ok(toml_edit::value(parse_bool_value(key, value)?)),
+        crate::config::ConfigFieldKind::String => Ok(toml_edit::value(value.to_string())),
+        crate::config::ConfigFieldKind::List => {
+            let items = toml_edit::Array::from_iter(parse_string_list(value));
+            Ok(toml_edit::value(items))
+        }
+    }
+}
+
+/// Read one editable field's value out of a config struct (also used for
+/// the built-in defaults).
+fn config_field_value_of(config: &crate::config::AppConfig, key: &str) -> Option<String> {
+    match key {
+        "agent.max_tool_rounds" => Some(config.agent.max_tool_rounds.to_string()),
+        "agent.log_level" => Some(config.agent.log_level.clone()),
+        "agent.auto_include_skills" => Some(config.agent.auto_include_skills.to_string()),
+        "agent.memory.enabled" => Some(config.agent.memory.enabled.to_string()),
+        "agent.memory.auto_recall" => Some(config.agent.memory.auto_recall.to_string()),
+        "agent.memory.auto_write" => Some(config.agent.memory.auto_write.to_string()),
+        "shell.perm_mode" => config
+            .shell
+            .as_ref()
+            .map(|shell| shell.perm_mode.clone().unwrap_or_default()),
+        "shell.read_paths" => config
+            .shell
+            .as_ref()
+            .map(|shell| shell.read_paths.clone().unwrap_or_default().join(", ")),
+        "shell.write_paths" => config
+            .shell
+            .as_ref()
+            .map(|shell| shell.write_paths.clone().unwrap_or_default().join(", ")),
+        _ => None,
+    }
+}
+
+/// Whether the workspace config file sets `key` (it then overrides the
+/// global config regardless of what the global file says).
+fn workspace_overrides_key(key: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let path = crate::config::workspace_config_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let value = crate::config::read_config_toml(&path)?;
+    Ok(crate::config::value_get_dotted(&value, key).is_some())
+}
+
+/// Built-in default for an editable config key (used when neither scope
+/// sets it).
+fn default_config_field(key: &str) -> Option<String> {
+    config_field_value_of(&crate::config::AppConfig::default(), key)
+}
 
 /// Generate the per-conversation session ID: stable for the lifetime of one
 /// process (one conversation in the TUI).
@@ -832,6 +1058,44 @@ impl App {
         }
     }
 
+    /// Build a serializable snapshot of the session state for remote
+    /// frontends.
+    pub fn snapshot(&self) -> AppSnapshot {
+        AppSnapshot {
+            status: self.status,
+            status_message: self.status_message.clone(),
+            session_id: self.session_id.clone(),
+            session_cwd: self.session_cwd.clone(),
+            current_model: self.current_model.clone(),
+            models: self.models.clone(),
+            messages: self.messages.clone(),
+            usage: self.usage,
+            request_count: self.request_count,
+            active_skills: self.active_skills.clone(),
+            todos: self.todos.clone(),
+            subagents: self
+                .subagents
+                .list()
+                .iter()
+                .map(|s| SubagentSummary {
+                    id: s.id.clone(),
+                    name: s.name.clone(),
+                    task: s.task.clone(),
+                    state: s.state,
+                    mode: s.mode,
+                    result: s.result.clone(),
+                    error: s.error.clone(),
+                })
+                .collect(),
+            should_quit: self.should_quit,
+            memory_available: self.memory.available,
+            memory_session_enabled: self.memory.session_enabled,
+            config_fields: self.config_fields(),
+            config_field_specs: self.config_field_specs(),
+            config_scopes: self.config_scopes(),
+        }
+    }
+
     /// Return a human-readable status list of running subagents.
     pub fn subagent_status_list(&self) -> String {
         let subs = self.subagents.list();
@@ -924,23 +1188,20 @@ impl App {
 
     /// Return the editable config fields as (key, current_value) pairs.
     pub fn config_fields(&self) -> Vec<(String, String)> {
-        let mut fields = vec![
-            (
-                "agent.max_tool_rounds".to_string(),
-                self.config.agent.max_tool_rounds.to_string(),
-            ),
-            (
-                "agent.log_level".to_string(),
-                self.config.agent.log_level.clone(),
-            ),
-        ];
-        if let Some(shell) = &self.config.shell {
-            fields.push((
-                "shell.perm_mode".to_string(),
-                shell.perm_mode.clone().unwrap_or_default(),
-            ));
-        }
-        fields
+        CONFIG_FIELD_SPECS
+            .iter()
+            .map(|spec| {
+                (
+                    spec.key.to_string(),
+                    config_field_value_of(&self.config, spec.key).unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// Metadata about the editable config fields (drives editor widgets).
+    pub fn config_field_specs(&self) -> Vec<crate::config::ConfigFieldSpec> {
+        CONFIG_FIELD_SPECS.to_vec()
     }
 
     /// Rebuild the LLM client from the current model and session ID.
@@ -984,6 +1245,8 @@ impl App {
     }
 
     /// Human-readable list of configured models, marking the current one.
+    /// Each entry shows the model id (the value accepted by `/model`), with
+    /// the display name alongside when it differs.
     pub fn model_names_list(&self) -> String {
         if self.models.is_empty() {
             return "no models configured".to_string();
@@ -991,10 +1254,16 @@ impl App {
         self.models
             .iter()
             .map(|m| {
-                if m.id == self.current_model.id {
-                    format!("{}* (current)", m.display_name())
+                let name = m.display_name();
+                let label = if name == m.id {
+                    m.id.clone()
                 } else {
-                    m.display_name().to_string()
+                    format!("{} ({})", name, m.id)
+                };
+                if m.id == self.current_model.id {
+                    format!("{} * (current)", label)
+                } else {
+                    label
                 }
             })
             .collect::<Vec<_>>()
@@ -1013,22 +1282,202 @@ impl App {
             .clone()
             .ok_or("no config file found; cannot save changes")?;
 
+        self.apply_config_field_effect(key, value)?;
+
+        self.config.save(&path)?;
+        Ok(format!("saved {} to {}", key, path.display()))
+    }
+
+    /// Runtime update for one config field: mutates `self.config` and any
+    /// runtime component that depends on the changed value. Errors on
+    /// unknown keys or values that fail to parse.
+    ///
+    /// Effects by field:
+    /// - `agent.max_tool_rounds` — applied to the live turn loop.
+    /// - `agent.log_level` — config only; picked up on the next start.
+    /// - `agent.auto_include_skills` — rebuilds the system prompt in place.
+    /// - `agent.memory.enabled` — config; also syncs the session toggle so
+    ///   the change is visible immediately when memory is available.
+    /// - `agent.memory.auto_recall` / `auto_write` — read live per dispatch.
+    /// - `shell.*` — rebuilds the shell permission policy.
+    fn apply_config_field_effect(
+        &mut self,
+        key: &str,
+        value: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match key {
             "agent.max_tool_rounds" => {
                 self.config.agent.max_tool_rounds = value.parse()?;
                 self.max_tool_rounds = self.config.agent.max_tool_rounds;
             }
             "agent.log_level" => self.config.agent.log_level = value.to_string(),
+            "agent.auto_include_skills" => {
+                self.config.agent.auto_include_skills = parse_bool_value(key, value)?;
+                let prompt =
+                    Self::build_system_prompt(&self.main_agent, &self.config, &self.skill_registry);
+                if let Some(first) = self.messages.first_mut() {
+                    if first.is_system() {
+                        *first = Message::system(prompt);
+                    }
+                }
+            }
+            "agent.memory.enabled" => {
+                self.config.agent.memory.enabled = parse_bool_value(key, value)?;
+                if self.memory.available {
+                    self.memory.session_enabled = self.config.agent.memory.enabled;
+                }
+            }
+            "agent.memory.auto_recall" => {
+                self.config.agent.memory.auto_recall = parse_bool_value(key, value)?;
+            }
+            "agent.memory.auto_write" => {
+                self.config.agent.memory.auto_write = parse_bool_value(key, value)?;
+            }
             "shell.perm_mode" => {
                 let shell = self.config.shell.get_or_insert_with(ShellConfig::default);
                 shell.perm_mode = Some(value.to_string());
                 self.rebuild_shell_policy();
             }
+            "shell.read_paths" | "shell.write_paths" => {
+                let paths = Some(parse_string_list(value));
+                let shell = self.config.shell.get_or_insert_with(ShellConfig::default);
+                if key == "shell.read_paths" {
+                    shell.read_paths = paths;
+                } else {
+                    shell.write_paths = paths;
+                }
+                self.rebuild_shell_policy();
+            }
             _ => return Err(format!("unknown config field: {}", key).into()),
         }
+        Ok(())
+    }
 
-        self.config.save(&path)?;
-        Ok(format!("saved {} to {}", key, path.display()))
+    /// Set a config field in one scope (`workspace` or `global`), writing the
+    /// value into that scope's TOML file while preserving all untouched
+    /// content (comments, formatting, unknown keys).
+    ///
+    /// The runtime only reflects the new value when the written scope wins:
+    /// the workspace file overrides the global file key by key, so writing a
+    /// key to the global config that the workspace also sets leaves the
+    /// effective value untouched (the reply message says so).
+    pub fn set_config_field_in(
+        &mut self,
+        scope: crate::config::ConfigScope,
+        key: &str,
+        value: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use crate::config::{ConfigScope, doc_set_dotted};
+
+        let item = config_field_toml_item(key, value)?;
+        let path = crate::config::scope_config_path(scope);
+
+        let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or_default();
+        doc_set_dotted(&mut doc, key, item)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, doc.to_string())?;
+
+        match scope {
+            ConfigScope::Workspace => {
+                self.apply_config_field_effect(key, value)?;
+                Ok(format!(
+                    "saved {} to {} (workspace override)",
+                    key,
+                    path.display()
+                ))
+            }
+            ConfigScope::Global => {
+                if workspace_overrides_key(key)? {
+                    Ok(format!(
+                        "saved {} to {}; note: the workspace config overrides this key, so the effective value is unchanged",
+                        key,
+                        path.display()
+                    ))
+                } else {
+                    self.apply_config_field_effect(key, value)?;
+                    Ok(format!("saved {} to {}", key, path.display()))
+                }
+            }
+        }
+    }
+
+    /// Remove a config field from one scope. The runtime then reflects the
+    /// remaining effective value: the other scope's value when set, otherwise
+    /// the built-in default.
+    pub fn remove_config_field_in(
+        &mut self,
+        scope: crate::config::ConfigScope,
+        key: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use crate::config::{doc_remove_dotted, toml_display_value, value_get_dotted};
+
+        let path = crate::config::scope_config_path(scope);
+        if !path.exists() {
+            return Err(format!("no config file at {}", path.display()).into());
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .map_err(|e| format!("invalid TOML in {}: {}", path.display(), e))?;
+        let removed = doc_remove_dotted(&mut doc, key)?;
+        if !removed {
+            return Err(format!("{} is not set in {}", key, path.display()).into());
+        }
+        std::fs::write(&path, doc.to_string())?;
+
+        let merged = crate::config::merged_config_toml()?;
+        let effective = value_get_dotted(&merged, key)
+            .map(toml_display_value)
+            .or_else(|| default_config_field(key))
+            .ok_or_else(|| format!("unknown config field: {}", key))?;
+        self.apply_config_field_effect(key, &effective)?;
+        Ok(format!(
+            "removed {} from {}; effective value: {}",
+            key,
+            path.display(),
+            effective
+        ))
+    }
+
+    /// Per-scope config state for editor frontends: both config files with
+    /// the values of the editable keys as written in each of them.
+    pub fn config_scopes(&self) -> Vec<crate::config::ConfigScopeSnapshot> {
+        use crate::config::{ConfigScope, toml_display_value, value_get_dotted};
+
+        [ConfigScope::Workspace, ConfigScope::Global]
+            .into_iter()
+            .map(|scope| {
+                let path = crate::config::scope_config_path(scope);
+                let exists = path.exists();
+                let parsed = if exists {
+                    crate::config::read_config_toml(&path).ok()
+                } else {
+                    None
+                };
+                let fields = CONFIG_FIELD_SPECS
+                    .iter()
+                    .map(|spec| {
+                        let value = parsed
+                            .as_ref()
+                            .and_then(|v| value_get_dotted(v, spec.key))
+                            .map(toml_display_value)
+                            .unwrap_or_default();
+                        (spec.key.to_string(), value)
+                    })
+                    .collect();
+                crate::config::ConfigScopeSnapshot {
+                    scope,
+                    path: path.display().to_string(),
+                    exists,
+                    fields,
+                }
+            })
+            .collect()
     }
 
     /// Set a status-bar message with an optional auto-clear timeout.

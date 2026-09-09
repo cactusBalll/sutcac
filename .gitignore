@@ -1,4 +1,6 @@
 /target/
-/.sutcac/
+/.sutcac*
 /.opencode/
 sutcac-audit.log
+node_modules/
+**/.vscode/

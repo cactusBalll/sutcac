@@ -21,7 +21,8 @@ use crate::tool::{CompleteTaskTool, ToolContext, Toolbox};
 pub type SubagentId = String;
 
 /// Runtime state of a subagent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubagentState {
     Idle,
     Streaming,
@@ -63,7 +64,8 @@ impl SubagentState {
 }
 
 /// How a subagent should be initialized relative to its parent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SubagentContextMode {
     /// Inherit a snapshot of the parent's context.
     Fork,
@@ -100,7 +102,8 @@ pub struct ParentSnapshot {
 }
 
 /// Event emitted by a running subagent back to the application.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubagentEvent {
     Started {
         id: SubagentId,

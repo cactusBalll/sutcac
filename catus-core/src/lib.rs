@@ -9,6 +9,7 @@
 
 pub mod agents;
 pub mod app;
+pub mod bootstrap;
 pub mod config;
 pub mod frontmatter;
 pub mod history;

@@ -316,6 +316,148 @@ pub fn workspace_config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// A config file scope: the per-workspace overlay or the global XDG base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigScope {
+    /// `./.sutcac/config.toml` (overrides the global config).
+    Workspace,
+    /// `<xdg>/catus/config.toml` (shared by all workspaces).
+    Global,
+}
+
+/// The config file backing one [`ConfigScope`].
+pub fn scope_config_path(scope: ConfigScope) -> PathBuf {
+    match scope {
+        ConfigScope::Workspace => workspace_config_path(),
+        ConfigScope::Global => xdg_config_path(),
+    }
+}
+
+/// Per-scope config state for editor frontends: the file path, whether it
+/// exists yet, and the values of the editable keys as written in that file
+/// (an empty string means the key is not set in that scope).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigScopeSnapshot {
+    pub scope: ConfigScope,
+    pub path: String,
+    pub exists: bool,
+    pub fields: Vec<(String, String)>,
+}
+
+/// The value type of one editable config field (drives editor widgets and
+/// TOML value conversion).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigFieldKind {
+    /// Integer scalar.
+    Int,
+    /// `true`/`false` scalar.
+    Bool,
+    /// Free-form string.
+    String,
+    /// Comma-separated string list.
+    List,
+}
+
+/// Metadata about one editable config field: dotted key, value kind, and a
+/// short description for editor UIs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigFieldSpec {
+    pub key: &'static str,
+    pub kind: ConfigFieldKind,
+    pub description: &'static str,
+}
+
+/// Parse a config file into a `toml::Value`; a missing file yields an empty
+/// table so scope-aware edits can start from scratch.
+pub fn read_config_toml(path: &Path) -> Result<toml::Value, Box<dyn std::error::Error>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => toml::from_str(&contents)
+            .map_err(|e| format!("invalid TOML in {}: {}", path.display(), e).into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(toml::Value::Table(Default::default()))
+        }
+        Err(e) => Err(format!("cannot read {}: {}", path.display(), e).into()),
+    }
+}
+
+/// Load the merged effective configuration as raw TOML: the XDG base with
+/// the workspace overlay merged on top (same rules as [`AppConfig::load`]).
+pub fn merged_config_toml() -> Result<toml::Value, Box<dyn std::error::Error>> {
+    let mut merged = read_config_toml(&xdg_config_path())?;
+    let ws_path = workspace_config_path();
+    if ws_path.exists() {
+        let ws = read_config_toml(&ws_path)?;
+        merge_toml_values(&mut merged, &ws);
+    }
+    Ok(merged)
+}
+
+/// Follow a dotted key (`agent.max_tool_rounds`) through a TOML value.
+pub fn value_get_dotted<'a>(value: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
+    let mut current = value;
+    for part in key.split('.') {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+/// Render one TOML scalar for display: strings without quotes, arrays as
+/// comma-separated elements, everything else via its TOML representation.
+pub fn toml_display_value(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Array(items) => items
+            .iter()
+            .map(toml_display_value)
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    }
+}
+
+/// Set a dotted key on a `toml_edit` document, creating intermediate tables,
+/// while preserving all untouched content (comments, formatting, unknown
+/// keys).
+pub fn doc_set_dotted(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    item: toml_edit::Item,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut parts: Vec<&str> = key.split('.').collect();
+    let last = parts.pop().ok_or_else(|| "empty key".to_string())?;
+    let mut table = doc.as_table_mut();
+    for part in parts {
+        let entry = table
+            .entry(part)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+        table = entry
+            .as_table_mut()
+            .ok_or_else(|| format!("key '{}' is not a table", part))?;
+    }
+    table.insert(last, item);
+    Ok(())
+}
+
+/// Remove a dotted key from a `toml_edit` document. Returns whether the key
+/// was present.
+pub fn doc_remove_dotted(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut parts: Vec<&str> = key.split('.').collect();
+    let last = parts.pop().ok_or_else(|| "empty key".to_string())?;
+    let mut table = doc.as_table_mut();
+    for part in parts {
+        table = table
+            .get_mut(part)
+            .and_then(|item| item.as_table_mut())
+            .ok_or_else(|| format!("key '{}' not found", key))?;
+    }
+    Ok(table.remove(last).is_some())
+}
+
 /// The application log file (`<xdg>/catus/catus.log`). Not configurable.
 pub fn xdg_log_path() -> PathBuf {
     xdg_catus_dir().join("catus.log")

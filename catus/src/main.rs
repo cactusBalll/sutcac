@@ -12,9 +12,9 @@ use tokio::sync::mpsc;
 
 use catus::tui;
 use catus::ui::{self, UiState};
-use catus_core::app::{App, AppStatus, RuntimeEvent};
+use catus_core::app::{AppStatus, RuntimeEvent};
+use catus_core::bootstrap::{bootstrap_runtime, load_config};
 use catus_core::config::AppConfig;
-use catus_core::runtime::Runtime;
 
 /// catus: an Agent TUI with an OpenAI-compatible API.
 #[derive(Debug, Parser)]
@@ -80,12 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(prompt) = cli.test {
-        let config = load_config()?;
+        let config = load_config().unwrap_or_else(exit_on_startup_error);
         init_logger(&config.effective_log_path(), config.effective_log_level());
         return run_test_mode(prompt, config).await;
     }
 
-    let config = load_config()?;
+    let config = load_config().unwrap_or_else(exit_on_startup_error);
     init_logger(&config.effective_log_path(), config.effective_log_level());
     run_tui_mode(config).await
 }
@@ -113,69 +113,10 @@ fn enter_workspace(dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot enter workspace '{}': {}", resolved.display(), e))
 }
 
-fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
-    let mut config = match AppConfig::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("catus: failed to load config: {}", e);
-            std::process::exit(1);
-        }
-    };
-    // Production storage directories (session history, memory store) live
-    // under the XDG base directory.
-    config.dirs = catus_core::config::AppDirs::from_xdg();
-
-    if let Err(e) = config.resolve_models() {
-        eprintln!("catus: invalid model configuration: {}", e);
-        eprintln!("catus: configure at least one [[providers]] entry and one [[models]] entry");
-        std::process::exit(1);
-    }
-
-    if let Err(e) = config.validate_tier_models() {
-        eprintln!("catus: invalid tier model configuration: {}", e);
-        eprintln!(
-            "catus: set [agent.models] performance to a configured [[models]] id or name; efficient is optional"
-        );
-        std::process::exit(1);
-    }
-
-    if config.providers.iter().all(|p| p.api_key.is_empty()) {
-        eprintln!(
-            "catus: all provider api_keys are empty; set api_key in ~/.config/catus/config.toml or .sutcac/config.toml"
-        );
-        std::process::exit(1);
-    }
-
-    Ok(config)
-}
-
-/// Shared startup for both frontends: build the runtime and connect to the
-/// configured MCP servers.
-async fn bootstrap_runtime(config: AppConfig, log_warnings: bool) -> Runtime {
-    let mut runtime = Runtime::new(App::new(config));
-    if !runtime.app.main_agent_from_file {
-        eprintln!("catus: main agent definition not found; create .sutcac/agents/main.md");
-        std::process::exit(1);
-    }
-    for warning in &runtime.app.memory.warnings {
-        if log_warnings {
-            eprintln!("catus: memory warning: {}", warning);
-        } else {
-            log::warn!("memory warning: {}", warning);
-        }
-    }
-    // Drain startup events queued during initialization.
-    while runtime.app.take_event().is_some() {}
-
-    let mcp_warnings = runtime.app.connect_mcp().await;
-    for warning in &mcp_warnings {
-        if log_warnings {
-            eprintln!("catus: mcp warning: {}", warning);
-        } else {
-            log::warn!("mcp warning: {}", warning);
-        }
-    }
-    runtime
+/// Print a startup error the way the process-local versions used to, then exit.
+fn exit_on_startup_error<T>(e: String) -> T {
+    eprintln!("catus: {}", e);
+    std::process::exit(1)
 }
 
 /// Headless one-shot mode. Drives the same runtime event loop as the TUI:
@@ -185,7 +126,9 @@ async fn run_test_mode(
     prompt: String,
     config: AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut runtime = bootstrap_runtime(config, true).await;
+    let mut runtime = bootstrap_runtime(config, true)
+        .await
+        .unwrap_or_else(exit_on_startup_error);
 
     println!("USER: {}", prompt);
     runtime.app.submit_user_message(prompt);
@@ -252,7 +195,9 @@ async fn run_test_mode(
 }
 
 async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut runtime = bootstrap_runtime(config, false).await;
+    let mut runtime = bootstrap_runtime(config, false)
+        .await
+        .unwrap_or_else(exit_on_startup_error);
     let mut ui = UiState::new();
 
     let mut guard = tui::TerminalGuard::new(tui::init_terminal()?);

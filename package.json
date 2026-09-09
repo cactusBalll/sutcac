@@ -1,0 +1,13 @@
+{
+  "name": "catus-workspace-ui",
+  "private": true,
+  "workspaces": [
+    "catus-ui",
+    "catus-web",
+    "catus-server/web"
+  ],
+  "scripts": {
+    "build:web": "npm run build --workspace catus-web",
+    "build:server": "npm run build --workspace catus-server-web"
+  }
+}
