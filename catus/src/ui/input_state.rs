@@ -1,7 +1,7 @@
 //! Input-line state: typed text, cursor, history recall, and completion
 //! candidates.
 
-use crate::app::commands::BUILT_IN_REGISTRY;
+use catus_core::app::commands::BUILT_IN_REGISTRY;
 
 /// Maximum number of rows reserved for the completion candidate strip.
 pub const MAX_CANDIDATES: usize = 8;

@@ -1,5 +1,7 @@
-//! Application state for the catus Agent TUI.
+//! Frontend-independent application state: the Agent session, its turn state
+//! machine, and the event stream consumed by frontends.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,15 +23,41 @@ use crate::tool::{
     ToolResult, Toolbox, parse_ask_permission_tags,
 };
 
-pub mod chat_state;
 pub mod command;
 pub mod commands;
-pub mod input_state;
-pub mod overlay_state;
 
-pub use chat_state::ChatState;
-pub use input_state::{InputState, MAX_CANDIDATES};
-pub use overlay_state::{Overlay, OverlayState};
+pub use command::{CommandError, CommandOutcome, CommandRegistry, SlashCommand, UiRequest};
+
+/// An event emitted by the runtime for the active frontend.
+///
+/// Frontends consume these to update their own view state; the session state
+/// itself is always readable through `App`. The stream variants carry the
+/// raw deltas so streaming frontends (a TUI auto-scroll, a Web SSE bridge)
+/// can react incrementally.
+#[derive(Debug, Clone)]
+pub enum RuntimeEvent {
+    /// An assistant text chunk was appended to the conversation.
+    StreamText(String),
+    /// An assistant reasoning chunk was appended to the conversation.
+    StreamReasoning(String),
+    /// The model emitted a tool call (stored, not yet executed).
+    ToolCallAdded(ToolCall),
+    /// Token usage was reported for a completed LLM request.
+    UsageUpdated(Usage),
+    /// The conversation content changed; view state such as auto-scroll may
+    /// want to follow.
+    MessagesChanged,
+    /// A tool is waiting for the user to answer questions. The turn stays
+    /// paused until the frontend answers via `complete_interaction` /
+    /// `cancel_interaction`.
+    InteractionRequested(Vec<AskQuestion>),
+    /// A subagent reported an event.
+    SubagentEvent(crate::subagent::SubagentEvent),
+    /// The current turn finished (or failed); no further stream activity is
+    /// expected until the next user message. Background work such as the
+    /// memory write pass may still be running.
+    TurnComplete,
+}
 
 /// Current high-level state of the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,16 +68,27 @@ pub enum AppStatus {
     Error,
 }
 
-/// Result of pressing Enter in the input line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OnEnterResult {
+/// Outcome of submitting one input line to the app.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputLineOutcome {
     /// The input was a slash command and has been handled.
-    Handled,
-    /// The input was submitted as a user message; the caller should start
-    /// streaming the assistant reply.
+    Handled(CommandOutcome),
+    /// The input was submitted as a user message; the caller should resume
+    /// the LLM stream (the runtime gates it on pending memory passes).
     Submitted,
     /// The input was empty; nothing happened.
     Empty,
+}
+
+/// What the turn state machine wants after an LLM stream completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnPhase {
+    /// Tool results are ready; a follow-up LLM request is needed.
+    ContinueStream,
+    /// The turn is paused waiting for user interaction.
+    PausedInteraction,
+    /// The turn has finished (or failed).
+    Complete,
 }
 
 /// Mutable application state shared between the TUI and async workers.
@@ -114,12 +153,18 @@ pub struct App {
     pub memory: crate::memory::MemoryState,
     /// All tools available to the LLM: built-in plus MCP-converted.
     pub toolbox: Toolbox,
-    /// Input-line state (cursor, history, completion candidates).
-    pub input_state: InputState,
-    /// Chat viewport state (scroll, auto-scroll).
-    pub chat_state: ChatState,
-    /// Modal overlay state.
-    pub overlay_state: OverlayState,
+    /// Events queued for the frontend, drained via [`App::take_event`].
+    pending_events: VecDeque<RuntimeEvent>,
+    /// Sender half of the LLM stream event channel; every spawned stream
+    /// task shares it.
+    pub(crate) stream_tx: mpsc::Sender<StreamEvent>,
+    /// Receiver half of the LLM stream event channel; the runtime merges it
+    /// into its event loop.
+    pub(crate) stream_rx: mpsc::Receiver<StreamEvent>,
+    /// Sender half of the stream-completion channel.
+    pub(crate) done_tx: mpsc::Sender<Result<(), LlmError>>,
+    /// Receiver half of the stream-completion channel.
+    pub(crate) done_rx: mpsc::Receiver<Result<(), LlmError>>,
 }
 
 /// How long transient status-bar messages remain visible before clearing.
@@ -253,6 +298,9 @@ impl App {
             None => (None, String::new()),
         };
 
+        let (stream_tx, stream_rx) = mpsc::channel(128);
+        let (done_tx, done_rx) = mpsc::channel(1);
+
         Self {
             config,
             client: LlmClient::new(
@@ -290,10 +338,22 @@ impl App {
             should_quit: false,
             status_message_clear_at: None,
             config_path: AppConfig::find_config_file(),
-            input_state: InputState::new(),
-            chat_state: ChatState::new(),
-            overlay_state: OverlayState::new(),
+            pending_events: VecDeque::new(),
+            stream_tx,
+            stream_rx,
+            done_tx,
+            done_rx,
         }
+    }
+
+    /// Queue an event for the frontend.
+    pub(crate) fn queue_event(&mut self, event: RuntimeEvent) {
+        self.pending_events.push_back(event);
+    }
+
+    /// Take the next event queued for the frontend, if any.
+    pub fn take_event(&mut self) -> Option<RuntimeEvent> {
+        self.pending_events.pop_front()
     }
 
     /// Discover agent definitions and select the main agent.
@@ -401,39 +461,39 @@ impl App {
         warnings
     }
 
-    /// Take the current input and append it as a user message.
+    /// Append `text` as a user message.
     ///
     /// When the Agent Memory subsystem is enabled with `auto_recall`, this
     /// also dispatches the memory subagent's recall pass; the caller must
     /// wait for it to finish (via `awaiting_memory_recall`) before starting
     /// the main LLM stream.
-    pub fn submit_user_message(&mut self) -> Option<String> {
-        let text = self.input_state.take_input()?;
+    pub fn submit_user_message(&mut self, text: String) {
         self.messages.push(Message::user(text.clone()));
-        self.input_state.record_history(&text);
-
         self.tool_rounds_this_turn = 0;
-        self.chat_state.scroll_to_bottom();
+        self.queue_event(RuntimeEvent::MessagesChanged);
         self.maybe_dispatch_memory_recall(&text);
         self.persist_session();
-        Some(text)
     }
 
-    /// Handle pressing Enter in the input line: slash commands take precedence;
-    /// otherwise submit the user message and signal that streaming should start.
-    pub async fn on_enter(&mut self) -> OnEnterResult {
-        let input = self.input_state.input.trim().to_string();
-        if input.is_empty() {
-            return OnEnterResult::Empty;
+    /// Handle one submitted input line: slash commands take precedence;
+    /// otherwise the line is submitted as a user message and the caller
+    /// should resume the LLM stream.
+    ///
+    /// The caller owns the input line state: it decides whether to clear the
+    /// line and whether to record the input in its history (use
+    /// `CommandOutcome::record_history` for commands).
+    pub async fn handle_input_line(&mut self, input: &str) -> InputLineOutcome {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return InputLineOutcome::Empty;
         }
 
-        if self.handle_command(&input).await {
-            self.input_state.clear();
-            OnEnterResult::Handled
-        } else if self.submit_user_message().is_some() {
-            OnEnterResult::Submitted
+        if trimmed.starts_with('/') {
+            let outcome = self.handle_command(trimmed).await;
+            InputLineOutcome::Handled(outcome)
         } else {
-            OnEnterResult::Empty
+            self.submit_user_message(trimmed.to_string());
+            InputLineOutcome::Submitted
         }
     }
 
@@ -482,7 +542,7 @@ impl App {
     pub fn finish_stream(&mut self) {
         self.status = AppStatus::Idle;
         self.status_message.clear();
-        self.chat_state.scroll_to_bottom();
+        self.queue_event(RuntimeEvent::MessagesChanged);
 
         if let Some(last) = self.messages.last() {
             log::info!(
@@ -502,7 +562,7 @@ impl App {
             self.messages.push(Message::event(
                 "Assistant returned an empty response".to_string(),
             ));
-            self.chat_state.scroll_to_bottom();
+            self.queue_event(RuntimeEvent::MessagesChanged);
         }
     }
 
@@ -987,7 +1047,7 @@ impl App {
         let text = msg.into();
         log::warn!("{}", text);
         self.messages.push(Message::event(text));
-        self.chat_state.scroll_to_bottom();
+        self.queue_event(RuntimeEvent::MessagesChanged);
     }
 
     pub fn clear_error(&mut self) {
@@ -1125,7 +1185,6 @@ impl App {
                 log::info!("running tool: {}", description);
                 self.messages
                     .push(Message::event(format!("tool: {}", description)));
-                self.chat_state.scroll_to_bottom();
 
                 let mut ctx = ToolContext {
                     shell_state: &mut self.shell_state,
@@ -1153,14 +1212,16 @@ impl App {
             }
         };
 
+        self.queue_event(RuntimeEvent::MessagesChanged);
+
         if let Some(request) = result.interaction {
-            // The tool is asking the user questions: pause the turn, open the
-            // ask overlay, and resume via `complete_interaction` once the
-            // overlay closes. No result message is pushed yet.
+            // The tool is asking the user questions: pause the turn and let
+            // the frontend collect the answers; the turn resumes via
+            // `complete_interaction` once they arrive. No result message is
+            // pushed yet.
             log::info!("tool '{}' is waiting for user input", call.name);
             self.pending_interaction = Some((call, request.questions.clone()));
-            self.overlay_state.open_ask(request.questions);
-            self.chat_state.scroll_to_bottom();
+            self.queue_event(RuntimeEvent::InteractionRequested(request.questions));
             return None;
         }
 
@@ -1172,7 +1233,7 @@ impl App {
 
         self.status = AppStatus::Idle;
         self.status_message.clear();
-        self.chat_state.scroll_to_bottom();
+        self.queue_event(RuntimeEvent::MessagesChanged);
         self.persist_session();
 
         Some(message)
@@ -1273,7 +1334,7 @@ impl App {
 
         self.status = AppStatus::Idle;
         self.status_message.clear();
-        self.chat_state.scroll_to_bottom();
+        self.queue_event(RuntimeEvent::MessagesChanged);
         self.persist_session();
         true
     }
@@ -1597,14 +1658,14 @@ impl App {
             }
         }
 
-        // A paused ask_user interaction reopens its overlay; the turn
+        // A paused ask_user interaction is re-raised as an event; the turn
         // continues once the user answers.
         self.pending_interaction = snapshot
             .state
             .get(crate::history::STATE_PENDING_INTERACTION)
             .and_then(|j| serde_json::from_str(j).ok());
         if let Some((_, questions)) = &self.pending_interaction {
-            self.overlay_state.open_ask(questions.clone());
+            self.queue_event(RuntimeEvent::InteractionRequested(questions.clone()));
         }
 
         // Shell working directory and variables.
@@ -1675,13 +1736,14 @@ impl App {
         // Keep the loaded session's name so subsequent persists update the
         // same row instead of renaming it.
         self.session_name = snapshot.meta.name.clone();
-        self.chat_state.scroll_to_bottom();
+        self.queue_event(RuntimeEvent::MessagesChanged);
         Ok("session resumed".to_string())
     }
 
-    /// Handle a TUI slash command. Returns `true` if the input was a command
-    /// and should not be sent to the LLM.
-    pub async fn handle_command(&mut self, input: &str) -> bool {
+    /// Handle a slash command. Returns the outcome describing how the input
+    /// was treated; presentation intents are carried in
+    /// `CommandOutcome::ui`.
+    pub async fn handle_command(&mut self, input: &str) -> CommandOutcome {
         commands::handle_command(self, input).await
     }
 
@@ -1695,20 +1757,19 @@ impl App {
         }
     }
 
-    /// Start an async LLM stream and send events through `event_tx`.
+    /// Start an async LLM stream.
     ///
-    /// The stream task signals completion through `done_tx`.
-    pub async fn start_llm_stream(
-        &mut self,
-        event_tx: mpsc::Sender<StreamEvent>,
-        done_tx: mpsc::Sender<Result<(), LlmError>>,
-    ) {
+    /// Events flow through the runtime's internal stream channel; the stream
+    /// task signals completion through the internal done channel.
+    pub async fn start_llm_stream(&mut self) {
         // Snapshot the conversation *before* adding the assistant placeholder so
         // the API request never contains an empty assistant message.
         let messages = self.messages.clone();
         let tools = self.toolbox.definitions();
         self.start_assistant_message();
         let client = self.client.clone();
+        let event_tx = self.stream_tx.clone();
+        let done_tx = self.done_tx.clone();
 
         tokio::spawn(async move {
             let result = client.stream_chat(&messages, &tools, event_tx).await;
@@ -1716,14 +1777,12 @@ impl App {
         });
     }
 
-    /// Handle the completion of an LLM stream, running any pending tool calls
-    /// and scheduling follow-up requests.
-    pub async fn handle_llm_done(
-        &mut self,
-        result: Result<(), LlmError>,
-        event_tx: &mpsc::Sender<StreamEvent>,
-        done_tx: &mpsc::Sender<Result<(), LlmError>>,
-    ) {
+    /// Handle the completion of an LLM stream.
+    ///
+    /// Runs any pending tool calls and returns the phase the runtime should
+    /// drive next: a follow-up request, a pause for user interaction, or the
+    /// end of the turn.
+    pub async fn handle_llm_done(&mut self, result: Result<(), LlmError>) -> TurnPhase {
         match result {
             Ok(()) => {
                 self.finish_stream();
@@ -1735,12 +1794,12 @@ impl App {
                     self.run_pending_tool().await;
                     if self.pending_interaction.is_some() {
                         // The tool turned into an interactive question; the
-                        // overlay collects the answer and the turn resumes
-                        // via AppAction::StartStream once it closes.
-                        return;
+                        // frontend collects the answer and the turn resumes
+                        // once it is submitted.
+                        return TurnPhase::PausedInteraction;
                     }
-                    self.start_llm_stream(event_tx.clone(), done_tx.clone())
-                        .await;
+                    self.persist_session();
+                    TurnPhase::ContinueStream
                 } else if self.pending_tool_calls_count() > 0 {
                     let count = self.pending_tool_calls_count();
                     if self.is_tool_round_limit_reached() {
@@ -1753,13 +1812,16 @@ impl App {
                         self.add_event_message(msg);
                     }
                     self.clear_pending_tool_calls();
+                    self.persist_session();
+                    TurnPhase::Complete
                 } else {
                     log::info!("no pending tool call; turn complete");
                     // Turn finished: hand the transcript to the memory
                     // subagent's summarize/write pass (runs in background).
                     self.maybe_dispatch_memory_write();
+                    self.persist_session();
+                    TurnPhase::Complete
                 }
-                self.persist_session();
             }
             Err(e) => {
                 // Remove the empty assistant placeholder so a failed request does
@@ -1771,6 +1833,7 @@ impl App {
                 self.add_event_message(format!("LLM request failed: {}", e));
                 self.set_error("LLM request failed".to_string());
                 self.persist_session();
+                TurnPhase::Complete
             }
         }
     }
@@ -2188,184 +2251,6 @@ mod tests {
     }
 
     #[test]
-    fn input_history_recalls_newest_first() {
-        let dir = std::env::temp_dir().join(format!("catus_hist_order_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        submit_message(&mut app, "first");
-        submit_message(&mut app, "second");
-        submit_message(&mut app, "third");
-
-        assert_eq!(
-            app.input_state.input_history,
-            vec!["third", "second", "first"]
-        );
-
-        // Type a new draft line, then use Up/Down to recall history and restore it.
-        app.input_state.input = "draft".to_string();
-        app.input_state.history_previous();
-        assert_eq!(app.input_state.input, "third");
-        app.input_state.history_previous();
-        assert_eq!(app.input_state.input, "second");
-        app.input_state.history_next();
-        assert_eq!(app.input_state.input, "third");
-        app.input_state.history_next();
-        assert_eq!(app.input_state.input, "draft");
-        assert!(app.input_state.input_history_index.is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn consecutive_duplicate_inputs_are_not_stored_twice() {
-        let dir = std::env::temp_dir().join(format!("catus_hist_dedup_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        submit_message(&mut app, "same");
-        submit_message(&mut app, "same");
-
-        assert_eq!(app.input_state.input_history, vec!["same"]);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn slash_command_completion_offers_resume() {
-        let dir = std::env::temp_dir().join(format!("catus_slash_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input_state.input = "/res".to_string();
-        app.input_state.recompute_candidates();
-
-        assert_eq!(app.input_state.candidates, vec!["/resume"]);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn history_completion_filters_by_prefix_case_insensitively() {
-        let dir = std::env::temp_dir().join(format!("catus_hist_complete_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        submit_message(&mut app, "Hello World");
-        submit_message(&mut app, "hello there");
-        submit_message(&mut app, "goodbye");
-
-        app.input_state.input = "HEL".to_string();
-        app.input_state.recompute_candidates();
-
-        assert_eq!(
-            app.input_state.candidates,
-            vec!["hello there", "Hello World"]
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn tab_cycles_through_candidates() {
-        let dir = std::env::temp_dir().join(format!("catus_cycle_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input_state.candidates =
-            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
-
-        app.input_state.cycle_candidate(1);
-        assert_eq!(app.input_state.input, "alpha");
-        assert_eq!(app.input_state.selected_candidate, Some(0));
-
-        app.input_state.cycle_candidate(1);
-        assert_eq!(app.input_state.input, "beta");
-
-        app.input_state.cycle_candidate(-1);
-        assert_eq!(app.input_state.input, "alpha");
-
-        app.input_state.cycle_candidate(-1);
-        assert_eq!(app.input_state.input, "gamma"); // wrap backward
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn typing_resets_history_recall() {
-        let dir = std::env::temp_dir().join(format!("catus_type_reset_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        submit_message(&mut app, "base");
-        app.input_state.history_previous();
-        assert!(app.input_state.input_history_index.is_some());
-
-        app.input_state.push_char('x');
-        assert!(app.input_state.input_history_index.is_none());
-        assert_eq!(app.input_state.input, "basex");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cursor_moves_and_inserts_at_cursor() {
-        let dir = std::env::temp_dir().join(format!("catus_cursor_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input_state.push_char('a');
-        app.input_state.push_char('b');
-        app.input_state.push_char('c');
-        assert_eq!(app.input_state.input, "abc");
-        assert_eq!(app.input_state.cursor, 3);
-
-        app.input_state.move_cursor_left();
-        app.input_state.move_cursor_left();
-        assert_eq!(app.input_state.cursor, 1);
-
-        app.input_state.push_char('x');
-        assert_eq!(app.input_state.input, "axbc");
-        assert_eq!(app.input_state.cursor, 2);
-
-        app.input_state.backspace();
-        assert_eq!(app.input_state.input, "abc");
-        assert_eq!(app.input_state.cursor, 1);
-
-        app.input_state.move_cursor_home();
-        assert_eq!(app.input_state.cursor, 0);
-        app.input_state.move_cursor_end();
-        assert_eq!(app.input_state.cursor, 3);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn slash_resume_command_is_recorded_in_history() {
-        let dir = std::env::temp_dir().join(format!("catus_cmd_hist_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        seed_session(&dir, "foo", &[]);
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input_state.input = "/resume foo".to_string();
-        app.handle_command("/resume foo").await;
-
-        assert_eq!(app.input_state.input_history, vec!["/resume foo"]);
-        app.input_state.history_previous();
-        assert_eq!(app.input_state.input, "/resume foo");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn record_usage_accumulates_session_totals() {
         let dir = std::env::temp_dir().join(format!("catus_usage_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2413,77 +2298,9 @@ mod tests {
             total_tokens: 32,
             cached_tokens: 12,
         });
-        assert!(app.handle_command("/status").await);
-        assert_eq!(app.overlay_state.overlay, Overlay::Status);
-        assert!(app.overlay_state.is_active());
+        let outcome = app.handle_command("/status").await;
+        assert!(outcome.handled);
         assert_eq!(app.usage.prompt_tokens, 19);
-
-        // Esc closes it.
-        crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Esc);
-        assert!(!app.overlay_state.is_active());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn bare_resume_opens_picker_and_enter_loads_history() {
-        let dir = std::env::temp_dir().join(format!("catus_resume_overlay_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        seed_session(&dir, "alpha", &[Message::user("hi")]);
-        seed_session(&dir, "beta", &[]);
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/resume").await);
-        let items = match &app.overlay_state.overlay {
-            Overlay::Resume { items, selected } => {
-                assert_eq!(items.len(), 2);
-                assert_eq!(*selected, 0);
-                items.clone()
-            }
-            other => panic!("expected resume overlay, got {:?}", other),
-        };
-
-        // Arrow keys move the selection with wrap-around.
-        crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Down);
-        assert_eq!(
-            app.overlay_state.overlay,
-            Overlay::Resume { items, selected: 1 }
-        );
-        crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Down);
-        match &app.overlay_state.overlay {
-            Overlay::Resume { selected, .. } => assert_eq!(*selected, 0),
-            other => panic!("expected resume overlay, got {:?}", other),
-        }
-
-        // Enter yields the selected session name for the event loop to load.
-        let action =
-            crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Enter);
-        match action {
-            crate::ui::OverlayAction::LoadHistory(name) => {
-                let store = crate::history::SessionStore::open(&dir).unwrap();
-                assert!(store.find_session(&name).unwrap().is_some());
-            }
-            other => panic!("expected LoadHistory, got {:?}", other),
-        }
-        assert!(!app.overlay_state.is_active());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn resume_picker_esc_closes_without_loading() {
-        let dir = std::env::temp_dir().join(format!("catus_resume_esc_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        seed_session(&dir, "a", &[]);
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        let items = app.list_session_names();
-        app.overlay_state.open_resume(items);
-        crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Esc);
-        assert_eq!(app.overlay_state.overlay, Overlay::None);
-        assert!(app.current_session_id.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2496,25 +2313,23 @@ mod tests {
         seed_session(&dir, "foo", &[]);
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/resume foo").await);
-        assert_eq!(app.overlay_state.overlay, Overlay::None);
+        let outcome = app.handle_command("/resume foo").await;
+        assert!(outcome.handled);
+        assert!(outcome.ui.is_none());
         assert_eq!(app.status_message, "session resumed");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn config_command_opens_overlay() {
+    async fn config_command_requests_config_ui() {
         let dir = std::env::temp_dir().join(format!("catus_config_overlay_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/config").await);
-        assert!(matches!(
-            app.overlay_state.overlay,
-            Overlay::Config { selected: 0 }
-        ));
+        let outcome = app.handle_command("/config").await;
+        assert!(outcome.handled);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2531,21 +2346,6 @@ mod tests {
         assert!(keys.contains(&"agent.max_tool_rounds"));
         assert!(keys.contains(&"agent.log_level"));
         assert!(!keys.iter().any(|k| k.starts_with("api.")));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn config_overlay_enter_prefills_edit_command() {
-        let dir = std::env::temp_dir().join(format!("catus_config_enter_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        app.overlay_state.open_config();
-        crate::ui::overlay::handle_overlay_key(&mut app, crossterm::event::KeyCode::Enter);
-        assert!(app.input_state.input.starts_with("/config set "));
-        assert_eq!(app.overlay_state.overlay, Overlay::None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2647,52 +2447,6 @@ log_level = "info"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn slash_command_completion_offers_status() {
-        let dir = std::env::temp_dir().join(format!("catus_slash_status_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input_state.input = "/st".to_string();
-        app.input_state.recompute_candidates();
-        assert_eq!(app.input_state.candidates, vec!["/status"]);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn slash_command_completion_offers_help_and_exit() {
-        let dir = std::env::temp_dir().join(format!("catus_slash_help_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input_state.input = "/".to_string();
-        app.input_state.recompute_candidates();
-        assert!(app.input_state.candidates.contains(&"/help".to_string()));
-        assert!(app.input_state.candidates.contains(&"/exit".to_string()));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn slash_command_completion_offers_mcp_and_subcommands() {
-        let dir = std::env::temp_dir().join(format!("catus_slash_mcp_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let mut app = App::new(test_config_with_history_dir(&dir));
-        app.input_state.input = "/mc".to_string();
-        app.input_state.recompute_candidates();
-        assert_eq!(
-            app.input_state.candidates,
-            vec!["/mcp", "/mcp list", "/mcp status"]
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[tokio::test]
     async fn mcp_status_command_shows_connection_counts() {
         let dir = std::env::temp_dir().join(format!("catus_mcp_status_{}", std::process::id()));
@@ -2700,7 +2454,7 @@ log_level = "info"
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/mcp status").await);
+        assert!(app.handle_command("/mcp status").await.handled);
         assert!(
             app.messages
                 .iter()
@@ -2717,7 +2471,7 @@ log_level = "info"
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/help").await);
+        assert!(app.handle_command("/help").await.handled);
         assert!(
             app.messages
                 .iter()
@@ -2736,7 +2490,7 @@ log_level = "info"
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/help mcp list").await);
+        assert!(app.handle_command("/help mcp list").await.handled);
         assert!(
             app.messages
                 .iter()
@@ -2753,7 +2507,7 @@ log_level = "info"
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/help nosuch").await);
+        assert!(app.handle_command("/help nosuch").await.handled);
         assert!(
             app.messages
                 .iter()
@@ -2770,7 +2524,7 @@ log_level = "info"
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut app = App::new(test_config_with_history_dir(&dir));
-        assert!(app.handle_command("/exit").await);
+        assert!(app.handle_command("/exit").await.handled);
         assert!(app.should_quit);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2877,10 +2631,9 @@ log_level = "info"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Helper that submits a user message directly without going through the TUI.
+    /// Helper that submits a user message directly.
     fn submit_message(app: &mut App, text: &str) {
-        app.input_state.input = text.to_string();
-        app.submit_user_message();
+        app.submit_user_message(text.to_string());
     }
 
     fn ask_tool_call() -> ToolCall {
@@ -2905,7 +2658,18 @@ log_level = "info"
         );
         assert!(app.has_pending_interaction());
         assert_eq!(app.pending_tool_calls_count(), 1, "call stays pending");
-        assert!(app.overlay_state.is_active());
+        assert!(
+            {
+                let mut requested = false;
+                while let Some(event) = app.take_event() {
+                    if matches!(event, RuntimeEvent::InteractionRequested(_)) {
+                        requested = true;
+                    }
+                }
+                requested
+            },
+            "the frontend must be told to collect the user's answers"
+        );
         assert!(
             !app.messages.iter().any(|m| m.role == Role::Tool),
             "tool result must not be sent before the user answers"
@@ -3070,8 +2834,7 @@ log_level = "info"
 
         // Submitting a user message dispatches the recall pass and withholds
         // the main stream.
-        app.input_state.input = "how do I configure the release profile?".to_string();
-        assert!(app.submit_user_message().is_some());
+        app.submit_user_message("how do I configure the release profile?".to_string());
         assert!(app.awaiting_memory_recall());
         assert_eq!(app.status, AppStatus::RunningTool);
 
@@ -3092,8 +2855,7 @@ log_level = "info"
 
         // A recall=false completion injects nothing (the recall injected for
         // the first turn stays in the conversation).
-        app.input_state.input = "hi".to_string();
-        assert!(app.submit_user_message().is_some());
+        app.submit_user_message("hi".to_string());
         assert!(app.awaiting_memory_recall());
         let id = app.memory.pending_recall.clone().unwrap();
         let recalled = app
@@ -3126,8 +2888,7 @@ log_level = "info"
 
         let config = memory_test_config(&dir, false);
         let mut app = App::new(config);
-        app.input_state.input = "hello".to_string();
-        assert!(app.submit_user_message().is_some());
+        app.submit_user_message("hello".to_string());
         assert!(app.awaiting_memory_recall());
 
         let id = app.memory.pending_recall.clone().unwrap();
@@ -3204,8 +2965,7 @@ log_level = "info"
         let mut app = App::new(config);
         assert!(!app.memory.available);
 
-        app.input_state.input = "hello".to_string();
-        assert!(app.submit_user_message().is_some());
+        app.submit_user_message("hello".to_string());
         assert!(!app.awaiting_memory_recall());
         app.maybe_dispatch_memory_write();
         assert!(app.memory.pending_write.is_none());
@@ -3222,8 +2982,7 @@ log_level = "info"
 
         let config = memory_test_config(&dir, true);
         let mut app = App::new(config);
-        app.input_state.input = "remember this".to_string();
-        assert!(app.submit_user_message().is_some());
+        app.submit_user_message("remember this".to_string());
         // Drain the recall pass before toggling (one pass at a time).
         let id = app.memory.pending_recall.clone().unwrap();
         app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {

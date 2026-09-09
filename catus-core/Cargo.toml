@@ -1,0 +1,29 @@
+[package]
+name = "catus-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4"
+diff-match-patch-rs = "0.5.1"
+dirs = "6.0.0"
+eventsource-stream = "0.2.3"
+futures = "0.3.34"
+http = "1"
+log = "0.4"
+reqwest = { version = "0.13.4", features = ["json", "stream", "cookies"] }
+rmcp = { version = "3.1.4", features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = "1.2.0"
+serde_json = "1.0.151"
+sutcac-sh = { path = "../sutcac-sh" }
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.4"
+
+[dev-dependencies]
+tempfile = "3"

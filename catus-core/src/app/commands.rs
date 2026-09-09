@@ -9,9 +9,9 @@ use std::sync::LazyLock;
 
 use futures::future::BoxFuture;
 
-use crate::app::App;
 use crate::app::AppStatus;
-use crate::app::command::{CommandError, CommandRegistry, SlashCommand};
+use crate::app::command::{CommandError, CommandRegistry, SlashCommand, UiRequest};
+use crate::app::{App, CommandOutcome};
 
 /// Show help for slash commands.
 pub struct HelpCommand;
@@ -33,7 +33,7 @@ impl SlashCommand for HelpCommand {
         &'a self,
         app: &'a mut App,
         args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             let text = match args.map(str::trim).filter(|s| !s.is_empty()) {
                 Some(args) => {
@@ -49,7 +49,7 @@ impl SlashCommand for HelpCommand {
             };
             app.add_event_message(text);
             app.set_transient_message("Help displayed");
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -78,10 +78,10 @@ impl SlashCommand for ExitCommand {
         &'a self,
         app: &'a mut App,
         _args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.should_quit = true;
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -124,7 +124,7 @@ impl SlashCommand for ConfigCommand {
         &'a self,
         app: &'a mut App,
         args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.status = AppStatus::Idle;
             match args.map(str::trim).filter(|s| !s.is_empty()) {
@@ -147,9 +147,9 @@ impl SlashCommand for ConfigCommand {
                         .into());
                     }
                 }
-                None => app.overlay_state.open_config(),
+                None => return Ok(Some(UiRequest::ShowConfig)),
             }
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -174,7 +174,7 @@ impl SlashCommand for ResumeCommand {
         &'a self,
         app: &'a mut App,
         args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.status = AppStatus::Idle;
             match args.map(str::trim).filter(|s| !s.is_empty()) {
@@ -184,10 +184,10 @@ impl SlashCommand for ResumeCommand {
                 }
                 None => {
                     let items = app.list_session_names();
-                    app.overlay_state.open_resume(items);
+                    return Ok(Some(UiRequest::ShowResumePicker { items }));
                 }
             }
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -212,11 +212,10 @@ impl SlashCommand for StatusCommand {
         &'a self,
         app: &'a mut App,
         _args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.status = AppStatus::Idle;
-            app.overlay_state.open_status();
-            Ok(())
+            Ok(Some(UiRequest::ShowStatus))
         })
     }
 }
@@ -265,7 +264,7 @@ impl SlashCommand for AgentCommand {
         &'a self,
         app: &'a mut App,
         args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.status = AppStatus::Idle;
             match args.map(str::trim).filter(|s| !s.is_empty()) {
@@ -312,7 +311,7 @@ impl SlashCommand for AgentCommand {
                             None => {
                                 let items: Vec<String> =
                                     app.subagents.list().iter().map(|s| s.id.clone()).collect();
-                                app.overlay_state.open_subagent_status(items);
+                                return Ok(Some(UiRequest::ShowSubagents { items }));
                             }
                         },
                         "close" => {
@@ -338,10 +337,10 @@ impl SlashCommand for AgentCommand {
                 None => {
                     let items: Vec<String> =
                         app.agent_registry.iter().map(|a| a.name.clone()).collect();
-                    app.overlay_state.open_agents(items);
+                    return Ok(Some(UiRequest::ShowAgents { items }));
                 }
             }
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -383,7 +382,7 @@ impl SlashCommand for SkillCommand {
         &'a self,
         app: &'a mut App,
         args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.status = AppStatus::Idle;
             match args.map(str::trim).filter(|s| !s.is_empty()) {
@@ -414,10 +413,10 @@ impl SlashCommand for SkillCommand {
                 }
                 None => {
                     let items = app.skill_registry.iter().map(|s| s.name.clone()).collect();
-                    app.overlay_state.open_skills(items);
+                    return Ok(Some(UiRequest::ShowSkills { items }));
                 }
             }
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -461,7 +460,7 @@ impl SlashCommand for ModelCommand {
         &'a self,
         app: &'a mut App,
         args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.status = AppStatus::Idle;
             match args.map(str::trim).filter(|s| !s.is_empty()) {
@@ -481,10 +480,10 @@ impl SlashCommand for ModelCommand {
                         .iter()
                         .position(|m| m.id == app.current_model.id)
                         .unwrap_or(0);
-                    app.overlay_state.open_model(items, selected);
+                    return Ok(Some(UiRequest::ShowModels { items, selected }));
                 }
             }
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -536,7 +535,7 @@ impl SlashCommand for PermissionCommand {
         &'a self,
         app: &'a mut App,
         args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.status = AppStatus::Idle;
             match args.map(str::trim).filter(|s| !s.is_empty()) {
@@ -588,7 +587,7 @@ impl SlashCommand for PermissionCommand {
                     app.set_transient_message("session permissions listed");
                 }
             }
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -621,7 +620,7 @@ impl SlashCommand for AutoCommand {
         &'a self,
         app: &'a mut App,
         _args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.status = AppStatus::Idle;
             app.set_session_permissions_allow_all();
@@ -629,7 +628,7 @@ impl SlashCommand for AutoCommand {
                 "session permissions switched to allow_all (path restrictions kept)".to_string(),
             );
             app.set_transient_message("session permissions: allow_all");
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -673,7 +672,7 @@ impl SlashCommand for McpCommand {
         &'a self,
         app: &'a mut App,
         args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.status = AppStatus::Idle;
             match args.map(str::trim).filter(|s| !s.is_empty()) {
@@ -703,7 +702,7 @@ impl SlashCommand for McpCommand {
                     app.set_transient_message("MCP status listed");
                 }
             }
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -763,7 +762,7 @@ impl SlashCommand for MemoryCommand {
         &'a self,
         app: &'a mut App,
         args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>> {
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
             app.status = AppStatus::Idle;
             match args.map(str::trim).filter(|s| !s.is_empty()) {
@@ -804,7 +803,7 @@ impl SlashCommand for MemoryCommand {
                     app.set_transient_message("Memory status listed");
                 }
             }
-            Ok(())
+            Ok(None)
         })
     }
 }
@@ -829,9 +828,9 @@ pub static BUILT_IN_REGISTRY: LazyLock<CommandRegistry> = LazyLock::new(|| {
     ])
 });
 
-/// Handle a TUI slash command. Returns `true` if the input started with `/`
-/// and has been handled as a command.
-pub async fn handle_command(app: &mut App, input: &str) -> bool {
+/// Handle a slash command. Returns the outcome describing how the input was
+/// treated; presentation intents are carried in `CommandOutcome::ui`.
+pub async fn handle_command(app: &mut App, input: &str) -> CommandOutcome {
     BUILT_IN_REGISTRY.handle_command(app, input).await
 }
 
@@ -860,7 +859,7 @@ mod tests {
         let mut app = App::new(AppConfig::default());
 
         // Bare /memory shows the status.
-        assert!(app.handle_command("/memory").await);
+        assert!(app.handle_command("/memory").await.handled);
         assert!(
             app.messages
                 .iter()
@@ -868,7 +867,7 @@ mod tests {
         );
 
         // The subsystem is unavailable without a memory agent; on/off report it.
-        assert!(app.handle_command("/memory off").await);
+        assert!(app.handle_command("/memory off").await.handled);
         assert!(
             app.status_message.contains("unavailable"),
             "unexpected status: {}",
@@ -876,7 +875,7 @@ mod tests {
         );
 
         // Unknown subcommand is an error.
-        assert!(app.handle_command("/memory bogus").await);
+        assert!(app.handle_command("/memory bogus").await.handled);
         assert!(app.status_message.contains("unknown /memory subcommand"));
     }
 
@@ -940,25 +939,29 @@ mod tests {
         let mut app = App::new(config);
         assert_eq!(app.current_model.id, "model-a");
 
-        // Bare /model opens the picker with the current model selected.
-        assert!(app.handle_command("/model").await);
-        assert!(matches!(
-            app.overlay_state.overlay,
-            crate::app::Overlay::Model { .. }
-        ));
+        // Bare /model requests the model picker with the current model selected.
+        let outcome = app.handle_command("/model").await;
+        assert!(outcome.handled);
+        match outcome.ui {
+            Some(UiRequest::ShowModels { items, selected }) => {
+                assert_eq!(items, vec!["model-a".to_string(), "model-b".to_string()]);
+                assert_eq!(selected, 0);
+            }
+            other => panic!("expected ShowModels request, got {:?}", other),
+        }
 
-        assert!(app.handle_command("/model list").await);
+        assert!(app.handle_command("/model list").await.handled);
         assert!(
             app.messages
                 .iter()
                 .any(|m| m.is_event() && m.content.contains("Model B"))
         );
 
-        assert!(app.handle_command("/model Model B").await);
+        assert!(app.handle_command("/model Model B").await.handled);
         assert_eq!(app.current_model.id, "model-b");
         assert!(app.status_message.contains("Model B"));
 
-        assert!(app.handle_command("/model nosuch").await);
+        assert!(app.handle_command("/model nosuch").await.handled);
         assert!(
             app.status_message.contains("model not found"),
             "unexpected status: {}",
@@ -983,7 +986,7 @@ mod tests {
             sutcac_sh::permissions::PermissionPolicy::parse("deny:network,write").unwrap();
 
         // Bare /permission shows the current policy.
-        assert!(app.handle_command("/permission").await);
+        assert!(app.handle_command("/permission").await.handled);
         assert!(
             app.messages
                 .iter()
@@ -991,7 +994,11 @@ mod tests {
         );
 
         // Grant tags for the session.
-        assert!(app.handle_command("/permission grant network,write").await);
+        assert!(
+            app.handle_command("/permission grant network,write")
+                .await
+                .handled
+        );
         assert!(app.shell_state.permissions.check(&custom_network()).is_ok());
         assert!(
             app.shell_state
@@ -1005,7 +1012,11 @@ mod tests {
         }));
 
         // Revoke them again.
-        assert!(app.handle_command("/permission revoke network,write").await);
+        assert!(
+            app.handle_command("/permission revoke network,write")
+                .await
+                .handled
+        );
         assert!(
             app.shell_state
                 .permissions
@@ -1020,14 +1031,14 @@ mod tests {
         );
 
         // Missing argument is an error.
-        assert!(app.handle_command("/permission grant").await);
+        assert!(app.handle_command("/permission grant").await.handled);
         assert!(
             app.status_message
                 .contains("usage: /permission grant <tags>")
         );
 
         // Unknown subcommand is an error.
-        assert!(app.handle_command("/permission bogus").await);
+        assert!(app.handle_command("/permission bogus").await.handled);
         assert!(
             app.status_message
                 .contains("unknown /permission subcommand")
@@ -1044,12 +1055,31 @@ mod tests {
             sutcac_sh::permissions::PermissionPolicy::parse("deny:network").unwrap();
         app.shell_state.permissions.grant_tag("network");
 
-        assert!(app.handle_command("/auto").await);
+        assert!(app.handle_command("/auto").await.handled);
         assert!(app.messages.iter().any(|m| m.content.contains("allow_all")));
         let mut network = PermissionSet::empty();
         network.insert(Permission::Custom("NETWORK".to_string()));
         assert!(app.shell_state.permissions.check(&network).is_ok());
         // Session grants are cleared along with the mode switch.
         assert!(app.shell_state.permissions.session_grants.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commands_report_whether_the_input_line_should_be_recorded() {
+        use crate::config::AppConfig;
+
+        let mut app = App::new(AppConfig::default());
+
+        let outcome = app.handle_command("/help").await;
+        assert!(outcome.handled);
+        assert!(outcome.record_history);
+
+        let outcome = app.handle_command("/exit").await;
+        assert!(outcome.handled);
+        assert!(!outcome.record_history);
+
+        let outcome = app.handle_command("/nosuch").await;
+        assert!(outcome.handled);
+        assert!(!outcome.record_history);
     }
 }

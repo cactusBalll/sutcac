@@ -1,6 +1,6 @@
 //! Modal overlay state for the TUI.
 
-use crate::tool::{AskAnswer, AskQuestion};
+use catus_core::tool::{AskAnswer, AskQuestion};
 
 /// Modal page shown on top of the chat view.
 #[derive(Debug, Clone, PartialEq, Eq)]

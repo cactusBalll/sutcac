@@ -1,14 +1,13 @@
 //! Modal overlay pages rendered on top of the chat view.
 //!
 //! Pages:
-//! - [`Overlay::Resume`](crate::app::Overlay::Resume): interactive history
-//!   picker backed by a ratatui [`List`].
-//! - [`Overlay::Status`](crate::app::Overlay::Status): token usage details.
-//! - [`Overlay::Config`](crate::app::Overlay::Config): editable config fields.
-//! - [`Overlay::Skills`](crate::app::Overlay::Skills): skill picker.
-//! - [`Overlay::Model`](crate::app::Overlay::Model): model picker.
-//! - [`Overlay::Ask`](crate::app::Overlay::Ask): question dialog opened by
-//!   the `ask_user` tool.
+//! - [`Overlay::Resume`]: interactive history picker backed by a ratatui
+//!   [`List`].
+//! - [`Overlay::Status`]: token usage details.
+//! - [`Overlay::Config`]: editable config fields.
+//! - [`Overlay::Skills`]: skill picker.
+//! - [`Overlay::Model`]: model picker.
+//! - [`Overlay::Ask`]: question dialog opened by the `ask_user` tool.
 //!
 //! This module renders overlays and handles keyboard navigation for them.
 
@@ -21,8 +20,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table},
 };
 
-use crate::app::{App, Overlay};
-use crate::tool::{AskAnswer, AskQuestion, collect_answer};
+use crate::ui::{Overlay, UiState};
+use catus_core::app::App;
+use catus_core::tool::{AskAnswer, AskQuestion, collect_answer};
 
 /// Result of handling a key press while an overlay is active.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,12 +49,12 @@ pub enum OverlayAction {
 
 /// Handle a key press while an overlay is active. Keys never reach the
 /// input line while an overlay is open.
-pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
-    match app.overlay_state.overlay.clone() {
+pub fn handle_overlay_key(app: &mut App, ui: &mut UiState, code: KeyCode) -> OverlayAction {
+    match ui.overlay_state.overlay.clone() {
         Overlay::None => OverlayAction::Consumed,
         Overlay::Status => match code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 OverlayAction::Closed
             }
             _ => OverlayAction::Consumed,
@@ -66,7 +66,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 } else {
                     (selected + items.len() - 1) % items.len()
                 };
-                app.overlay_state.overlay = Overlay::Resume {
+                ui.overlay_state.overlay = Overlay::Resume {
                     items,
                     selected: next,
                 };
@@ -78,7 +78,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 } else {
                     (selected + 1) % items.len()
                 };
-                app.overlay_state.overlay = Overlay::Resume {
+                ui.overlay_state.overlay = Overlay::Resume {
                     items,
                     selected: next,
                 };
@@ -86,14 +86,14 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
             }
             KeyCode::Enter => {
                 let chosen = items.get(selected).cloned();
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 match chosen {
                     Some(name) => OverlayAction::LoadHistory(name),
                     None => OverlayAction::Closed,
                 }
             }
             KeyCode::Esc => {
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 OverlayAction::Closed
             }
             _ => OverlayAction::Consumed,
@@ -105,7 +105,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 } else {
                     (selected + items.len() - 1) % items.len()
                 };
-                app.overlay_state.overlay = Overlay::Skills {
+                ui.overlay_state.overlay = Overlay::Skills {
                     items,
                     selected: next,
                 };
@@ -117,7 +117,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 } else {
                     (selected + 1) % items.len()
                 };
-                app.overlay_state.overlay = Overlay::Skills {
+                ui.overlay_state.overlay = Overlay::Skills {
                     items,
                     selected: next,
                 };
@@ -125,14 +125,14 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
             }
             KeyCode::Enter => {
                 let chosen = items.get(selected).cloned();
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 match chosen {
                     Some(name) => OverlayAction::ActivateSkill(name),
                     None => OverlayAction::Closed,
                 }
             }
             KeyCode::Esc => {
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 OverlayAction::Closed
             }
             _ => OverlayAction::Consumed,
@@ -144,7 +144,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 } else {
                     (selected + items.len() - 1) % items.len()
                 };
-                app.overlay_state.overlay = Overlay::Model {
+                ui.overlay_state.overlay = Overlay::Model {
                     items,
                     selected: next,
                 };
@@ -156,7 +156,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 } else {
                     (selected + 1) % items.len()
                 };
-                app.overlay_state.overlay = Overlay::Model {
+                ui.overlay_state.overlay = Overlay::Model {
                     items,
                     selected: next,
                 };
@@ -164,14 +164,14 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
             }
             KeyCode::Enter => {
                 let chosen = items.get(selected).cloned();
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 match chosen {
                     Some(id) => OverlayAction::SwitchModel(id),
                     None => OverlayAction::Closed,
                 }
             }
             KeyCode::Esc => {
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 OverlayAction::Closed
             }
             _ => OverlayAction::Consumed,
@@ -185,7 +185,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
             mut answers,
         } => {
             let Some(question) = questions.get(current).cloned() else {
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 return OverlayAction::CancelInteraction;
             };
             // Focus rows: `0..options.len()` are the options, the row after
@@ -196,7 +196,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 selections.get(current).map(Vec::as_slice).unwrap_or(&[]);
             match code {
                 KeyCode::Up => {
-                    app.overlay_state.overlay = Overlay::Ask {
+                    ui.overlay_state.overlay = Overlay::Ask {
                         questions,
                         current,
                         focus: (focus + rows - 1) % rows,
@@ -207,7 +207,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                     OverlayAction::Consumed
                 }
                 KeyCode::Down => {
-                    app.overlay_state.overlay = Overlay::Ask {
+                    ui.overlay_state.overlay = Overlay::Ask {
                         questions,
                         current,
                         focus: (focus + 1) % rows,
@@ -219,7 +219,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 }
                 KeyCode::Char(c) if focus == other_row => {
                     other.push(c);
-                    app.overlay_state.overlay = Overlay::Ask {
+                    ui.overlay_state.overlay = Overlay::Ask {
                         questions,
                         current,
                         focus,
@@ -231,7 +231,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 }
                 KeyCode::Backspace if focus == other_row => {
                     other.pop();
-                    app.overlay_state.overlay = Overlay::Ask {
+                    ui.overlay_state.overlay = Overlay::Ask {
                         questions,
                         current,
                         focus,
@@ -248,7 +248,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                     {
                         *slot = !*slot;
                     }
-                    app.overlay_state.overlay = Overlay::Ask {
+                    ui.overlay_state.overlay = Overlay::Ask {
                         questions,
                         current,
                         focus,
@@ -263,7 +263,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                         Some(answer) => {
                             answers.push(answer);
                             if current + 1 < questions.len() {
-                                app.overlay_state.overlay = Overlay::Ask {
+                                ui.overlay_state.overlay = Overlay::Ask {
                                     questions,
                                     current: current + 1,
                                     focus: 0,
@@ -273,7 +273,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                                 };
                                 OverlayAction::Consumed
                             } else {
-                                app.overlay_state.close();
+                                ui.overlay_state.close();
                                 OverlayAction::Answered(answers)
                             }
                         }
@@ -282,7 +282,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                     }
                 }
                 KeyCode::Esc => {
-                    app.overlay_state.close();
+                    ui.overlay_state.close();
                     OverlayAction::CancelInteraction
                 }
                 _ => OverlayAction::Consumed,
@@ -297,7 +297,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                     } else {
                         (selected + fields.len() - 1) % fields.len()
                     };
-                    app.overlay_state.overlay = Overlay::Config { selected: next };
+                    ui.overlay_state.overlay = Overlay::Config { selected: next };
                     OverlayAction::Consumed
                 }
                 KeyCode::Down => {
@@ -306,20 +306,20 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                     } else {
                         (selected + 1) % fields.len()
                     };
-                    app.overlay_state.overlay = Overlay::Config { selected: next };
+                    ui.overlay_state.overlay = Overlay::Config { selected: next };
                     OverlayAction::Consumed
                 }
                 KeyCode::Enter => {
                     if let Some((key, value)) = fields.get(selected) {
-                        app.input_state.input = format!("/config set {} {}", key, value);
-                        app.input_state.cursor = app.input_state.input.len();
-                        app.input_state.recompute_candidates();
+                        ui.input_state.input = format!("/config set {} {}", key, value);
+                        ui.input_state.cursor = ui.input_state.input.len();
+                        ui.input_state.recompute_candidates();
                     }
-                    app.overlay_state.close();
+                    ui.overlay_state.close();
                     OverlayAction::Closed
                 }
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    app.overlay_state.close();
+                    ui.overlay_state.close();
                     OverlayAction::Closed
                 }
                 _ => OverlayAction::Consumed,
@@ -332,7 +332,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 } else {
                     (selected + items.len() - 1) % items.len()
                 };
-                app.overlay_state.overlay = Overlay::Agents {
+                ui.overlay_state.overlay = Overlay::Agents {
                     items,
                     selected: next,
                 };
@@ -344,7 +344,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 } else {
                     (selected + 1) % items.len()
                 };
-                app.overlay_state.overlay = Overlay::Agents {
+                ui.overlay_state.overlay = Overlay::Agents {
                     items,
                     selected: next,
                 };
@@ -352,14 +352,14 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
             }
             KeyCode::Enter => {
                 let chosen = items.get(selected).cloned();
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 match chosen {
                     Some(name) => OverlayAction::ActivateAgent(name),
                     None => OverlayAction::Closed,
                 }
             }
             KeyCode::Esc => {
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 OverlayAction::Closed
             }
             _ => OverlayAction::Consumed,
@@ -371,7 +371,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 } else {
                     (selected + items.len() - 1) % items.len()
                 };
-                app.overlay_state.overlay = Overlay::SubagentStatus {
+                ui.overlay_state.overlay = Overlay::SubagentStatus {
                     items,
                     selected: next,
                 };
@@ -383,7 +383,7 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
                 } else {
                     (selected + 1) % items.len()
                 };
-                app.overlay_state.overlay = Overlay::SubagentStatus {
+                ui.overlay_state.overlay = Overlay::SubagentStatus {
                     items,
                     selected: next,
                 };
@@ -391,14 +391,14 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
             }
             KeyCode::Enter => {
                 let chosen = items.get(selected).cloned();
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 match chosen {
                     Some(id) => OverlayAction::WatchSubagent(id),
                     None => OverlayAction::Closed,
                 }
             }
             KeyCode::Esc => {
-                app.overlay_state.close();
+                ui.overlay_state.close();
                 OverlayAction::Closed
             }
             _ => OverlayAction::Consumed,
@@ -408,8 +408,8 @@ pub fn handle_overlay_key(app: &mut App, code: KeyCode) -> OverlayAction {
 
 /// Move the overlay selection with the mouse wheel. Returns true if the
 /// scroll was consumed by an overlay.
-pub fn handle_overlay_scroll(app: &mut App, up: bool) -> bool {
-    match &app.overlay_state.overlay {
+pub fn handle_overlay_scroll(app: &mut App, ui: &mut UiState, up: bool) -> bool {
+    match &ui.overlay_state.overlay {
         Overlay::Resume { .. }
         | Overlay::Config { .. }
         | Overlay::Skills { .. }
@@ -417,7 +417,7 @@ pub fn handle_overlay_scroll(app: &mut App, up: bool) -> bool {
         | Overlay::Agents { .. }
         | Overlay::SubagentStatus { .. }
         | Overlay::Ask { .. } => {
-            let _ = handle_overlay_key(app, if up { KeyCode::Up } else { KeyCode::Down });
+            let _ = handle_overlay_key(app, ui, if up { KeyCode::Up } else { KeyCode::Down });
             true
         }
         _ => false,
@@ -425,11 +425,11 @@ pub fn handle_overlay_scroll(app: &mut App, up: bool) -> bool {
 }
 
 /// Render the active overlay centered over the chat view.
-pub fn draw_overlay(frame: &mut Frame, app: &App) {
+pub fn draw_overlay(frame: &mut Frame, app: &App, ui: &UiState) {
     let popup = centered_rect(60, 70, frame.area());
     frame.render_widget(Clear, popup);
 
-    match &app.overlay_state.overlay {
+    match &ui.overlay_state.overlay {
         Overlay::None => {}
         Overlay::Resume { items, selected } => draw_resume(frame, items, *selected, popup),
         Overlay::Status => draw_status(frame, app, popup),
@@ -955,9 +955,9 @@ mod tests {
 
     mod ask {
         use super::*;
-        use crate::app::Overlay;
-        use crate::config::AppConfig;
-        use crate::tool::{Answer, AskAnswer, AskQuestion};
+        use crate::ui::Overlay;
+        use catus_core::config::AppConfig;
+        use catus_core::tool::{Answer, AskAnswer, AskQuestion};
 
         fn question(multi_select: bool) -> AskQuestion {
             serde_json::from_str(&format!(
@@ -967,39 +967,40 @@ mod tests {
             .unwrap()
         }
 
-        fn app_with_ask(questions: Vec<AskQuestion>) -> App {
+        fn app_with_ask(questions: Vec<AskQuestion>) -> (App, UiState) {
             let mut app = App::new(AppConfig::default());
-            app.overlay_state.open_ask(questions);
-            app
+            let mut ui = UiState::new();
+            ui.overlay_state.open_ask(questions);
+            (app, ui)
         }
 
         #[test]
         fn single_select_enter_picks_focused_option() {
-            let mut app = app_with_ask(vec![question(false)]);
+            let (mut app, mut ui) = app_with_ask(vec![question(false)]);
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Down),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Down),
                 OverlayAction::Consumed
             );
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Enter),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Enter),
                 OverlayAction::Answered(vec![AskAnswer {
                     prompt: "Pick".to_string(),
                     answer: Answer::One("b".to_string()),
                 }])
             );
-            assert!(!app.overlay_state.is_active());
+            assert!(!ui.overlay_state.is_active());
         }
 
         #[test]
         fn single_select_other_row_uses_typed_text() {
-            let mut app = app_with_ask(vec![question(false)]);
+            let (mut app, mut ui) = app_with_ask(vec![question(false)]);
             // Focus row 2 is the pseudo-option "Other" (after options a, b).
-            handle_overlay_key(&mut app, KeyCode::Down);
-            handle_overlay_key(&mut app, KeyCode::Down);
-            handle_overlay_key(&mut app, KeyCode::Char('x'));
-            handle_overlay_key(&mut app, KeyCode::Char('y'));
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Down);
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Down);
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Char('x'));
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Char('y'));
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Enter),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Enter),
                 OverlayAction::Answered(vec![AskAnswer {
                     prompt: "Pick".to_string(),
                     answer: Answer::One("xy".to_string()),
@@ -1009,14 +1010,14 @@ mod tests {
 
         #[test]
         fn multi_select_toggles_and_collects() {
-            let mut app = app_with_ask(vec![question(true)]);
+            let (mut app, mut ui) = app_with_ask(vec![question(true)]);
             // Check option "a" with Space, then confirm.
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Char(' ')),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Char(' ')),
                 OverlayAction::Consumed
             );
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Enter),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Enter),
                 OverlayAction::Answered(vec![AskAnswer {
                     prompt: "Pick".to_string(),
                     answer: Answer::Many(vec!["a".to_string()]),
@@ -1026,29 +1027,29 @@ mod tests {
 
         #[test]
         fn multi_select_requires_at_least_one_answer() {
-            let mut app = app_with_ask(vec![question(true)]);
+            let (mut app, mut ui) = app_with_ask(vec![question(true)]);
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Enter),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Enter),
                 OverlayAction::Consumed,
                 "Enter without any selection must not submit"
             );
-            assert!(app.overlay_state.is_active());
+            assert!(ui.overlay_state.is_active());
         }
 
         #[test]
         fn multiple_questions_advance_then_answer() {
-            let mut app = app_with_ask(vec![question(false), question(false)]);
+            let (mut app, mut ui) = app_with_ask(vec![question(false), question(false)]);
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Enter),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Enter),
                 OverlayAction::Consumed,
                 "first Enter advances to the next question"
             );
-            match &app.overlay_state.overlay {
+            match &ui.overlay_state.overlay {
                 Overlay::Ask { current, .. } => assert_eq!(*current, 1),
                 other => panic!("expected ask overlay, got {:?}", other),
             }
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Enter),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Enter),
                 OverlayAction::Answered(vec![
                     AskAnswer {
                         prompt: "Pick".to_string(),
@@ -1064,22 +1065,22 @@ mod tests {
 
         #[test]
         fn esc_cancels_the_interaction() {
-            let mut app = app_with_ask(vec![question(false)]);
+            let (mut app, mut ui) = app_with_ask(vec![question(false)]);
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Esc),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Esc),
                 OverlayAction::CancelInteraction
             );
-            assert!(!app.overlay_state.is_active());
+            assert!(!ui.overlay_state.is_active());
         }
     }
 
     mod model_picker {
         use super::*;
-        use crate::app::Overlay;
-        use crate::config::{AppConfig, ModelEntry};
-        use crate::llm::Provider;
+        use crate::ui::Overlay;
+        use catus_core::config::{AppConfig, ModelEntry};
+        use catus_core::llm::Provider;
 
-        fn app_with_models() -> App {
+        fn app_with_models() -> (App, UiState) {
             let mut config = AppConfig {
                 providers: vec![Provider {
                     name: "test".to_string(),
@@ -1111,34 +1112,149 @@ mod tests {
                 .iter()
                 .position(|m| m.id == app.current_model.id)
                 .unwrap_or(0);
-            app.overlay_state.open_model(items, selected);
-            app
+            let mut ui = UiState::new();
+            ui.overlay_state.open_model(items, selected);
+            (app, ui)
         }
 
         #[test]
         fn enter_confirms_selected_model_id() {
-            let mut app = app_with_models();
-            handle_overlay_key(&mut app, KeyCode::Down);
+            let (mut app, mut ui) = app_with_models();
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Down);
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Enter),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Enter),
                 OverlayAction::SwitchModel("model-b".to_string())
             );
-            assert!(!app.overlay_state.is_active());
+            assert!(!ui.overlay_state.is_active());
         }
 
         #[test]
         fn selection_wraps_and_esc_closes() {
-            let mut app = app_with_models();
-            handle_overlay_key(&mut app, KeyCode::Up);
-            match &app.overlay_state.overlay {
+            let (mut app, mut ui) = app_with_models();
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Up);
+            match &ui.overlay_state.overlay {
                 Overlay::Model { selected, .. } => assert_eq!(*selected, 1),
                 other => panic!("expected model overlay, got {:?}", other),
             }
             assert_eq!(
-                handle_overlay_key(&mut app, KeyCode::Esc),
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Esc),
                 OverlayAction::Closed
             );
-            assert_eq!(app.overlay_state.overlay, Overlay::None);
+            assert_eq!(ui.overlay_state.overlay, Overlay::None);
+        }
+    }
+
+    mod resume_picker {
+        use super::*;
+        use crate::ui::Overlay;
+        use catus_core::app::App;
+        use catus_core::config::AppConfig;
+        use catus_core::history::SessionStore;
+        use catus_core::message::Message;
+
+        fn test_app_with_history_dir(dir: &std::path::Path) -> App {
+            let config = AppConfig {
+                agent: catus_core::config::AgentConfig {
+                    history_path: Some(dir.to_path_buf()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            App::new(config)
+        }
+
+        fn seed_session(dir: &std::path::Path, name: &str, messages: &[Message]) {
+            let store = SessionStore::open(dir).unwrap();
+            let id = store
+                .create_session(name, "catus-seed", "test-model")
+                .unwrap();
+            store
+                .replace_messages(id, catus_core::history::MAIN_AGENT_ID, messages)
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn picker_navigation_and_enter_loads_history() {
+            let dir =
+                std::env::temp_dir().join(format!("catus_resume_overlay_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            seed_session(&dir, "alpha", &[Message::user("hi")]);
+            seed_session(&dir, "beta", &[]);
+
+            let mut app = test_app_with_history_dir(&dir);
+            let mut ui = UiState::new();
+            let items = app.list_session_names();
+            ui.overlay_state.open_resume(items);
+
+            // Arrow keys move the selection with wrap-around.
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Down);
+            match &ui.overlay_state.overlay {
+                Overlay::Resume { items, selected } => {
+                    assert_eq!(items.len(), 2);
+                    assert_eq!(*selected, 1);
+                }
+                other => panic!("expected resume overlay, got {:?}", other),
+            }
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Down);
+            match &ui.overlay_state.overlay {
+                Overlay::Resume { selected, .. } => assert_eq!(*selected, 0),
+                other => panic!("expected resume overlay, got {:?}", other),
+            }
+
+            // Enter yields the selected session name for the event loop to load.
+            let action = handle_overlay_key(&mut app, &mut ui, KeyCode::Enter);
+            match action {
+                OverlayAction::LoadHistory(name) => {
+                    let store = SessionStore::open(&dir).unwrap();
+                    assert!(store.find_session(&name).unwrap().is_some());
+                }
+                other => panic!("expected LoadHistory, got {:?}", other),
+            }
+            assert!(!ui.overlay_state.is_active());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn esc_closes_without_loading() {
+            let dir = std::env::temp_dir().join(format!("catus_resume_esc_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            seed_session(&dir, "a", &[]);
+
+            let mut app = test_app_with_history_dir(&dir);
+            let mut ui = UiState::new();
+            let items = app.list_session_names();
+            ui.overlay_state.open_resume(items);
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Esc);
+            assert_eq!(ui.overlay_state.overlay, Overlay::None);
+            assert!(app.current_session_id.is_none());
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    mod config_overlay {
+        use super::*;
+        use crate::ui::Overlay;
+        use catus_core::config::AppConfig;
+
+        #[test]
+        fn enter_prefills_edit_command() {
+            let dir =
+                std::env::temp_dir().join(format!("catus_config_enter_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let mut app = App::new(AppConfig::default());
+            let mut ui = UiState::new();
+            ui.overlay_state.open_config();
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Enter);
+            assert!(ui.input_state.input.starts_with("/config set "));
+            assert_eq!(ui.overlay_state.overlay, Overlay::None);
+
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

@@ -9,21 +9,18 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, AppStatus};
-use crate::message::{Message, Role};
+use crate::ui::{MAX_CANDIDATES, UiState};
+use catus_core::app::{App, AppStatus};
+use catus_core::message::{Message, Role};
 use crossterm::event::KeyCode;
 
 const PROMPT: &str = "> ";
 const PROMPT_WIDTH: u16 = 2;
 
 /// Draw the chat layout into the provided frame.
-pub fn draw_chat(frame: &mut Frame, app: &mut App) {
+pub fn draw_chat(frame: &mut Frame, app: &mut App, ui: &mut UiState) {
     let area = frame.area();
-    let candidate_height = app
-        .input_state
-        .candidates
-        .len()
-        .min(crate::app::MAX_CANDIDATES) as u16;
+    let candidate_height = ui.input_state.candidates.len().min(MAX_CANDIDATES) as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -34,15 +31,15 @@ pub fn draw_chat(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    render_history(frame, app, chunks[0]);
+    render_history(frame, app, ui, chunks[0]);
     if candidate_height > 0 {
-        render_candidates(frame, app, chunks[1]);
+        render_candidates(frame, ui, chunks[1]);
     }
-    render_input(frame, app, chunks[2]);
-    render_status(frame, app, chunks[3]);
+    render_input(frame, ui, chunks[2]);
+    render_status(frame, app, ui, chunks[3]);
 }
 
-fn render_history(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_history(frame: &mut Frame, app: &mut App, ui: &mut UiState, area: Rect) {
     let messages: Vec<&Message> = if let Some(id) = &app.current_subagent_view {
         app.subagents
             .get(id)
@@ -57,12 +54,13 @@ fn render_history(frame: &mut Frame, app: &mut App, area: Rect) {
     let total_wrapped_lines = paragraph.line_count(area.width);
     let visible_lines = area.height as usize;
 
-    // `app.chat_state.scroll` is an offset from the bottom (0 = latest message).
-    // Clamp it here so `scroll_to_top()` cannot leave it at usize::MAX,
-    // which would make subsequent scroll-down operations ineffective.
+    // `UiState::chat_state.scroll` is an offset from the bottom (0 = latest
+    // message). Clamp it here so `scroll_to_top()` cannot leave it at
+    // usize::MAX, which would make subsequent scroll-down operations
+    // ineffective.
     let (bottom_offset, top_scroll) =
-        compute_history_scroll(total_wrapped_lines, visible_lines, app.chat_state.scroll);
-    app.chat_state.scroll = bottom_offset;
+        compute_history_scroll(total_wrapped_lines, visible_lines, ui.chat_state.scroll);
+    ui.chat_state.scroll = bottom_offset;
 
     let paragraph = paragraph.scroll((top_scroll, 0));
 
@@ -89,10 +87,10 @@ fn compute_history_scroll(
     (bottom_offset, top_scroll)
 }
 
-fn render_input(frame: &mut Frame, app: &App, area: Rect) {
+fn render_input(frame: &mut Frame, ui: &UiState, area: Rect) {
     let max_width = area.width.saturating_sub(PROMPT_WIDTH) as usize;
     let (visible_input, cursor_offset) =
-        visible_input_window(&app.input_state.input, app.input_state.cursor, max_width);
+        visible_input_window(&ui.input_state.input, ui.input_state.cursor, max_width);
 
     let input = Paragraph::new(Text::from(Line::from(vec![
         Span::styled(
@@ -189,27 +187,27 @@ fn candidate_scroll_offset(total: usize, selected: usize, visible_count: usize) 
     }
 }
 
-fn render_candidates(frame: &mut Frame, app: &App, area: Rect) {
+fn render_candidates(frame: &mut Frame, ui: &UiState, area: Rect) {
     let normal_style = Style::default().fg(Color::Cyan);
     let selected_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
         .add_modifier(Modifier::REVERSED);
 
-    let total = app.input_state.candidates.len();
+    let total = ui.input_state.candidates.len();
     if total == 0 {
         return;
     }
 
     let visible_count = area.height as usize;
-    let selected = app
+    let selected = ui
         .input_state
         .selected_candidate
         .unwrap_or(0)
         .min(total - 1);
     let offset = candidate_scroll_offset(total, selected, visible_count);
 
-    let items: Vec<ListItem> = app
+    let items: Vec<ListItem> = ui
         .input_state
         .candidates
         .iter()
@@ -218,7 +216,7 @@ fn render_candidates(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, candidate)| {
             let absolute_i = offset + i;
-            let style = if app.input_state.selected_candidate == Some(absolute_i) {
+            let style = if ui.input_state.selected_candidate == Some(absolute_i) {
                 selected_style
             } else {
                 normal_style
@@ -229,7 +227,7 @@ fn render_candidates(frame: &mut Frame, app: &App, area: Rect) {
 
     let list = List::new(items).highlight_symbol("▶ ");
     let mut state = ListState::default();
-    state.select(app.input_state.selected_candidate.map(|i| i - offset));
+    state.select(ui.input_state.selected_candidate.map(|i| i - offset));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -253,7 +251,7 @@ fn truncate_to_width(s: &str, max_width: usize) -> &str {
     &s[start_byte..]
 }
 
-fn render_status(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_status(frame: &mut Frame, app: &mut App, ui: &UiState, area: Rect) {
     app.maybe_clear_status_message();
 
     let (label, color) = match app.status {
@@ -271,7 +269,7 @@ fn render_status(frame: &mut Frame, app: &mut App, area: Rect) {
     if !app.status_message.is_empty() {
         spans.push(Span::raw(app.status_message.clone()));
     } else {
-        let navigate = if app.input_state.input.starts_with('/') {
+        let navigate = if ui.input_state.input.starts_with('/') {
             "↑↓:cmd"
         } else {
             "↑↓:hist"
@@ -332,22 +330,22 @@ const MAX_TOOL_STDOUT_LINES: usize = 20;
 
 /// Handle a key event that scrolls the chat history. Returns `true` if the
 /// key was consumed.
-pub fn handle_chat_key(app: &mut App, code: KeyCode) -> bool {
+pub fn handle_chat_key(ui: &mut UiState, code: KeyCode) -> bool {
     match code {
         KeyCode::Home => {
-            app.chat_state.scroll_to_top();
+            ui.chat_state.scroll_to_top();
             true
         }
         KeyCode::End => {
-            app.chat_state.scroll_to_bottom();
+            ui.chat_state.scroll_to_bottom();
             true
         }
         KeyCode::PageUp => {
-            app.chat_state.scroll_up(10);
+            ui.chat_state.scroll_up(10);
             true
         }
         KeyCode::PageDown => {
-            app.chat_state.scroll_down(10);
+            ui.chat_state.scroll_down(10);
             true
         }
         _ => false,

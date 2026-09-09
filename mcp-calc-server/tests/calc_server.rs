@@ -4,8 +4,8 @@
 //! catus's `McpManager` end-to-end: connection, tool catalog discovery, and
 //! tool calls.
 
-use catus::config::McpServerConfig;
-use catus::mcp::McpManager;
+use catus_core::config::McpServerConfig;
+use catus_core::mcp::McpManager;
 
 fn server_binary_path() -> &'static str {
     // Cargo sets this for integration tests of the package that defines the binary.

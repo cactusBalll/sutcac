@@ -9,10 +9,70 @@
 //! The command name, completion candidates, help text, and execution are all
 //! declared in the same place, so the command cannot accidentally drift out of
 //! sync with completion or help.
+//!
+//! Commands are frontend-neutral: they mutate core session state and return
+//! a [`CommandOutcome`]. Presentation intents (which modal page a graphical
+//! frontend may want to open) are expressed through [`UiRequest`] instead of
+//! reaching into any specific UI layer.
 
 use futures::future::BoxFuture;
 
 use crate::app::App;
+
+/// A presentation intent produced by a slash command.
+///
+/// Frontends decide how to realize it: the TUI opens the matching modal
+/// overlay, a Web frontend may push a page, a headless frontend ignores it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "page", rename_all = "snake_case")]
+pub enum UiRequest {
+    /// Show the session status page.
+    ShowStatus,
+    /// Show the config editor.
+    ShowConfig,
+    /// Show the saved-session picker with the given names (newest first).
+    ShowResumePicker { items: Vec<String> },
+    /// Show the skill picker with the given skill names.
+    ShowSkills { items: Vec<String> },
+    /// Show the model picker. `selected` is the highlighted entry.
+    ShowModels { items: Vec<String>, selected: usize },
+    /// Show the agent picker.
+    ShowAgents { items: Vec<String> },
+    /// Show the running-subagent picker.
+    ShowSubagents { items: Vec<String> },
+}
+
+/// Result of executing a slash command, returned to the frontend.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CommandOutcome {
+    /// Whether the input was treated as a command (even an unknown one).
+    pub handled: bool,
+    /// Whether the frontend should record the full input line in its
+    /// input history.
+    pub record_history: bool,
+    /// Presentation intent for frontends with modal pages.
+    pub ui: Option<UiRequest>,
+}
+
+impl CommandOutcome {
+    /// A handled command with no presentation intent.
+    pub fn handled() -> Self {
+        Self {
+            handled: true,
+            record_history: false,
+            ui: None,
+        }
+    }
+
+    /// An input that was not a command.
+    pub fn not_handled() -> Self {
+        Self {
+            handled: false,
+            record_history: false,
+            ui: None,
+        }
+    }
+}
 
 /// Error produced while executing a slash command.
 #[derive(Debug)]
@@ -48,6 +108,10 @@ impl From<Box<dyn std::error::Error>> for CommandError {
 ///
 /// Each command is a stateless object held by [`CommandRegistry`]. Execution is
 /// asynchronous because some commands need to await MCP server responses.
+///
+/// `execute` returns `Ok(Some(request))` when the frontend should realize a
+/// presentation intent (e.g. open a picker page); plain informational
+/// commands return `Ok(None)`.
 pub trait SlashCommand: Send + Sync {
     /// Primary command name without the leading slash, e.g. `"help"`.
     fn name(&self) -> &'static str;
@@ -96,7 +160,7 @@ pub trait SlashCommand: Send + Sync {
         &'a self,
         app: &'a mut App,
         args: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), CommandError>>;
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>>;
 }
 
 /// Registry of slash commands.
@@ -195,11 +259,11 @@ impl CommandRegistry {
     }
 
     /// Parse `input` and dispatch it to the matching command, if any.
-    /// Returns `true` when the input started with `/` and was treated as a
-    /// command, even if the command itself is unknown.
-    pub async fn handle_command(&self, app: &mut App, input: &str) -> bool {
+    /// Returns the outcome describing how the input was handled; errors are
+    /// also surfaced through the app's error status for display frontends.
+    pub async fn handle_command(&self, app: &mut App, input: &str) -> CommandOutcome {
         if !input.starts_with('/') {
-            return false;
+            return CommandOutcome::not_handled();
         }
 
         let rest = input[1..].trim();
@@ -209,15 +273,18 @@ impl CommandRegistry {
 
         match self.find_command(cmd_name) {
             Some(cmd) => match cmd.execute(app, args).await {
-                Ok(()) => {
-                    if cmd.record_history(args) {
-                        app.input_state.record_history(input);
-                    }
-                    true
-                }
+                Ok(ui) => CommandOutcome {
+                    handled: true,
+                    record_history: cmd.record_history(args),
+                    ui,
+                },
                 Err(CommandError(msg)) => {
                     app.set_error(msg);
-                    true
+                    CommandOutcome {
+                        handled: true,
+                        record_history: false,
+                        ui: None,
+                    }
                 }
             },
             None => {
@@ -226,7 +293,11 @@ impl CommandRegistry {
                 } else {
                     app.set_error("unknown command: /".to_string());
                 }
-                true
+                CommandOutcome {
+                    handled: true,
+                    record_history: false,
+                    ui: None,
+                }
             }
         }
     }

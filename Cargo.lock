@@ -300,28 +300,39 @@ dependencies = [
 name = "catus"
 version = "0.1.0"
 dependencies = [
- "chrono",
+ "catus-core",
  "clap",
  "crossterm",
+ "log",
+ "ratatui",
+ "serde_json",
+ "simplelog",
+ "tempfile",
+ "tokio",
+ "unicode-width",
+]
+
+[[package]]
+name = "catus-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
  "diff-match-patch-rs",
  "dirs",
  "eventsource-stream",
  "futures",
  "http",
  "log",
- "ratatui",
  "reqwest",
  "rmcp",
  "rusqlite",
  "serde",
  "serde-saphyr",
  "serde_json",
- "simplelog",
  "sutcac-sh",
  "tempfile",
  "tokio",
  "toml",
- "unicode-width",
 ]
 
 [[package]]
@@ -1616,7 +1627,7 @@ name = "mcp-calc-server"
 version = "0.1.0"
 dependencies = [
  "axum",
- "catus",
+ "catus-core",
  "rmcp",
  "serde",
  "serde_json",

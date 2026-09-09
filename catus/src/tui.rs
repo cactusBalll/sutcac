@@ -7,7 +7,7 @@
 
 use std::io::Write;
 
-use crate::app::AppStatus;
+use catus_core::app::AppStatus;
 
 /// Initialize the terminal into raw mode and return a `Terminal`.
 ///

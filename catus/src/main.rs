@@ -1,6 +1,7 @@
 //! catus: an Agent tool prototype with OpenAI-compatible API and TUI.
 
 use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 
 use clap::Parser;
@@ -9,13 +10,11 @@ use log::LevelFilter;
 use simplelog::{Config, WriteLogger};
 use tokio::sync::mpsc;
 
-use catus::app::{App, AppStatus};
-use catus::config::AppConfig;
-use catus::llm::{LlmError, StreamEvent};
-use catus::message::Message;
-use catus::resources;
 use catus::tui;
-use catus::ui;
+use catus::ui::{self, UiState};
+use catus_core::app::{App, AppStatus, RuntimeEvent};
+use catus_core::config::AppConfig;
+use catus_core::runtime::Runtime;
 
 /// catus: an Agent TUI with an OpenAI-compatible API.
 #[derive(Debug, Parser)]
@@ -42,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.install_project_config {
         let root = std::env::current_dir()?;
-        match resources::install_project_config(&root) {
+        match catus_core::resources::install_project_config(&root) {
             Ok(report) => {
                 println!(
                     "catus: installed project config into {}",
@@ -50,8 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 for (relative, action) in &report.files {
                     let verb = match action {
-                        resources::InstallAction::Written => "written",
-                        resources::InstallAction::Skipped => "kept",
+                        catus_core::resources::InstallAction::Written => "written",
+                        catus_core::resources::InstallAction::Skipped => "kept",
                     };
                     println!("catus:   {verb}: .sutcac/{relative}");
                 }
@@ -118,135 +117,117 @@ fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     Ok(config)
 }
 
+/// Shared startup for both frontends: build the runtime and connect to the
+/// configured MCP servers.
+async fn bootstrap_runtime(config: AppConfig, log_warnings: bool) -> Runtime {
+    let mut runtime = Runtime::new(App::new(config));
+    if !runtime.app.main_agent_from_file {
+        eprintln!("catus: main agent definition not found; create .sutcac/agents/main.md");
+        std::process::exit(1);
+    }
+    for warning in &runtime.app.memory.warnings {
+        if log_warnings {
+            eprintln!("catus: memory warning: {}", warning);
+        } else {
+            log::warn!("memory warning: {}", warning);
+        }
+    }
+    // Drain startup events queued during initialization.
+    while runtime.app.take_event().is_some() {}
+
+    let mcp_warnings = runtime.app.connect_mcp().await;
+    for warning in &mcp_warnings {
+        if log_warnings {
+            eprintln!("catus: mcp warning: {}", warning);
+        } else {
+            log::warn!("mcp warning: {}", warning);
+        }
+    }
+    runtime
+}
+
+/// Headless one-shot mode. Drives the same runtime event loop as the TUI:
+/// prints assistant deltas, tool activity, and cancels interactive
+/// questions (there is no user to answer them).
 async fn run_test_mode(
     prompt: String,
     config: AppConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new(config);
-    if !app.main_agent_from_file {
-        eprintln!("catus: main agent definition not found; create .sutcac/agents/main.md");
-        std::process::exit(1);
-    }
-    for warning in &app.memory.warnings {
-        eprintln!("catus: memory warning: {}", warning);
-    }
-    let client = app.client.clone();
-    let max_rounds = app.max_tool_rounds;
-
-    // Connect to configured MCP servers before starting the conversation.
-    let mcp_warnings = app.connect_mcp().await;
-    for warning in &mcp_warnings {
-        eprintln!("catus: mcp warning: {}", warning);
-    }
+    let mut runtime = bootstrap_runtime(config, true).await;
 
     println!("USER: {}", prompt);
-    app.messages.push(Message::user(prompt));
+    runtime.app.submit_user_message(prompt);
+    // Start the main stream unless a memory recall pass is still running.
+    runtime.maybe_resume_stream().await;
 
-    // Memory recall pass before the first LLM request, mirroring the TUI
-    // flow (simple tasks skip memory inside the pass itself).
-    let user_prompt = app
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == catus::message::Role::User)
-        .map(|m| m.content.clone())
-        .unwrap_or_default();
-    app.maybe_dispatch_memory_recall(&user_prompt);
-    app.await_memory_passes().await;
+    let mut printed = runtime.app.messages.len();
+    let mut assistant_opened = false;
 
-    for round in 0..max_rounds {
-        let tools = app.toolbox.definitions();
-        match client.chat(&app.messages, &tools).await {
-            Ok(reply) => {
-                if !reply.content.is_empty() {
-                    println!("ASSISTANT: {}", reply.content);
+    while let Some(event) = runtime.next_event().await {
+        match event {
+            RuntimeEvent::StreamText(text) => {
+                if !assistant_opened {
+                    println!();
+                    print!("ASSISTANT: ");
+                    assistant_opened = true;
                 }
-                if !reply.reasoning_content.is_empty() {
-                    println!("REASONING: {}", reply.reasoning_content);
+                print!("{}", text);
+                std::io::stdout().flush()?;
+            }
+            RuntimeEvent::ToolCallAdded(call) => {
+                if assistant_opened {
+                    println!();
+                    assistant_opened = false;
                 }
-                if let Some(usage) = &reply.usage {
-                    println!(
-                        "USAGE: prompt={} completion={} total={} cached={}",
-                        usage.prompt_tokens,
-                        usage.completion_tokens,
-                        usage.total_tokens,
-                        usage.cached_tokens
-                    );
-                }
-
-                // Always push an assistant message so tool calls have a parent
-                // message, matching the TUI flow.
-                let mut msg = Message::assistant(reply.content);
-                msg.reasoning_content = reply.reasoning_content;
-                app.messages.push(msg);
-
-                // Skill activation happens through `use_skill` tool calls,
-                // handled by run_pending_tool below.
-
-                for call in reply.tool_calls {
-                    app.add_tool_call(call);
-                }
-
-                if app.has_pending_tool_call() {
-                    while app.has_pending_tool_call() {
-                        if let Some(message) = app.run_pending_tool().await {
-                            println!("TOOL RESULT:\n{}", message);
+                println!("TOOL CALL: {} {}", call.name, call.arguments);
+            }
+            RuntimeEvent::MessagesChanged => {
+                for message in &runtime.app.messages[printed..] {
+                    match message.role {
+                        catus_core::message::Role::Tool => {
+                            println!("TOOL RESULT:\n{}", message.content);
                         }
-                        if app.has_pending_interaction() {
-                            // The ask overlay needs the interactive TUI;
-                            // report the question as cancelled so the model
-                            // can continue without a user.
-                            app.cancel_interaction();
-                            println!(
-                                "TOOL RESULT:\nuser cancelled (ask_user requires the interactive TUI)"
-                            );
-                            break;
+                        catus_core::message::Role::Event => {
+                            println!("{}", message.content);
                         }
+                        _ => {}
                     }
-                } else {
-                    println!(
-                        "[no tool call, conversation complete after {} round(s)]",
-                        round + 1
-                    );
-                    break;
                 }
+                printed = runtime.app.messages.len();
             }
-            Err(e) => {
-                log::error!("llm error: {}", e);
-                eprintln!("catus: llm error: {}", e);
-                std::process::exit(1);
+            RuntimeEvent::InteractionRequested(_) => {
+                if assistant_opened {
+                    println!();
+                    assistant_opened = false;
+                }
+                // The ask overlay needs the interactive TUI; report the
+                // question as cancelled so the model can continue without a
+                // user.
+                println!("TOOL RESULT:\nuser cancelled (ask_user requires the interactive TUI)");
+                runtime.app.cancel_interaction();
+                runtime.maybe_resume_stream().await;
             }
+            RuntimeEvent::TurnComplete => break,
+            _ => {}
         }
     }
 
-    // Let the memory write pass summarize and record the turn before exit.
-    app.maybe_dispatch_memory_write();
-    app.await_memory_passes().await;
+    // Let the background memory write pass summarize the turn before exit.
+    runtime.app.await_memory_passes().await;
+    runtime.app.persist_session();
 
     Ok(())
 }
 
 async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new(config);
-    if !app.main_agent_from_file {
-        eprintln!("catus: main agent definition not found; create .sutcac/agents/main.md");
-        std::process::exit(1);
-    }
-    for warning in &app.memory.warnings {
-        log::warn!("memory warning: {}", warning);
-    }
-    let mcp_warnings = app.connect_mcp().await;
-    for warning in &mcp_warnings {
-        log::warn!("mcp warning: {}", warning);
-    }
+    let mut runtime = bootstrap_runtime(config, false).await;
+    let mut ui = UiState::new();
 
     let mut guard = tui::TerminalGuard::new(tui::init_terminal()?);
     let terminal = guard.terminal();
     terminal.clear()?;
 
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(32);
-    let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(128);
-    let (done_tx, mut done_rx) = mpsc::channel::<Result<(), LlmError>>(1);
 
     // Spawn a blocking task to read crossterm events.
     tokio::task::spawn_blocking(move || {
@@ -277,13 +258,13 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
     // they are rewritten only on real transitions. The bell rings when a busy
     // turn settles to Idle; intermediate Idle blips between tool rounds never
     // become visible here.
-    let mut last_status = app.status;
-    tui::set_tab_title(tui::title_for_status(app.status));
+    let mut last_status = runtime.app.status;
+    tui::set_tab_title(tui::title_for_status(runtime.app.status));
 
     while !should_quit {
-        terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        terminal.draw(|frame| ui::draw(frame, &mut runtime.app, &mut ui))?;
 
-        let status = app.status;
+        let status = runtime.app.status;
         if status != last_status {
             let was_busy = matches!(last_status, AppStatus::Streaming | AppStatus::RunningTool);
             let is_busy = matches!(status, AppStatus::Streaming | AppStatus::RunningTool);
@@ -303,32 +284,31 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
             Some(event) = ui_rx.recv() => {
                 match event {
                     UiEvent::Key(key) => {
-                        match ui::handle_key_event(&mut app, key).await {
+                        match ui::handle_key_event(&mut runtime.app, &mut ui, key).await {
                             ui::AppAction::None => {}
                             ui::AppAction::Quit => should_quit = true,
-                            ui::AppAction::StartStream => {
-                                if app.awaiting_memory_recall() {
-                                    // The user's message is still waiting for
-                                    // the memory recall pass; the main stream
-                                    // starts when the pass completes.
-                                } else {
-                                    app.start_llm_stream(event_tx.clone(), done_tx.clone())
-                                        .await;
-                                }
-                            }
-                            ui::AppAction::SetError(msg) => app.set_error(msg),
+                            ui::AppAction::StartStream => runtime.maybe_resume_stream().await,
+                            ui::AppAction::SetError(msg) => runtime.app.set_error(msg),
                         }
                     }
                     UiEvent::Mouse(mouse) => {
                         match mouse.kind {
                             crossterm::event::MouseEventKind::ScrollUp => {
-                                if !ui::overlay::handle_overlay_scroll(&mut app, true) {
-                                    app.chat_state.scroll_up(3);
+                                if !ui::overlay::handle_overlay_scroll(
+                                    &mut runtime.app,
+                                    &mut ui,
+                                    true,
+                                ) {
+                                    ui.chat_state.scroll_up(3);
                                 }
                             }
                             crossterm::event::MouseEventKind::ScrollDown => {
-                                if !ui::overlay::handle_overlay_scroll(&mut app, false) {
-                                    app.chat_state.scroll_down(3);
+                                if !ui::overlay::handle_overlay_scroll(
+                                    &mut runtime.app,
+                                    &mut ui,
+                                    false,
+                                ) {
+                                    ui.chat_state.scroll_down(3);
                                 }
                             }
                             _ => {}
@@ -340,34 +320,27 @@ async fn run_tui_mode(config: AppConfig) -> Result<(), Box<dyn std::error::Error
                     }
                 }
             }
-            Some(event) = event_rx.recv() => {
-                let is_content_chunk =
-                    matches!(event, StreamEvent::Text(_) | StreamEvent::Reasoning(_));
-                app.handle_stream_event(event);
-                if app.chat_state.auto_scroll && is_content_chunk {
-                    app.chat_state.scroll_to_bottom();
-                }
-            }
-            Some(result) = done_rx.recv() => {
-                // The stream task sends every StreamEvent *before* signalling
-                // done, but tokio::select! may pick the done branch first even
-                // when queued events are still waiting. Drain them so tool
-                // calls and text chunks are never applied after completion.
-                while let Ok(event) = event_rx.try_recv() {
-                    app.handle_stream_event(event);
-                }
-                app.handle_llm_done(result, &event_tx, &done_tx).await;
-            }
-            Some(event) = app.subagents.event_rx.recv() => {
-                if app.handle_subagent_event(event) {
-                    app.start_llm_stream(event_tx.clone(), done_tx.clone()).await;
+            Some(event) = runtime.next_event() => {
+                match event {
+                    RuntimeEvent::InteractionRequested(questions) => {
+                        // The core paused the turn for user input; open the
+                        // ask overlay to collect the answers.
+                        ui.overlay_state.open_ask(questions);
+                    }
+                    RuntimeEvent::StreamText(_) | RuntimeEvent::StreamReasoning(_)
+                    | RuntimeEvent::MessagesChanged => {
+                        if ui.chat_state.auto_scroll {
+                            ui.chat_state.scroll_to_bottom();
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     }
 
     // Final snapshot; incremental saves already cover most of the session.
-    app.persist_session();
+    runtime.app.persist_session();
 
     Ok(())
 }
