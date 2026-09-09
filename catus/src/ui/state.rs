@@ -41,6 +41,10 @@ impl UiState {
             }
             UiRequest::ShowAgents { items } => self.overlay_state.open_agents(items),
             UiRequest::ShowSubagents { items } => self.overlay_state.open_subagent_status(items),
+            UiRequest::WatchSubagent { id } => self.overlay_state.open_subagent_watch(Some(id)),
+            UiRequest::CloseSubagentPicker { items } => {
+                self.overlay_state.open_subagent_close(items)
+            }
         }
     }
 }

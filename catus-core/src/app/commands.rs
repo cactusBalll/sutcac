@@ -237,7 +237,7 @@ impl SlashCommand for AgentCommand {
     }
 
     fn usage(&self) -> &'static str {
-        "/agent [list | status | use <name> <task> | watch <id>]"
+        "/agent [list | status | use <name> <task> | watch <id> | close [id]]"
     }
 
     fn subcommands(&self) -> &[&'static str] {
@@ -249,8 +249,8 @@ impl SlashCommand for AgentCommand {
             Some("list") => "Usage: /agent list\nList discovered Agent definitions.".to_string(),
             Some("status") => "Usage: /agent status\nList running subagents and their state.".to_string(),
             Some("use") => "Usage: /agent use <name> <task> [fork|create]\nDispatch a task to a subagent manually.".to_string(),
-            Some("watch") => "Usage: /agent watch <id>\nSwitch the chat view to a subagent's conversation.".to_string(),
-            Some("close") => "Usage: /agent close <id>\nRemove a completed subagent from the status list.".to_string(),
+            Some("watch") => "Usage: /agent watch <id>\nOpen the subagent monitor page. Left/Right switch between subagents, Esc returns to the main view. Without an id, opens the subagent picker.".to_string(),
+            Some("close") => "Usage: /agent close [id]\nRemove a subagent from the status list. Without an id, opens the subagent picker.".to_string(),
             Some(sub) => format!("Unknown subcommand '{}' for /agent", sub),
             None => format!("Usage: {}\n{}", self.usage(), self.description()),
         }
@@ -266,7 +266,17 @@ impl SlashCommand for AgentCommand {
         args: Option<&'a str>,
     ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
         Box::pin(async move {
-            app.status = AppStatus::Idle;
+            // Watching is a pure view change: the app may be busy streaming
+            // or running a tool while the user opens the monitor page, so
+            // the status must not be reset for the watch subcommand.
+            let is_watch = args
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.splitn(2, ' ').next())
+                == Some("watch");
+            if !is_watch {
+                app.status = AppStatus::Idle;
+            }
             match args.map(str::trim).filter(|s| !s.is_empty()) {
                 Some(args) => {
                     let mut parts = args.splitn(4, ' ');
@@ -307,6 +317,7 @@ impl SlashCommand for AgentCommand {
                             Some(id) => {
                                 let msg = app.watch_subagent(id)?;
                                 app.set_transient_message(msg);
+                                return Ok(Some(UiRequest::WatchSubagent { id: id.to_string() }));
                             }
                             None => {
                                 let items: Vec<String> =
@@ -314,17 +325,17 @@ impl SlashCommand for AgentCommand {
                                 return Ok(Some(UiRequest::ShowSubagents { items }));
                             }
                         },
-                        "close" => {
-                            let id = parts.next().ok_or("usage: /agent close <id>")?;
-                            if app.subagents.remove(id) {
-                                if app.current_subagent_view.as_deref() == Some(id) {
-                                    app.watch_main_agent();
-                                }
-                                app.set_transient_message(format!("closed subagent {}", id));
-                            } else {
-                                return Err(format!("subagent not found: {}", id).into());
+                        "close" => match parts.next() {
+                            Some(id) => {
+                                let msg = app.close_subagent(id)?;
+                                app.set_transient_message(msg);
                             }
-                        }
+                            None => {
+                                let items: Vec<String> =
+                                    app.subagents.list().iter().map(|s| s.id.clone()).collect();
+                                return Ok(Some(UiRequest::CloseSubagentPicker { items }));
+                            }
+                        },
                         _ => {
                             return Err(format!(
                                 "unknown /agent subcommand: {}. Try /agent list, status, use, watch, or close",
@@ -885,6 +896,108 @@ mod tests {
         assert!(candidates.contains(&"/mcp".to_string()));
         assert!(candidates.contains(&"/mcp list".to_string()));
         assert!(candidates.contains(&"/mcp status".to_string()));
+    }
+
+    #[test]
+    fn agent_completion_candidates_include_watch_and_close() {
+        let candidates = BUILT_IN_REGISTRY.completion_candidates("/agent");
+        assert!(candidates.contains(&"/agent watch".to_string()));
+        assert!(candidates.contains(&"/agent close".to_string()));
+    }
+
+    mod agent {
+        use super::*;
+        use crate::subagent::SubagentState;
+
+        fn app_with_subagents() -> (App, String, String) {
+            let mut app = App::new(crate::config::AppConfig::default());
+            let id_a = app
+                .subagents
+                .insert_test("coder", "write code", SubagentState::RunningTool);
+            let id_b = app
+                .subagents
+                .insert_test("fixer", "fix bugs", SubagentState::Completed);
+            (app, id_a, id_b)
+        }
+
+        #[tokio::test]
+        async fn watch_with_id_returns_page_request_and_preserves_status() {
+            let (mut app, id_a, _id_b) = app_with_subagents();
+            app.status = AppStatus::RunningTool;
+
+            let outcome = app.handle_command(&format!("/agent watch {}", id_a)).await;
+            assert!(outcome.handled);
+            match outcome.ui {
+                Some(UiRequest::WatchSubagent { id }) => assert_eq!(id, id_a),
+                other => panic!("expected WatchSubagent request, got {:?}", other),
+            }
+            // Watching is a pure view change: the busy status is preserved.
+            assert_eq!(app.status, AppStatus::RunningTool);
+        }
+
+        #[tokio::test]
+        async fn watch_without_id_returns_subagent_picker() {
+            let (mut app, id_a, _id_b) = app_with_subagents();
+            let outcome = app.handle_command("/agent watch").await;
+            assert!(outcome.handled);
+            match outcome.ui {
+                Some(UiRequest::ShowSubagents { items }) => {
+                    assert_eq!(items, vec![id_a.clone(), "subagent-1-fixer".to_string()]);
+                }
+                other => panic!("expected ShowSubagents request, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn watch_unknown_id_is_an_error() {
+            let (mut app, _id_a, _id_b) = app_with_subagents();
+            assert!(app.handle_command("/agent watch nosuch").await.handled);
+            assert!(app.status_message.contains("subagent not found"));
+        }
+
+        #[tokio::test]
+        async fn close_without_id_returns_close_picker() {
+            let (mut app, id_a, id_b) = app_with_subagents();
+            let outcome = app.handle_command("/agent close").await;
+            assert!(outcome.handled);
+            match outcome.ui {
+                Some(UiRequest::CloseSubagentPicker { items }) => {
+                    assert_eq!(items, vec![id_a, id_b]);
+                }
+                other => panic!("expected CloseSubagentPicker request, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn close_with_id_removes_the_subagent() {
+            let (mut app, id_a, _id_b) = app_with_subagents();
+            assert!(
+                app.handle_command(&format!("/agent close {}", id_a))
+                    .await
+                    .handled
+            );
+            assert!(app.subagents.get(&id_a).is_none());
+            assert!(app.subagents.get(&_id_b).is_some());
+            assert!(
+                app.status_message
+                    .contains(&format!("closed subagent {}", id_a))
+            );
+        }
+
+        #[tokio::test]
+        async fn close_unknown_id_is_an_error() {
+            let (mut app, _id_a, _id_b) = app_with_subagents();
+            assert!(app.handle_command("/agent close nosuch").await.handled);
+            assert!(app.status_message.contains("subagent not found"));
+        }
+
+        #[tokio::test]
+        async fn other_agent_subcommands_still_reset_busy_status() {
+            let (mut app, _id_a, _id_b) = app_with_subagents();
+            app.status = AppStatus::RunningTool;
+            assert!(app.handle_command("/agent status").await.handled);
+            assert_eq!(app.status, AppStatus::Idle);
+        }
     }
 
     #[test]

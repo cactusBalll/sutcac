@@ -139,8 +139,6 @@ pub struct App {
     pub main_agent_from_file: bool,
     /// Running subagents and their state.
     pub subagents: SubagentManager,
-    /// Currently observed subagent in the TUI, if any.
-    pub current_subagent_view: Option<String>,
     /// Discovered Agent Skills registry.
     pub skill_registry: SkillRegistry,
     /// Names of skills currently active in the conversation.
@@ -317,7 +315,6 @@ impl App {
             main_agent,
             main_agent_from_file,
             subagents,
-            current_subagent_view: None,
             skill_registry,
             active_skills: Vec::new(),
             todos: TodoList::new(),
@@ -656,18 +653,24 @@ impl App {
         ))
     }
 
-    /// Switch the TUI chat view to a subagent's conversation.
+    /// Validate a subagent id for the frontend's monitor page.
+    ///
+    /// The watch view itself is frontend-owned; the core only checks that the
+    /// subagent exists.
     pub fn watch_subagent(&mut self, id: &str) -> Result<String, Box<dyn std::error::Error>> {
         if self.subagents.get(id).is_none() {
             return Err(format!("subagent not found: {}", id).into());
         }
-        self.current_subagent_view = Some(id.to_string());
         Ok(format!("watching subagent {}", id))
     }
 
-    /// Switch the TUI chat view back to the main agent.
-    pub fn watch_main_agent(&mut self) {
-        self.current_subagent_view = None;
+    /// Remove a subagent from the status list.
+    pub fn close_subagent(&mut self, id: &str) -> Result<String, Box<dyn std::error::Error>> {
+        if self.subagents.remove(id) {
+            Ok(format!("closed subagent {}", id))
+        } else {
+            Err(format!("subagent not found: {}", id).into())
+        }
     }
 
     /// Dispatch the memory subagent's recall pass for a just-submitted user

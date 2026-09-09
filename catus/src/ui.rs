@@ -173,9 +173,14 @@ async fn handle_overlay_result(
             ui.input_state.recompute_candidates();
             AppAction::None
         }
-        OverlayAction::WatchSubagent(id) => match app.watch_subagent(&id) {
+        OverlayAction::WatchSubagent(id) => {
+            // Watching is a pure view change: open the full-screen monitor
+            // page without touching the app status.
+            ui.overlay_state.open_subagent_watch(Some(id));
+            AppAction::None
+        }
+        OverlayAction::CloseSubagent(id) => match app.close_subagent(&id) {
             Ok(msg) => {
-                app.status = AppStatus::Idle;
                 app.set_transient_message(msg);
                 AppAction::None
             }

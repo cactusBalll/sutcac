@@ -36,6 +36,17 @@ pub enum Overlay {
     Agents { items: Vec<String>, selected: usize },
     /// Subagent status picker.
     SubagentStatus { items: Vec<String>, selected: usize },
+    /// Full-screen subagent monitor page. One tab per subagent; `focus` pins
+    /// the initially selected tab by id, `active` is the current tab index
+    /// (ids are derived live from `App::subagents` on each draw), and `scroll`
+    /// is the message-area scroll offset from the bottom.
+    SubagentWatch {
+        focus: Option<String>,
+        active: usize,
+        scroll: usize,
+    },
+    /// Subagent close picker.
+    SubagentClose { items: Vec<String>, selected: usize },
 }
 
 impl Overlay {
@@ -117,6 +128,21 @@ impl OverlayState {
     /// Replace the active overlay with the subagent status picker.
     pub fn open_subagent_status(&mut self, items: Vec<String>) {
         self.overlay = Overlay::SubagentStatus { items, selected: 0 };
+    }
+
+    /// Replace the active overlay with the full-screen subagent monitor,
+    /// focused on `focus` (if given).
+    pub fn open_subagent_watch(&mut self, focus: Option<String>) {
+        self.overlay = Overlay::SubagentWatch {
+            focus,
+            active: 0,
+            scroll: 0,
+        };
+    }
+
+    /// Replace the active overlay with the subagent close picker.
+    pub fn open_subagent_close(&mut self, items: Vec<String>) {
+        self.overlay = Overlay::SubagentClose { items, selected: 0 };
     }
 
     /// Close any active overlay.

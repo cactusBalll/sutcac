@@ -40,6 +40,10 @@ pub enum UiRequest {
     ShowAgents { items: Vec<String> },
     /// Show the running-subagent picker.
     ShowSubagents { items: Vec<String> },
+    /// Open the subagent monitor page, focused on the given subagent id.
+    WatchSubagent { id: String },
+    /// Show the subagent close picker with the given subagent ids.
+    CloseSubagentPicker { items: Vec<String> },
 }
 
 /// Result of executing a slash command, returned to the frontend.

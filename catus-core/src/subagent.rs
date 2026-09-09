@@ -432,6 +432,40 @@ impl SubagentManager {
         self.parent_mcp_manager = mcp_manager;
     }
 
+    /// Insert a subagent without a runner. Only for tests in other modules
+    /// that need managed subagent state without spawning a task.
+    #[cfg(test)]
+    pub(crate) fn insert_test(
+        &mut self,
+        name: &str,
+        task: &str,
+        state: SubagentState,
+    ) -> SubagentId {
+        let id = format!("subagent-{}-{}", self.next_id, name);
+        self.next_id += 1;
+        let definition = crate::agents::AgentDefinition {
+            name: name.to_string(),
+            description: format!("test agent {}", name),
+            model_tier: None,
+            allowed_tools: Vec::new(),
+            permission: None,
+            skills: Vec::new(),
+            role: None,
+            body: String::new(),
+            source_path: std::path::PathBuf::new(),
+        };
+        let mut subagent = Subagent::new(
+            id.clone(),
+            &definition,
+            task.to_string(),
+            SubagentContextMode::Create,
+            None,
+        );
+        subagent.state = state;
+        self.subagents.push(subagent);
+        id
+    }
+
     /// Apply a subagent event to the managed state.
     ///
     /// Returns `Some(result)` if a synchronous caller was waiting for this

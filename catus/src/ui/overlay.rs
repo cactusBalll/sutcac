@@ -16,10 +16,11 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table},
 };
 
+use crate::ui::chat::{compute_history_scroll, message_to_lines};
 use crate::ui::{Overlay, UiState};
 use catus_core::app::App;
 use catus_core::tool::{AskAnswer, AskQuestion, collect_answer};
@@ -45,6 +46,8 @@ pub enum OverlayAction {
     ActivateAgent(String),
     /// The subagent status picker confirmed a subagent id to watch.
     WatchSubagent(String),
+    /// The subagent close picker confirmed a subagent id to remove.
+    CloseSubagent(String),
 }
 
 /// Handle a key press while an overlay is active. Keys never reach the
@@ -403,7 +406,135 @@ pub fn handle_overlay_key(app: &mut App, ui: &mut UiState, code: KeyCode) -> Ove
             }
             _ => OverlayAction::Consumed,
         },
+        Overlay::SubagentWatch {
+            focus,
+            active,
+            scroll,
+        } => {
+            let ids: Vec<String> = app.subagents.list().iter().map(|s| s.id.clone()).collect();
+            let active = resolve_watch_active(&ids, &focus, active);
+            match code {
+                KeyCode::Left => {
+                    let next = if ids.is_empty() {
+                        0
+                    } else {
+                        (active + ids.len() - 1) % ids.len()
+                    };
+                    ui.overlay_state.overlay = Overlay::SubagentWatch {
+                        focus: None,
+                        active: next,
+                        scroll: 0,
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Right => {
+                    let next = if ids.is_empty() {
+                        0
+                    } else {
+                        (active + 1) % ids.len()
+                    };
+                    ui.overlay_state.overlay = Overlay::SubagentWatch {
+                        focus: None,
+                        active: next,
+                        scroll: 0,
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Up => {
+                    ui.overlay_state.overlay = Overlay::SubagentWatch {
+                        focus: None,
+                        active,
+                        scroll: scroll.saturating_add(3),
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Down => {
+                    ui.overlay_state.overlay = Overlay::SubagentWatch {
+                        focus: None,
+                        active,
+                        scroll: scroll.saturating_sub(3),
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::PageUp => {
+                    ui.overlay_state.overlay = Overlay::SubagentWatch {
+                        focus: None,
+                        active,
+                        scroll: scroll.saturating_add(10),
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::PageDown => {
+                    ui.overlay_state.overlay = Overlay::SubagentWatch {
+                        focus: None,
+                        active,
+                        scroll: scroll.saturating_sub(10),
+                    };
+                    OverlayAction::Consumed
+                }
+                KeyCode::Esc => {
+                    ui.overlay_state.close();
+                    OverlayAction::Closed
+                }
+                // The monitor page accepts no other input; every key is
+                // swallowed while it is open.
+                _ => OverlayAction::Consumed,
+            }
+        }
+        Overlay::SubagentClose { items, selected } => match code {
+            KeyCode::Up => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + items.len() - 1) % items.len()
+                };
+                ui.overlay_state.overlay = Overlay::SubagentClose {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Down => {
+                let next = if items.is_empty() {
+                    0
+                } else {
+                    (selected + 1) % items.len()
+                };
+                ui.overlay_state.overlay = Overlay::SubagentClose {
+                    items,
+                    selected: next,
+                };
+                OverlayAction::Consumed
+            }
+            KeyCode::Enter => {
+                let chosen = items.get(selected).cloned();
+                ui.overlay_state.close();
+                match chosen {
+                    Some(id) => OverlayAction::CloseSubagent(id),
+                    None => OverlayAction::Closed,
+                }
+            }
+            KeyCode::Esc => {
+                ui.overlay_state.close();
+                OverlayAction::Closed
+            }
+            _ => OverlayAction::Consumed,
+        },
     }
+}
+
+/// Resolve the active watch tab: prefer the pinned `focus` id while it still
+/// exists, otherwise clamp `active` into range.
+fn resolve_watch_active(ids: &[String], focus: &Option<String>, active: usize) -> usize {
+    if ids.is_empty() {
+        return 0;
+    }
+    if let Some(id) = focus {
+        if let Some(idx) = ids.iter().position(|candidate| candidate == id) {
+            return idx;
+        }
+    }
+    active.min(ids.len() - 1)
 }
 
 /// Move the overlay selection with the mouse wheel. Returns true if the
@@ -416,7 +547,13 @@ pub fn handle_overlay_scroll(app: &mut App, ui: &mut UiState, up: bool) -> bool 
         | Overlay::Model { .. }
         | Overlay::Agents { .. }
         | Overlay::SubagentStatus { .. }
+        | Overlay::SubagentClose { .. }
         | Overlay::Ask { .. } => {
+            let _ = handle_overlay_key(app, ui, if up { KeyCode::Up } else { KeyCode::Down });
+            true
+        }
+        // The watch page scrolls its message area with the wheel.
+        Overlay::SubagentWatch { .. } => {
             let _ = handle_overlay_key(app, ui, if up { KeyCode::Up } else { KeyCode::Down });
             true
         }
@@ -424,8 +561,14 @@ pub fn handle_overlay_scroll(app: &mut App, ui: &mut UiState, up: bool) -> bool 
     }
 }
 
-/// Render the active overlay centered over the chat view.
-pub fn draw_overlay(frame: &mut Frame, app: &App, ui: &UiState) {
+/// Render the active overlay. The subagent monitor is a full-screen page;
+/// every other overlay is a centered popup.
+pub fn draw_overlay(frame: &mut Frame, app: &App, ui: &mut UiState) {
+    if matches!(ui.overlay_state.overlay, Overlay::SubagentWatch { .. }) {
+        draw_subagent_watch(frame, app, ui, frame.area());
+        return;
+    }
+
     let popup = centered_rect(60, 70, frame.area());
     frame.render_widget(Clear, popup);
 
@@ -440,6 +583,9 @@ pub fn draw_overlay(frame: &mut Frame, app: &App, ui: &UiState) {
         Overlay::SubagentStatus { items, selected } => {
             draw_subagent_status(frame, app, items, *selected, popup)
         }
+        Overlay::SubagentClose { items, selected } => {
+            draw_subagent_close(frame, app, items, *selected, popup)
+        }
         Overlay::Ask {
             questions,
             current,
@@ -448,6 +594,8 @@ pub fn draw_overlay(frame: &mut Frame, app: &App, ui: &UiState) {
             other,
             ..
         } => draw_ask(frame, questions, *current, *focus, selections, other, popup),
+        // The watch page is handled above as a full-screen page.
+        Overlay::SubagentWatch { .. } => {}
     }
 }
 
@@ -743,6 +891,207 @@ fn draw_subagent_status(
     frame.render_widget(help, rows[1]);
 }
 
+/// Render the full-screen subagent monitor page: a tab strip with one tab
+/// per subagent, a task/status line for the active tab, the active
+/// subagent's message history, and a help footer. Tab ids are derived live
+/// from `app.subagents`, so the page tracks subagents started or closed
+/// while it is open.
+fn draw_subagent_watch(frame: &mut Frame, app: &App, ui: &mut UiState, area: Rect) {
+    let (focus, active, scroll) = match &ui.overlay_state.overlay {
+        Overlay::SubagentWatch {
+            focus,
+            active,
+            scroll,
+        } => (focus.clone(), *active, *scroll),
+        _ => return,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" agent watch ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // tab strip
+            Constraint::Length(1), // task / status line
+            Constraint::Min(1),    // message history
+            Constraint::Length(1), // help footer
+        ])
+        .split(inner);
+
+    let subs = app.subagents.list();
+    let ids: Vec<String> = subs.iter().map(|s| s.id.clone()).collect();
+    let active = resolve_watch_active(&ids, &focus, active);
+
+    // Normalize the view state: pin is consumed once resolved and the scroll
+    // offset is clamped like the main history view.
+    let (bottom_offset, top_scroll) = if let Some(sub) = subs.get(active) {
+        let lines: Vec<Line> = sub.messages.iter().flat_map(message_to_lines).collect();
+        let paragraph =
+            Paragraph::new(Text::from(lines)).wrap(ratatui::widgets::Wrap { trim: false });
+        let total = paragraph.line_count(rows[2].width);
+        let visible = rows[2].height as usize;
+        compute_history_scroll(total, visible, scroll)
+    } else {
+        (0, 0)
+    };
+    ui.overlay_state.overlay = Overlay::SubagentWatch {
+        focus: None,
+        active,
+        scroll: bottom_offset,
+    };
+
+    // Tab strip.
+    let mut spans: Vec<Span> = Vec::new();
+    if subs.is_empty() {
+        spans.push(Span::styled(
+            "(no subagents)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        for (i, s) in subs.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+            }
+            let label = format!(
+                " {} {} [{}] ",
+                s.id,
+                truncate_chars(&s.name, 14),
+                s.state.as_str()
+            );
+            let style = if i == active {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            spans.push(Span::styled(label, style));
+        }
+        if !subs.is_empty() {
+            spans.push(Span::styled(
+                format!(" {}/{} ", active + 1, subs.len()),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+
+    // Task / status line for the active tab.
+    if let Some(s) = subs.get(active) {
+        let mut line = Line::from(vec![
+            Span::styled(
+                format!("#{} {}", s.id, s.name),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                truncate_chars(&s.task, rows[1].width as usize),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        if let Some(err) = &s.error {
+            line.spans.push(Span::styled(
+                format!("  error: {}", truncate_chars(err, 60)),
+                Style::default().fg(Color::Red),
+            ));
+        } else if let Some(result) = &s.result {
+            line.spans.push(Span::styled(
+                format!("  ✓ {}", truncate_chars(result, 60)),
+                Style::default().fg(Color::Green),
+            ));
+        }
+        frame.render_widget(Paragraph::new(line), rows[1]);
+    }
+
+    // Message history for the active tab.
+    if let Some(sub) = subs.get(active) {
+        let lines: Vec<Line> = sub.messages.iter().flat_map(message_to_lines).collect();
+        let paragraph =
+            Paragraph::new(Text::from(lines)).wrap(ratatui::widgets::Wrap { trim: false });
+        frame.render_widget(paragraph.scroll((top_scroll, 0)), rows[2]);
+    } else {
+        let empty = Paragraph::new(Line::styled(
+            "no subagents running — start one with /agent use <name> <task>",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(empty, rows[2]);
+    }
+
+    let help = Paragraph::new(Line::styled(
+        "←/→ 切换 · ↑/↓ 滚动 · Esc 返回",
+        Style::default().fg(Color::DarkGray),
+    ))
+    .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help, rows[3]);
+}
+
+/// Render the subagent close picker: a list of subagent ids to remove from
+/// the status list.
+fn draw_subagent_close(
+    frame: &mut Frame,
+    app: &App,
+    items: &[String],
+    selected: usize,
+    area: Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Close Subagent ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let list_items: Vec<ListItem> = if items.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "(no subagents)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        items
+            .iter()
+            .map(|id| {
+                let text = match app.subagents.get(id) {
+                    Some(s) => format!("{} [{}] {}", s.id, s.state.as_str(), s.name),
+                    None => id.clone(),
+                };
+                ListItem::new(Line::from(text))
+            })
+            .collect()
+    };
+
+    let list = List::new(list_items)
+        .highlight_symbol("▶ ")
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, rows[0], &mut state);
+
+    let help = Paragraph::new(Line::styled(
+        "↑/↓ select · Enter close · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ))
+    .alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(help, rows[1]);
+}
+
+/// Truncate `s` to at most `max` characters.
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 fn draw_config(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" Config ");
     let inner = block.inner(area);
@@ -968,7 +1317,7 @@ mod tests {
         }
 
         fn app_with_ask(questions: Vec<AskQuestion>) -> (App, UiState) {
-            let mut app = App::new(AppConfig::default());
+            let app = App::new(AppConfig::default());
             let mut ui = UiState::new();
             ui.overlay_state.open_ask(questions);
             (app, ui)
@@ -1105,7 +1454,7 @@ mod tests {
                 ..Default::default()
             };
             config.agent.auto_include_skills = false;
-            let mut app = App::new(config);
+            let app = App::new(config);
             let items: Vec<String> = app.models.iter().map(|m| m.id.clone()).collect();
             let selected = app
                 .models
@@ -1255,6 +1604,194 @@ mod tests {
             assert_eq!(ui.overlay_state.overlay, Overlay::None);
 
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    mod subagent_watch {
+        use super::*;
+        use crate::ui::Overlay;
+        use catus_core::config::{AppConfig, ModelEntry};
+        use catus_core::llm::Provider;
+        use catus_core::subagent::SubagentContextMode;
+
+        /// An app with `count` real (erroring-fast) subagents spawned from a
+        /// temp agent definition, so the watch page has tabs to switch
+        /// between. The provider endpoint refuses connections immediately,
+        /// so the spawned runners fail offline.
+        pub(super) fn app_with_spawned_subagents(count: usize) -> (App, UiState) {
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let dir = std::env::temp_dir().join(format!(
+                "catus_watch_spawn_{}_{}",
+                std::process::id(),
+                seq
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let agents = dir.join("agents");
+            std::fs::create_dir_all(&agents).unwrap();
+            std::fs::write(
+                agents.join("coder.md"),
+                "---\nname: coder\ndescription: test agent\n---\nBody.\n",
+            )
+            .unwrap();
+
+            let mut config = AppConfig::default();
+            config.agent.auto_include_skills = false;
+            config.agent.agent_paths = Some(vec![agents]);
+            config.providers = vec![Provider {
+                name: "test".to_string(),
+                base_url: "http://127.0.0.1:9".to_string(),
+                api_key: "test".to_string(),
+                session_header: None,
+            }];
+            config.models = vec![ModelEntry {
+                id: "test-model".to_string(),
+                name: "Test Model".to_string(),
+                context_window: 4096,
+                provider: "test".to_string(),
+            }];
+
+            let mut app = App::new(config);
+            for i in 0..count {
+                app.spawn_subagent("coder", &format!("task {i}"), SubagentContextMode::Create)
+                    .unwrap();
+            }
+            let mut ui = UiState::new();
+            ui.overlay_state.open_subagent_watch(None);
+            (app, ui)
+        }
+
+        #[tokio::test]
+        async fn left_right_switch_tabs_with_wraparound() {
+            let (mut app, mut ui) = app_with_spawned_subagents(2);
+            assert_eq!(app.subagents.list().len(), 2);
+
+            // Right wraps from the last tab to the first.
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Right);
+            match &ui.overlay_state.overlay {
+                Overlay::SubagentWatch { active, .. } => assert_eq!(*active, 1),
+                other => panic!("expected watch overlay, got {:?}", other),
+            }
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Right);
+            match &ui.overlay_state.overlay {
+                Overlay::SubagentWatch { active, .. } => assert_eq!(*active, 0),
+                other => panic!("expected watch overlay, got {:?}", other),
+            }
+            // Left wraps back to the last tab.
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Left);
+            match &ui.overlay_state.overlay {
+                Overlay::SubagentWatch { active, .. } => assert_eq!(*active, 1),
+                other => panic!("expected watch overlay, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn tab_switch_resets_scroll_and_focus_is_pinned() {
+            let (mut app, mut ui) = app_with_spawned_subagents(2);
+            // Reopen with a pinned focus on the second subagent.
+            let second = app.subagents.list()[1].id.clone();
+            ui.overlay_state.open_subagent_watch(Some(second.clone()));
+
+            // Scroll up on the focused tab, then switch: scroll resets.
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Up);
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Left);
+            match &ui.overlay_state.overlay {
+                Overlay::SubagentWatch {
+                    focus,
+                    active,
+                    scroll,
+                } => {
+                    assert!(focus.is_none());
+                    assert_eq!(*active, 0);
+                    assert_eq!(*scroll, 0);
+                }
+                other => panic!("expected watch overlay, got {:?}", other),
+            }
+            let _ = second;
+        }
+
+        #[tokio::test]
+        async fn esc_closes_and_other_keys_are_swallowed() {
+            let (mut app, mut ui) = app_with_spawned_subagents(1);
+            // Arbitrary keys are consumed and never reach the input line.
+            for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Tab] {
+                assert_eq!(
+                    handle_overlay_key(&mut app, &mut ui, code),
+                    OverlayAction::Consumed
+                );
+            }
+            assert!(ui.overlay_state.is_active());
+            assert_eq!(
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Esc),
+                OverlayAction::Closed
+            );
+            assert_eq!(ui.overlay_state.overlay, Overlay::None);
+        }
+
+        #[tokio::test]
+        async fn scroll_keys_adjust_offset_and_clamp_at_zero() {
+            let (mut app, mut ui) = app_with_spawned_subagents(1);
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Up);
+            match &ui.overlay_state.overlay {
+                Overlay::SubagentWatch { scroll, .. } => assert_eq!(*scroll, 3),
+                other => panic!("expected watch overlay, got {:?}", other),
+            }
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Down);
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Down);
+            match &ui.overlay_state.overlay {
+                Overlay::SubagentWatch { scroll, .. } => assert_eq!(*scroll, 0),
+                other => panic!("expected watch overlay, got {:?}", other),
+            }
+        }
+
+        #[tokio::test]
+        async fn empty_list_esc_still_closes() {
+            let mut app = App::new(AppConfig::default());
+            let mut ui = UiState::new();
+            ui.overlay_state.open_subagent_watch(None);
+            assert_eq!(
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Esc),
+                OverlayAction::Closed
+            );
+            assert_eq!(ui.overlay_state.overlay, Overlay::None);
+        }
+    }
+
+    mod subagent_close_picker {
+        use super::subagent_watch::app_with_spawned_subagents;
+        use super::*;
+        use crate::ui::Overlay;
+
+        #[tokio::test]
+        async fn navigation_selection_and_close_action() {
+            let (mut app, mut ui) = app_with_spawned_subagents(2);
+            let ids: Vec<String> = app.subagents.list().iter().map(|s| s.id.clone()).collect();
+            ui.overlay_state.open_subagent_close(ids.clone());
+
+            handle_overlay_key(&mut app, &mut ui, KeyCode::Down);
+            match &ui.overlay_state.overlay {
+                Overlay::SubagentClose { selected, .. } => assert_eq!(*selected, 1),
+                other => panic!("expected close picker, got {:?}", other),
+            }
+            let action = handle_overlay_key(&mut app, &mut ui, KeyCode::Enter);
+            assert_eq!(action, OverlayAction::CloseSubagent(ids[1].clone()));
+            assert!(!ui.overlay_state.is_active());
+
+            // The event-loop action removes the subagent.
+            crate::ui::handle_overlay_result(&mut app, &mut ui, action).await;
+            assert!(app.subagents.get(&ids[1]).is_none());
+        }
+
+        #[tokio::test]
+        async fn esc_cancels_without_closing() {
+            let (mut app, mut ui) = app_with_spawned_subagents(1);
+            let id = app.subagents.list()[0].id.clone();
+            ui.overlay_state.open_subagent_close(vec![id.clone()]);
+            assert_eq!(
+                handle_overlay_key(&mut app, &mut ui, KeyCode::Esc),
+                OverlayAction::Closed
+            );
+            assert!(app.subagents.get(&id).is_some());
         }
     }
 }

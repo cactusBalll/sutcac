@@ -40,14 +40,7 @@ pub fn draw_chat(frame: &mut Frame, app: &mut App, ui: &mut UiState) {
 }
 
 fn render_history(frame: &mut Frame, app: &mut App, ui: &mut UiState, area: Rect) {
-    let messages: Vec<&Message> = if let Some(id) = &app.current_subagent_view {
-        app.subagents
-            .get(id)
-            .map(|s| s.messages.iter().collect())
-            .unwrap_or_default()
-    } else {
-        app.messages.iter().collect()
-    };
+    let messages: Vec<&Message> = app.messages.iter().collect();
     let lines: Vec<Line> = messages.into_iter().flat_map(message_to_lines).collect();
 
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
@@ -74,7 +67,7 @@ fn render_history(frame: &mut Frame, app: &mut App, ui: &mut UiState, area: Rect
 /// occupies; `visible_lines` is the height of the history area. The returned
 /// `bottom_offset` is always within `[0, max_scroll]` and can be stored back
 /// into `App::scroll` to keep the value bounded.
-fn compute_history_scroll(
+pub(crate) fn compute_history_scroll(
     total_wrapped_lines: usize,
     visible_lines: usize,
     scroll: usize,
@@ -352,7 +345,7 @@ pub fn handle_chat_key(ui: &mut UiState, code: KeyCode) -> bool {
     }
 }
 
-fn message_to_lines(msg: &Message) -> Vec<Line<'static>> {
+pub(crate) fn message_to_lines(msg: &Message) -> Vec<Line<'static>> {
     match msg.role {
         Role::System => Vec::new(),
         Role::User => render_highlighted("YOU", Color::Blue, &msg.content),
