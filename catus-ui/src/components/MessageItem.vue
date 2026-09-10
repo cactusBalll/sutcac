@@ -11,6 +11,20 @@ const props = defineProps<{
 const kind = computed(() => props.message.role);
 
 const reasoningOpen = ref(false);
+const toolOpen = ref(false);
+/** Bumped while a copy action shows its "copied" confirmation. */
+const copiedKey = ref('');
+
+/** Tool results longer than this collapse to a preview. */
+const COLLAPSE_LINES = 12;
+const PREVIEW_LINES = 5;
+
+const toolLines = computed(() => props.message.content.split('\n').length);
+const toolCollapsible = computed(() => kind.value === 'tool' && toolLines.value > COLLAPSE_LINES);
+const toolContent = computed(() => {
+  if (!toolCollapsible.value || toolOpen.value) return props.message.content;
+  return props.message.content.split('\n').slice(0, PREVIEW_LINES).join('\n');
+});
 
 /** Tool names backing this message's tool results / calls. */
 function toolNameFor(callId: string): string {
@@ -23,6 +37,18 @@ function toolNameFor(callId: string): string {
 
 function toolCalls(message: Message): ToolCall[] {
   return message.tool_calls ?? [];
+}
+
+async function copy(key: string, text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    copiedKey.value = key;
+    setTimeout(() => {
+      if (copiedKey.value === key) copiedKey.value = '';
+    }, 1500);
+  } catch {
+    // Clipboard access may be denied (e.g. insecure context); stay silent.
+  }
 }
 </script>
 
@@ -48,15 +74,33 @@ function toolCalls(message: Message): ToolCall[] {
     <pre v-if="reasoningOpen" class="reasoning">{{ message.reasoning_content }}</pre>
     <pre v-if="message.content">{{ message.content }}</pre>
     <div v-for="call in toolCalls(message)" :key="call.id" class="tool-call">
-      <span class="tool-name">⚙ {{ call.function.name }}</span>
+      <div class="tool-call-head">
+        <span class="tool-name">⚙ {{ call.function.name }}</span>
+        <button class="copy" @click="copy(call.id, call.function.arguments)">
+          {{ copiedKey === call.id ? 'copied' : 'copy' }}
+        </button>
+      </div>
       <pre class="tool-args">{{ call.function.arguments }}</pre>
     </div>
   </div>
 
   <!-- Tool result -->
   <div v-else-if="kind === 'tool'" class="msg tool">
-    <div class="label">⚙ {{ toolNameFor(message.tool_call_id ?? '') }}</div>
-    <pre>{{ message.content }}</pre>
+    <div class="label">
+      <span>⚙ {{ toolNameFor(message.tool_call_id ?? '') }}</span>
+      <span class="spacer" />
+      <button
+        v-if="toolCollapsible"
+        class="toggle"
+        @click="toolOpen = !toolOpen"
+      >
+        {{ toolOpen ? `▾ collapse` : `▸ ${toolLines} lines` }}
+      </button>
+      <button class="copy" @click="copy(`result:${message.tool_call_id}`, message.content)">
+        {{ copiedKey === `result:${message.tool_call_id}` ? 'copied' : 'copy' }}
+      </button>
+    </div>
+    <pre>{{ toolContent }}</pre>
   </div>
 
   <!-- Event notice -->
@@ -82,6 +126,10 @@ function toolCalls(message: Message): ToolCall[] {
   display: flex;
   gap: 10px;
   align-items: center;
+}
+
+.spacer {
+  flex: 1;
 }
 
 .user {
@@ -129,6 +177,8 @@ function toolCalls(message: Message): ToolCall[] {
 .tool pre {
   color: var(--fg-dim);
   font-size: 13px;
+  max-height: 60vh;
+  overflow-y: auto;
 }
 
 .tool-call {
@@ -137,6 +187,13 @@ function toolCalls(message: Message): ToolCall[] {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 6px 10px;
+}
+
+.tool-call-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
 }
 
 .tool-name {
@@ -148,6 +205,24 @@ function toolCalls(message: Message): ToolCall[] {
   color: var(--fg-dim);
   font-size: 12px;
   margin-top: 2px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.copy,
+.toggle {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--fg-dim);
+  font-size: 10px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.copy:hover,
+.toggle:hover {
+  color: var(--accent);
 }
 
 .event {

@@ -9,7 +9,9 @@ import type {
   AgentDetail,
   AppSnapshot,
   InputLineOutcome,
+  McpServerEntry,
   Message,
+  ModelEntry,
   RuntimeEventPayload,
   SessionSummary,
   SkillPreview,
@@ -31,6 +33,14 @@ export const tauriTransport: CatusTransport = {
     invoke<string>('set_config_field', { scope, key, value }),
   removeConfigField: (scope, key) =>
     invoke<string>('remove_config_field', { scope, key }),
+  upsertModel: (scope, model: ModelEntry) =>
+    invoke<string>('upsert_model', { scope, model }),
+  removeModel: (scope, id) =>
+    invoke<string>('remove_model', { scope, id }),
+  upsertMcpServer: (scope, server: McpServerEntry) =>
+    invoke<string>('upsert_mcp_server', { scope, server }),
+  removeMcpServer: (scope, name) =>
+    invoke<string>('remove_mcp_server', { scope, name }),
   listSessions: (scope) => invoke<SessionSummary[]>('list_sessions', { scope }),
   skillPreview: (name) => invoke<SkillPreview>('skill_preview', { name }),
   agentDetail: (name) => invoke<AgentDetail>('get_agent_detail', { name }),
@@ -38,11 +48,19 @@ export const tauriTransport: CatusTransport = {
   createAgent: (name, content) => invoke<string>('create_agent', { name, content }),
   async subscribe(handlers: TransportHandlers) {
     // `app-quit` closes the window on the Rust side; nothing to render.
-    await Promise.all([
-      listen<RuntimeEventPayload>('runtime-event', (e) => handlers.onRuntimeEvent(e.payload)),
-      listen<AppSnapshot>('snapshot', (e) => handlers.onSnapshot(e.payload)),
-      listen<string>('startup-error', (e) => handlers.onStartupError(String(e.payload))),
-      listen('app-quit', () => handlers.onQuit()),
-    ]);
+    // The in-process event channel stays up for the app's lifetime, so the
+    // connection is reported once subscription succeeds (or fails).
+    try {
+      await Promise.all([
+        listen<RuntimeEventPayload>('runtime-event', (e) => handlers.onRuntimeEvent(e.payload)),
+        listen<AppSnapshot>('snapshot', (e) => handlers.onSnapshot(e.payload)),
+        listen<string>('startup-error', (e) => handlers.onStartupError(String(e.payload))),
+        listen('app-quit', () => handlers.onQuit()),
+      ]);
+      handlers.onConnectionChange?.(true);
+    } catch (e) {
+      handlers.onConnectionChange?.(false);
+      throw e;
+    }
   },
 };

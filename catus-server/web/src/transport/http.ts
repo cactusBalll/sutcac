@@ -11,7 +11,9 @@ import type {
   AskAnswer,
   ConfigScope,
   InputLineOutcome,
+  McpServerEntry,
   Message,
+  ModelEntry,
   RuntimeEventPayload,
   SessionSummary,
   SkillPreview,
@@ -64,6 +66,14 @@ export const httpTransport: CatusTransport = {
     post<string>('/api/config', { scope, key, value }),
   removeConfigField: (scope: ConfigScope, key: string) =>
     post<string>('/api/config/remove', { scope, key }),
+  upsertModel: (scope: ConfigScope, model: ModelEntry) =>
+    post<string>('/api/models', { scope, model }),
+  removeModel: (scope: ConfigScope, id: string) =>
+    post<string>('/api/models/remove', { scope, id }),
+  upsertMcpServer: (scope: ConfigScope, server: McpServerEntry) =>
+    post<string>('/api/mcp', { scope, server }),
+  removeMcpServer: (scope: ConfigScope, name: string) =>
+    post<string>('/api/mcp/remove', { scope, name }),
   listSessions: (scope: string) =>
     get<SessionSummary[]>(`/api/sessions?scope=${encodeURIComponent(scope)}`),
   skillPreview: (name: string) =>
@@ -94,6 +104,7 @@ function connect(handlers: TransportHandlers, ready: () => void, attempt = 0): v
 
   socket.onopen = () => {
     open = true;
+    handlers.onConnectionChange?.(true);
     ready();
   };
   socket.onmessage = (message) => {
@@ -121,6 +132,7 @@ function connect(handlers: TransportHandlers, ready: () => void, attempt = 0): v
   };
   socket.onclose = () => {
     if (closed) return;
+    handlers.onConnectionChange?.(false);
     if (!open) {
       // The server may still be booting (or the UI is served before the
       // process started); retry with a capped backoff.

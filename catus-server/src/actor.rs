@@ -63,6 +63,30 @@ pub enum Command {
         key: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
+    /// Insert or update one `[[models]]` entry in one scope.
+    UpsertModel {
+        scope: catus_core::config::ConfigScope,
+        model: catus_core::config::ModelEntry,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Remove one `[[models]]` entry (matched by id) from one scope.
+    RemoveModel {
+        scope: catus_core::config::ConfigScope,
+        id: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Insert or update one `[[mcp.servers]]` entry in one scope.
+    UpsertMcpServer {
+        scope: catus_core::config::ConfigScope,
+        server: catus_core::config::McpServerConfig,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Remove one `[[mcp.servers]]` entry (matched by name) from one scope.
+    RemoveMcpServer {
+        scope: catus_core::config::ConfigScope,
+        name: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     /// List history sessions: `"current"` filters the session cwd, `"all"`
     /// returns every workspace's sessions (grouped client-side).
     ListSessions {
@@ -239,6 +263,50 @@ async fn handle_command(
         }
         Command::RemoveConfigField { scope, key, reply } => {
             let result = runtime.app.remove_config_field_in(scope, &key);
+            match &result {
+                Ok(msg) => runtime.app.set_transient_message(msg),
+                Err(e) => runtime.app.set_error(&e.to_string()),
+            }
+            emit_snapshot(events, runtime.app.snapshot());
+            let _ = reply.send(result.map_err(|e| e.to_string()));
+        }
+        Command::UpsertModel {
+            scope,
+            model,
+            reply,
+        } => {
+            let result = runtime.app.upsert_model_in(scope, model);
+            match &result {
+                Ok(msg) => runtime.app.set_transient_message(msg),
+                Err(e) => runtime.app.set_error(&e.to_string()),
+            }
+            emit_snapshot(events, runtime.app.snapshot());
+            let _ = reply.send(result.map_err(|e| e.to_string()));
+        }
+        Command::RemoveModel { scope, id, reply } => {
+            let result = runtime.app.remove_model_in(scope, &id);
+            match &result {
+                Ok(msg) => runtime.app.set_transient_message(msg),
+                Err(e) => runtime.app.set_error(&e.to_string()),
+            }
+            emit_snapshot(events, runtime.app.snapshot());
+            let _ = reply.send(result.map_err(|e| e.to_string()));
+        }
+        Command::UpsertMcpServer {
+            scope,
+            server,
+            reply,
+        } => {
+            let result = runtime.app.upsert_mcp_server_in(scope, server);
+            match &result {
+                Ok(msg) => runtime.app.set_transient_message(msg),
+                Err(e) => runtime.app.set_error(&e.to_string()),
+            }
+            emit_snapshot(events, runtime.app.snapshot());
+            let _ = reply.send(result.map_err(|e| e.to_string()));
+        }
+        Command::RemoveMcpServer { scope, name, reply } => {
+            let result = runtime.app.remove_mcp_server_in(scope, &name);
             match &result {
                 Ok(msg) => runtime.app.set_transient_message(msg),
                 Err(e) => runtime.app.set_error(&e.to_string()),

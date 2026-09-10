@@ -1,4 +1,4 @@
-# Copy this file to `~/.config/catus/config.toml` (the XDG base config) or to
+# Copy this file to `~/.config/catus/config.toml` (the XDG base config) [EDIT-TEST-OK] or to
 # `./.sutcac/config.toml` (the workspace config, merged on top of the XDG one
 # with workspace values winning) and fill in your OpenAI-compatible API key.
 

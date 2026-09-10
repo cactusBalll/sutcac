@@ -5,6 +5,7 @@ import SessionsPanel from './SessionsPanel.vue';
 import SkillsPanel from './SkillsPanel.vue';
 import McpPanel from './McpPanel.vue';
 import AgentsPanel from './AgentsPanel.vue';
+import ModelsPanel from './ModelsPanel.vue';
 
 const store = useRuntimeStore();
 
@@ -13,10 +14,12 @@ const titles = {
   skills: 'Agent Skills',
   mcp: 'MCP servers',
   agents: 'Agents',
+  models: 'Models',
 } as const;
 
 function onKeydown(e: KeyboardEvent) {
-  if (store.panel && e.key === 'Escape') {
+  // The overlay sits above panels; let it consume Esc first.
+  if (store.panel && !store.overlay && e.key === 'Escape') {
     e.preventDefault();
     store.closePanel();
   }
@@ -37,6 +40,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
       <SkillsPanel v-else-if="store.panel === 'skills'" />
       <McpPanel v-else-if="store.panel === 'mcp'" />
       <AgentsPanel v-else-if="store.panel === 'agents'" />
+      <ModelsPanel v-else-if="store.panel === 'models'" />
     </div>
   </div>
 </template>
@@ -85,5 +89,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
   flex: 1;
   overflow: hidden;
   display: flex;
+}
+
+@media (max-width: 560px) {
+  .head {
+    padding: 8px 12px;
+  }
 }
 </style>

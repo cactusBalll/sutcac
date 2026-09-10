@@ -77,6 +77,30 @@ pub struct RemoveConfigFieldBody {
 }
 
 #[derive(Deserialize)]
+pub struct UpsertModelBody {
+    pub scope: catus_core::config::ConfigScope,
+    pub model: catus_core::config::ModelEntry,
+}
+
+#[derive(Deserialize)]
+pub struct RemoveModelBody {
+    pub scope: catus_core::config::ConfigScope,
+    pub id: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpsertMcpServerBody {
+    pub scope: catus_core::config::ConfigScope,
+    pub server: catus_core::config::McpServerConfig,
+}
+
+#[derive(Deserialize)]
+pub struct RemoveMcpServerBody {
+    pub scope: catus_core::config::ConfigScope,
+    pub name: String,
+}
+
+#[derive(Deserialize)]
 pub struct AgentContentBody {
     pub content: String,
 }
@@ -235,6 +259,98 @@ pub async fn remove_config_field(
         Command::RemoveConfigField {
             scope: body.scope,
             key: body.key,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await
+        .map_err(|_| ApiError::actor_stopped())?
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+/// Insert or update one `[[models]]` entry in one scope. Returns the status
+/// message (400 with the reason on validation errors).
+pub async fn upsert_model(
+    State(state): State<SharedState>,
+    body: Result<Json<UpsertModelBody>, JsonRejection>,
+) -> Result<Json<String>, ApiError> {
+    let Json(body) = json_body(body)?;
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::UpsertModel {
+            scope: body.scope,
+            model: body.model,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await
+        .map_err(|_| ApiError::actor_stopped())?
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+/// Remove one `[[models]]` entry (matched by id) from one scope. Returns the
+/// status message.
+pub async fn remove_model(
+    State(state): State<SharedState>,
+    body: Result<Json<RemoveModelBody>, JsonRejection>,
+) -> Result<Json<String>, ApiError> {
+    let Json(body) = json_body(body)?;
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::RemoveModel {
+            scope: body.scope,
+            id: body.id,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await
+        .map_err(|_| ApiError::actor_stopped())?
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+/// Insert or update one `[[mcp.servers]]` entry in one scope. Returns the
+/// status message (400 with the reason on validation errors).
+pub async fn upsert_mcp_server(
+    State(state): State<SharedState>,
+    body: Result<Json<UpsertMcpServerBody>, JsonRejection>,
+) -> Result<Json<String>, ApiError> {
+    let Json(body) = json_body(body)?;
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::UpsertMcpServer {
+            scope: body.scope,
+            server: body.server,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await
+        .map_err(|_| ApiError::actor_stopped())?
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+/// Remove one `[[mcp.servers]]` entry (matched by name) from one scope.
+/// Returns the status message.
+pub async fn remove_mcp_server(
+    State(state): State<SharedState>,
+    body: Result<Json<RemoveMcpServerBody>, JsonRejection>,
+) -> Result<Json<String>, ApiError> {
+    let Json(body) = json_body(body)?;
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::RemoveMcpServer {
+            scope: body.scope,
+            name: body.name,
             reply: tx,
         },
     )

@@ -519,21 +519,32 @@ impl SlashCommand for ModelCommand {
     }
 
     fn usage(&self) -> &'static str {
-        "/model [name]"
+        "/model [list | set-performance <model> | set-efficient <model> | name]"
     }
 
     fn subcommands(&self) -> &[&'static str] {
-        &["list"]
+        &["list", "set-performance", "set-efficient"]
     }
 
     fn help(&self, subcommand: Option<&str>) -> String {
         match subcommand {
             Some("list") => "Usage: /model list\nList configured models.".to_string(),
-            Some(sub) => format!("Unknown subcommand '{}' for /model", sub),
-            None => "Usage: /model [name]\n\
-                With no argument, open the model picker. With a name, switch\nto the configured \
-                model directly."
+            Some("set-performance") => "Usage: /model set-performance <model-id-or-name>\n\
+                Set the performance-tier model ([agent.models].performance) and\n\
+                save it to the config file. New subagents pick it up."
                 .to_string(),
+            Some("set-efficient") => "Usage: /model set-efficient <model-id-or-name>\n\
+                Set the efficient-tier model ([agent.models].efficient) and\n\
+                save it to the config file. New subagents pick it up."
+                .to_string(),
+            Some(sub) => format!("Unknown subcommand '{}' for /model", sub),
+            None => {
+                "Usage: /model [list | set-performance <model> | set-efficient <model> | name]\n\
+                With no argument, open the model picker. With a name, switch\nto the configured \
+                model directly; set-performance / set-efficient\nchange the `[agent.models]` tier \
+                mapping used by subagents."
+                    .to_string()
+            }
         }
     }
 
@@ -550,12 +561,30 @@ impl SlashCommand for ModelCommand {
             app.status = AppStatus::Idle;
             match args.map(str::trim).filter(|s| !s.is_empty()) {
                 Some(args) => {
-                    if args == "list" {
-                        app.add_event_message(app.model_names_list());
-                        app.set_transient_message("Models listed");
-                    } else {
-                        let msg = app.set_model(args)?;
-                        app.set_transient_message(msg);
+                    let mut parts = args.splitn(2, ' ');
+                    let sub = parts.next().unwrap_or("");
+                    match sub {
+                        "list" => {
+                            app.add_event_message(app.model_names_list());
+                            app.set_transient_message("Models listed");
+                        }
+                        "set-performance" | "set-efficient" => {
+                            let reference =
+                                parts
+                                    .next()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .ok_or_else(|| format!("usage: /model {} <model>", sub))?;
+                            let tier =
+                                crate::config::ModelTier::parse(sub.trim_start_matches("set-"))
+                                    .map_err(CommandError)?;
+                            let msg = app.set_tier_model(tier, reference)?;
+                            app.set_transient_message(msg);
+                        }
+                        _ => {
+                            let msg = app.set_model(args)?;
+                            app.set_transient_message(msg);
+                        }
                     }
                 }
                 None => {
@@ -1418,6 +1447,47 @@ mod tests {
             app.status_message
         );
         assert_eq!(app.current_model.id, "model-b");
+    }
+
+    #[tokio::test]
+    async fn model_command_tier_subcommands_report_usage_errors() {
+        use crate::config::AppConfig;
+
+        let mut app = App::new(AppConfig::default());
+
+        // Missing model argument is a usage error (no config file access).
+        assert!(app.handle_command("/model set-performance").await.handled);
+        assert!(
+            app.status_message
+                .contains("usage: /model set-performance <model>"),
+            "unexpected status: {}",
+            app.status_message
+        );
+
+        assert!(app.handle_command("/model set-efficient").await.handled);
+        assert!(
+            app.status_message
+                .contains("usage: /model set-efficient <model>"),
+            "unexpected status: {}",
+            app.status_message
+        );
+
+        // Unknown subcommands still fall through to the model-name switch.
+        assert!(app.handle_command("/model set-bogus").await.handled);
+        assert!(
+            app.status_message.contains("model not found"),
+            "unexpected status: {}",
+            app.status_message
+        );
+
+        // The help text documents both tier subcommands.
+        let model = BUILT_IN_REGISTRY.find_command("model").unwrap();
+        assert!(
+            model
+                .help(Some("set-performance"))
+                .contains("performance-tier")
+        );
+        assert!(model.help(Some("set-efficient")).contains("efficient-tier"));
     }
 
     #[tokio::test]

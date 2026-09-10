@@ -65,6 +65,90 @@ async fn remove_config_field(
     rx.await.unwrap_or(Err("actor stopped".to_string()))
 }
 
+/// Insert or update one `[[models]]` entry in one scope. Returns the status
+/// message.
+#[tauri::command]
+async fn upsert_model(
+    state: State<'_, mpsc::Sender<Command>>,
+    scope: catus_core::config::ConfigScope,
+    model: catus_core::config::ModelEntry,
+) -> Result<String, String> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::UpsertModel {
+            scope,
+            model,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await.unwrap_or(Err("actor stopped".to_string()))
+}
+
+/// Remove one `[[models]]` entry (matched by id) from one scope. Returns the
+/// status message.
+#[tauri::command]
+async fn remove_model(
+    state: State<'_, mpsc::Sender<Command>>,
+    scope: catus_core::config::ConfigScope,
+    id: String,
+) -> Result<String, String> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::RemoveModel {
+            scope,
+            id,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await.unwrap_or(Err("actor stopped".to_string()))
+}
+
+/// Insert or update one `[[mcp.servers]]` entry in one scope. Returns the
+/// status message.
+#[tauri::command]
+async fn upsert_mcp_server(
+    state: State<'_, mpsc::Sender<Command>>,
+    scope: catus_core::config::ConfigScope,
+    server: catus_core::config::McpServerConfig,
+) -> Result<String, String> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::UpsertMcpServer {
+            scope,
+            server,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await.unwrap_or(Err("actor stopped".to_string()))
+}
+
+/// Remove one `[[mcp.servers]]` entry (matched by name) from one scope.
+/// Returns the status message.
+#[tauri::command]
+async fn remove_mcp_server(
+    state: State<'_, mpsc::Sender<Command>>,
+    scope: catus_core::config::ConfigScope,
+    name: String,
+) -> Result<String, String> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::RemoveMcpServer {
+            scope,
+            name,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await.unwrap_or(Err("actor stopped".to_string()))
+}
+
 /// Submit one input line (a user message or a slash command).
 #[tauri::command]
 async fn send_input(
@@ -267,6 +351,10 @@ pub fn run() {
             completion_candidates,
             set_config_field,
             remove_config_field,
+            upsert_model,
+            remove_model,
+            upsert_mcp_server,
+            remove_mcp_server,
             list_sessions,
             skill_preview,
             get_agent_detail,

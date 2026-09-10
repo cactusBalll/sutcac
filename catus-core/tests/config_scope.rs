@@ -183,11 +183,13 @@ fn config_extended_fields_effects() {
         .collect();
     assert!(kinds.contains(&("agent.auto_include_skills", "bool".to_string())));
     assert!(kinds.contains(&("shell.read_paths", "list".to_string())));
-    assert_eq!(kinds.len(), 9);
+    assert!(kinds.contains(&("agent.models.performance", "string".to_string())));
+    assert!(kinds.contains(&("agent.models.efficient", "string".to_string())));
+    assert_eq!(kinds.len(), 11);
 
     // Effective display lists every spec key.
     let fields = app.config_fields();
-    assert_eq!(fields.len(), 9);
+    assert_eq!(fields.len(), 11);
 
     // 1. bool field with a runtime effect (read live per dispatch).
     app.set_config_field_in(ConfigScope::Workspace, "agent.memory.auto_recall", "false")
@@ -233,7 +235,40 @@ fn config_extended_fields_effects() {
     let shell = app.config.shell.as_ref().unwrap();
     assert_eq!(shell.read_paths, Some(vec!["/elsewhere".to_string()]));
 
-    // 5. invalid bool values are rejected before anything is written.
+    // 5. tier fields validate the reference against the configured
+    // `[[models]]` list before anything is written.
+    let msg = app
+        .set_config_field_in(
+            ConfigScope::Workspace,
+            "agent.models.performance",
+            "test-model",
+        )
+        .unwrap();
+    assert!(msg.contains("workspace override"));
+    assert_eq!(app.config.agent.models.performance, "test-model");
+
+    let err = app
+        .set_config_field_in(ConfigScope::Workspace, "agent.models.efficient", "nosuch")
+        .unwrap_err();
+    assert!(err.to_string().contains("does not match any configured"));
+
+    app.set_config_field_in(
+        ConfigScope::Workspace,
+        "agent.models.efficient",
+        "test-model",
+    )
+    .unwrap();
+    assert_eq!(
+        app.config.agent.models.efficient.as_deref(),
+        Some("test-model")
+    );
+
+    // Removing the efficient tier falls back to the performance model.
+    app.remove_config_field_in(ConfigScope::Workspace, "agent.models.efficient")
+        .unwrap();
+    assert_eq!(app.config.agent.models.efficient, None);
+
+    // 6. invalid bool values are rejected before anything is written.
     let err = app
         .set_config_field_in(ConfigScope::Workspace, "agent.memory.auto_recall", "yes")
         .unwrap_err();

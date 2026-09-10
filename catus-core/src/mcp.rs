@@ -309,6 +309,17 @@ impl McpManager {
         self.clients.lock().unwrap().contains_key(server)
     }
 
+    /// Drop one server's connection and cached tool catalog. Returns whether
+    /// a connection was removed. Used before a reconnect and when a server
+    /// leaves the effective configuration.
+    pub fn disconnect(&self, server: &str) -> bool {
+        let mut clients = self.clients.lock().unwrap();
+        let had = clients.remove(server).is_some();
+        drop(clients);
+        self.catalogs.lock().unwrap().remove(server);
+        had
+    }
+
     /// Return true if no MCP servers are connected.
     pub fn is_empty(&self) -> bool {
         self.clients.lock().unwrap().is_empty()

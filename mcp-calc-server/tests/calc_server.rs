@@ -162,3 +162,36 @@ async fn manager_survives_when_server_command_is_missing() {
         "calc tools should still be available"
     );
 }
+
+#[tokio::test]
+async fn disconnect_and_connect_one_reconnect() {
+    let config = calc_server_config();
+    let (manager, warnings) = McpManager::connect(&[config.clone()]).await;
+    assert!(warnings.is_empty(), "unexpected warnings: {:?}", warnings);
+    assert!(manager.is_connected("calc"));
+
+    // Disconnect drops the connection and the cached catalog.
+    assert!(manager.disconnect("calc"));
+    assert!(!manager.disconnect("calc"), "second disconnect is a no-op");
+    assert!(!manager.is_connected("calc"));
+    assert!(manager.tool_catalog("calc").is_none());
+    assert!(manager.is_empty());
+
+    // `connect_one` restores the connection and the catalog (reconnect).
+    manager
+        .connect_one(&config)
+        .await
+        .expect("reconnect should succeed");
+    assert!(manager.is_connected("calc"));
+    let tools = manager
+        .tool_catalog("calc")
+        .expect("catalog should be cached after reconnect");
+    assert!(tools.iter().any(|t| t.name == "sum"));
+
+    // Tool calls work through the reconnected client.
+    let sum_result = manager
+        .call_tool("calc", "sum", args(&[("a", 1), ("b", 1)]))
+        .await
+        .expect("sum call should succeed after reconnect");
+    assert_eq!(sum_result.stdout, "2");
+}

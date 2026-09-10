@@ -1,8 +1,11 @@
 <script setup lang="ts">
-import { computed, watch } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import { useRuntimeStore } from '../../stores/runtime';
 
 const store = useRuntimeStore();
+const messagesEl = ref<HTMLElement | null>(null);
+/** Follow new messages unless the user scrolled up. */
+const following = ref(true);
 
 const summary = computed(() =>
   store.watching ? store.subagents.find((s) => s.id === store.watching) : undefined,
@@ -16,6 +19,22 @@ watch(
   },
   { deep: true },
 );
+
+watch(
+  () => store.watchingMessages.length,
+  async () => {
+    if (!following.value) return;
+    await nextTick();
+    const el = messagesEl.value;
+    if (el) el.scrollTop = el.scrollHeight;
+  },
+);
+
+function onScroll() {
+  const el = messagesEl.value;
+  if (!el) return;
+  following.value = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+}
 </script>
 
 <template>
@@ -27,7 +46,7 @@ watch(
     <div v-if="summary" class="task">{{ summary.task }}</div>
     <div v-if="summary?.result" class="result">{{ summary.result }}</div>
     <div v-if="summary?.error" class="error">{{ summary.error }}</div>
-    <div class="messages">
+    <div ref="messagesEl" class="messages" @scroll.passive="onScroll">
       <div v-for="(message, index) in store.watchingMessages" :key="index" class="line" :class="message.role">
         <span class="role">{{ message.role }}</span>
         <pre>{{ message.content }}</pre>

@@ -20,8 +20,22 @@ function onKeydown(e: KeyboardEvent) {
     }
     return;
   }
+  // Let buttons/inputs handle Enter themselves; only swallow it when the
+  // focus is on a passive element so a stray Enter cannot re-trigger
+  // whatever opened the overlay.
   if (e.key === 'Enter') {
-    e.preventDefault();
+    const target = e.target as HTMLElement | null;
+    const interactive = target?.closest('button, input, textarea, select, a[href]');
+    if (!interactive) e.preventDefault();
+  }
+}
+
+function onBackdropClick() {
+  if (!store.overlay) return;
+  if (store.overlay.kind === 'ask') {
+    store.cancelInteraction();
+  } else {
+    store.closeOverlay();
   }
 }
 
@@ -30,7 +44,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
 </script>
 
 <template>
-  <div v-if="store.overlay" class="backdrop">
+  <div v-if="store.overlay" class="backdrop" @click.self="onBackdropClick">
     <AskOverlay v-if="store.overlay.kind === 'ask'" :questions="store.overlay.questions" />
     <template v-else-if="store.overlay.kind === 'ui'">
       <StatusOverlay v-if="store.overlay.request.page === 'show_status'" />
@@ -86,5 +100,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown));
   align-items: center;
   justify-content: center;
   z-index: 50;
+}
+
+/* Small screens: panels fill the viewport instead of floating centered. */
+@media (max-width: 560px) {
+  .backdrop {
+    align-items: stretch;
+    padding: 12px;
+  }
 }
 </style>

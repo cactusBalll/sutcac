@@ -297,4 +297,19 @@ async function save() {
   color: var(--fg-dim);
   padding: 12px 0;
 }
+
+@media (max-width: 640px) {
+  .page {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .list {
+    width: 100%;
+    min-width: 0;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    overflow-y: visible;
+  }
+}
 </style>

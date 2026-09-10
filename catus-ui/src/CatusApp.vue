@@ -26,7 +26,7 @@ onMounted(() => {
     <h2>session ended</h2>
     <p>the catus session has been closed</p>
   </div>
-  <div v-else-if="!store.started" class="fatal"><p>loading session…</p></div>
+  <div v-else-if="!store.started" class="fatal loading"><p>loading session…</p></div>
   <div v-else class="app">
     <Sidebar />
     <div class="main">
@@ -61,5 +61,9 @@ onMounted(() => {
   gap: 12px;
   color: var(--err);
   padding: 32px;
+}
+
+.fatal.loading {
+  color: var(--fg-dim);
 }
 </style>

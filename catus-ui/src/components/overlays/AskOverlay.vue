@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, nextTick, onMounted, ref, watch } from 'vue';
 import { useRuntimeStore } from '../../stores/runtime';
 import type { AskAnswer, AskQuestion } from '../../types';
 
@@ -12,10 +12,22 @@ const checked = ref<Set<string>>(new Set());
 const otherText = ref('');
 /** Answers collected for earlier questions in the same call. */
 const collected = ref<AskAnswer[]>([]);
+/** Keyboard highlight: 0..options.length-1, plus `options.length` = Other row. */
+const highlight = ref(0);
+const root = ref<HTMLElement | null>(null);
+const otherInput = ref<HTMLInputElement | null>(null);
 
 const question = computed(() => props.questions[index.value]);
 const progress = computed(() => `${index.value + 1}/${props.questions.length}`);
 const isLast = computed(() => index.value + 1 >= props.questions.length);
+
+onMounted(() => root.value?.focus());
+
+watch(index, async () => {
+  highlight.value = 0;
+  await nextTick();
+  root.value?.focus();
+});
 
 function currentAnswer(labels: string[]): AskAnswer {
   return {
@@ -60,10 +72,36 @@ function confirmOther() {
   if (!otherText.value.trim()) return;
   advance([otherText.value.trim()]);
 }
+
+function moveHighlight(delta: number) {
+  const rows = question.value.options.length + 1; // options + Other row
+  highlight.value = (((highlight.value + delta) % rows) + rows) % rows;
+  if (highlight.value === question.value.options.length) {
+    otherInput.value?.focus();
+  } else {
+    root.value?.focus();
+  }
+}
+
+function onKeydown(e: KeyboardEvent) {
+  // The Other input handles its own keys.
+  if (e.target === otherInput.value) return;
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    moveHighlight(-1);
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    moveHighlight(1);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const option = question.value.options[highlight.value];
+    if (option) choose(option.label);
+  }
+}
 </script>
 
 <template>
-  <div class="ask panel">
+  <div ref="root" class="ask panel" tabindex="-1" @keydown="onKeydown">
     <div class="head">
       <span class="title">{{ question.title }}</span>
       <span class="progress">{{ progress }}</span>
@@ -71,11 +109,15 @@ function confirmOther() {
     <div class="prompt-text">{{ question.prompt }}</div>
     <div class="options">
       <button
-        v-for="option in question.options"
+        v-for="(option, i) in question.options"
         :key="option.label"
         class="option"
-        :class="{ checked: question.multiSelect && checked.has(option.label) }"
+        :class="{
+          checked: question.multiSelect && checked.has(option.label),
+          highlighted: i === highlight,
+        }"
         @click="choose(option.label)"
+        @mouseenter="highlight = i"
       >
         <span class="check">{{ question.multiSelect ? (checked.has(option.label) ? '[x]' : '[ ]') : '' }}</span>
         <span class="option-label">{{ option.label }}</span>
@@ -83,9 +125,11 @@ function confirmOther() {
       </button>
       <div class="other">
         <input
+          ref="otherInput"
           v-model="otherText"
           type="text"
           placeholder="Other…"
+          @focus="highlight = question.options.length"
           @keydown.enter.stop="confirmOther"
         />
         <button v-if="question.multiSelect" class="primary" @click="confirmMulti">
@@ -93,7 +137,7 @@ function confirmOther() {
         </button>
       </div>
     </div>
-    <div class="hint">Esc cancel</div>
+    <div class="hint">↑↓ move · Enter choose · Esc cancel</div>
   </div>
 </template>
 
@@ -107,6 +151,7 @@ function confirmOther() {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 16px 20px;
+  outline: none;
 }
 
 .head {
@@ -144,6 +189,11 @@ function confirmOther() {
   gap: 10px;
   text-align: left;
   padding: 8px 12px;
+}
+
+.option.highlighted {
+  background: var(--accent-dim);
+  border-color: var(--accent);
 }
 
 .option.checked {

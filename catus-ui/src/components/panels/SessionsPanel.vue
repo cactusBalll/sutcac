@@ -95,6 +95,7 @@ async function refresh() {
   padding: 10px 20px;
   color: var(--fg-dim);
   font-size: 12px;
+  flex-wrap: wrap;
 }
 
 .hint {

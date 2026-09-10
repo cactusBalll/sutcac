@@ -450,6 +450,21 @@ impl SubagentManager {
         self.parent_current_model = model;
     }
 
+    /// Update the parent tier-model snapshot used for future subagents.
+    ///
+    /// Agents with a `model` tier resolve through this mapping, so it must
+    /// track `[agent.models]` config edits (`/model set-performance` and the
+    /// web tier editor).
+    pub fn update_parent_tier_models(&mut self, tiers: TierModels) {
+        self.parent_tier_models = tiers;
+    }
+
+    /// Snapshot of the parent tier mapping for tests.
+    #[cfg(test)]
+    pub(crate) fn parent_tier_models_for_test(&self) -> &TierModels {
+        &self.parent_tier_models
+    }
+
     /// Snapshot of the parent model for tests.
     #[cfg(test)]
     pub(crate) fn parent_current_model_for_test(&self) -> &Model {

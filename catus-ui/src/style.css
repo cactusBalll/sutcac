@@ -6,6 +6,7 @@
   --fg-dim: #8b93a3;
   --accent: #6ea8fe;
   --accent-dim: #2b3f63;
+  --on-accent: #ffffff;
   --ok: #4cc38a;
   --warn: #e5c07b;
   --err: #e5757b;
@@ -26,6 +27,9 @@ html,
 body,
 #app {
   height: 100%;
+  /* Dynamic viewport: keeps the layout correct when mobile browsers show
+     and hide the URL bar. */
+  height: 100dvh;
   margin: 0;
   padding: 0;
   overflow: hidden;
@@ -48,7 +52,12 @@ button:hover {
 button.primary {
   background: var(--accent-dim);
   border-color: var(--accent);
-  color: #fff;
+  color: var(--on-accent);
+}
+
+:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
 }
 
 input[type='text'] {
@@ -71,4 +80,49 @@ pre {
   white-space: pre-wrap;
   word-break: break-word;
   font: inherit;
+}
+
+/* Scrollbars in the dark theme: slim rails on every scroll container, with
+   translucent tracks and rounded thumbs. Chromium and WebKit style them via
+   the WebKit pseudo-elements (note: setting scrollbar-width/color there
+   would disable the pseudo-element styling, so it is Firefox-only). */
+@supports selector(::-webkit-scrollbar) {
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+
+  ::-webkit-scrollbar-thumb:hover,
+  ::-webkit-scrollbar-thumb:active {
+    background-color: var(--fg-dim);
+  }
+}
+
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

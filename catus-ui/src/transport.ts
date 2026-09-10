@@ -12,7 +12,9 @@ import type {
   AskAnswer,
   ConfigScope,
   InputLineOutcome,
+  McpServerEntry,
   Message,
+  ModelEntry,
   RuntimeEventPayload,
   SessionSummary,
   SkillPreview,
@@ -27,6 +29,8 @@ export interface TransportHandlers {
   onStartupError(message: string): void;
   /** The session requested a shutdown (`/exit`). */
   onQuit(): void;
+  /** Transport connectivity changed (e.g. the WS dropped and is reconnecting). */
+  onConnectionChange?(connected: boolean): void;
 }
 
 export interface CatusTransport {
@@ -43,6 +47,14 @@ export interface CatusTransport {
   setConfigField(scope: ConfigScope, key: string, value: string): Promise<string>;
   /** Remove a config field from one scope; resolves with the status message. */
   removeConfigField(scope: ConfigScope, key: string): Promise<string>;
+  /** Insert or update one `[[models]]` entry in one scope; resolves with the status message. */
+  upsertModel(scope: ConfigScope, model: ModelEntry): Promise<string>;
+  /** Remove one `[[models]]` entry (by id) from one scope; resolves with the status message. */
+  removeModel(scope: ConfigScope, id: string): Promise<string>;
+  /** Insert or update one `[[mcp.servers]]` entry in one scope; resolves with the status message. */
+  upsertMcpServer(scope: ConfigScope, server: McpServerEntry): Promise<string>;
+  /** Remove one `[[mcp.servers]]` entry (by name) from one scope; resolves with the status message. */
+  removeMcpServer(scope: ConfigScope, name: string): Promise<string>;
   /**
    * List history sessions. `scope='all'` returns every workspace's
    * sessions; the default returns the current workspace's 10 newest.

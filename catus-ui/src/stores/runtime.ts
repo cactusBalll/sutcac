@@ -5,7 +5,9 @@ import type {
   AskAnswer,
   AskQuestion,
   ConfigScope,
+  McpServerEntry,
   Message,
+  ModelEntry,
   RuntimeEventPayload,
   SessionSummary,
   UiRequest,
@@ -25,12 +27,14 @@ export type Overlay =
   | null;
 
 /** Full-screen manager pages reachable from the left sidebar. */
-export type SidePanel = 'sessions' | 'skills' | 'mcp' | 'agents' | null;
+export type SidePanel = 'sessions' | 'skills' | 'mcp' | 'agents' | 'models' | null;
 
 export const useRuntimeStore = defineStore('runtime', {
   state: () => ({
     started: false,
     startupError: '',
+    /** Transport-level connectivity (WS reconnects surface here). */
+    connected: true,
     /** True once the backend announced shutdown (web: show an end banner). */
     quitRequested: false,
     messages: [] as Message[],
@@ -82,6 +86,8 @@ export const useRuntimeStore = defineStore('runtime', {
     selectedCandidate: null as number | null,
     /** Guard against out-of-order completion responses. */
     completionSeq: 0,
+    /** Incremented to request input-line focus (after overlays close). */
+    focusInputNonce: 0,
   }),
 
   getters: {
@@ -101,6 +107,9 @@ export const useRuntimeStore = defineStore('runtime', {
         },
         onQuit: () => {
           this.quitRequested = true;
+        },
+        onConnectionChange: (connected) => {
+          this.connected = connected;
         },
       });
       try {
@@ -370,14 +379,68 @@ export const useRuntimeStore = defineStore('runtime', {
       return true;
     },
 
+    /** Insert or update one `[[models]]` entry in one scope. */
+    async saveModel(scope: ConfigScope, model: ModelEntry): Promise<boolean> {
+      try {
+        await backend().upsertModel(scope, model);
+      } catch (e) {
+        this.status = 'error';
+        this.statusMessage = String(e);
+        return false;
+      }
+      await this.refreshSnapshot();
+      return true;
+    },
+
+    /** Remove one `[[models]]` entry (by id) from one scope. */
+    async deleteModel(scope: ConfigScope, id: string): Promise<boolean> {
+      try {
+        await backend().removeModel(scope, id);
+      } catch (e) {
+        this.status = 'error';
+        this.statusMessage = String(e);
+        return false;
+      }
+      await this.refreshSnapshot();
+      return true;
+    },
+
+    /** Insert or update one `[[mcp.servers]]` entry in one scope. */
+    async saveMcpServer(scope: ConfigScope, server: McpServerEntry): Promise<boolean> {
+      try {
+        await backend().upsertMcpServer(scope, server);
+      } catch (e) {
+        this.status = 'error';
+        this.statusMessage = String(e);
+        return false;
+      }
+      await this.refreshSnapshot();
+      return true;
+    },
+
+    /** Remove one `[[mcp.servers]]` entry (by name) from one scope. */
+    async deleteMcpServer(scope: ConfigScope, name: string): Promise<boolean> {
+      try {
+        await backend().removeMcpServer(scope, name);
+      } catch (e) {
+        this.status = 'error';
+        this.statusMessage = String(e);
+        return false;
+      }
+      await this.refreshSnapshot();
+      return true;
+    },
+
     closeOverlay() {
       this.overlay = null;
       this.watching = null;
       this.watchingMessages = [];
+      this.focusInputNonce += 1;
     },
 
     async answerInteraction(answers: AskAnswer[]) {
       this.overlay = null;
+      this.focusInputNonce += 1;
       try {
         const resumed = await backend().completeInteraction(answers);
         if (resumed) this.streaming = true;
@@ -389,6 +452,7 @@ export const useRuntimeStore = defineStore('runtime', {
 
     async cancelInteraction() {
       this.overlay = null;
+      this.focusInputNonce += 1;
       try {
         const resumed = await backend().cancelInteraction();
         if (resumed) this.streaming = true;

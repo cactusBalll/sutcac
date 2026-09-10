@@ -14,6 +14,8 @@ const tab = ref<'effective' | ConfigScope>('effective');
 
 /** Local edit drafts, keyed by `scope:key`; (re)initialized per snapshot. */
 const drafts = reactive<Record<string, string>>({});
+/** Rows that just saved successfully (transient "saved ✓" feedback). */
+const savedKeys = reactive<Set<string>>(new Set());
 
 const scopes = computed<ConfigScopeSnapshot[]>(() => store.configScopes);
 const specs = computed<ConfigFieldSpec[]>(() => store.configFieldSpecs);
@@ -74,12 +76,25 @@ function onCheckbox(scope: ConfigScope, key: string, event: Event) {
   setDraftBool(scope, key, (event.target as HTMLInputElement).checked);
 }
 
+/** The draft differs from the saved value in that scope. */
+function isDirty(scope: ConfigScopeSnapshot, key: string) {
+  const id = draftKey(scope.scope, key);
+  if (!(id in drafts)) return false;
+  const saved = scope.fields.find(([k]) => k === key)?.[1] ?? '';
+  return drafts[id] !== saved;
+}
+
 async function save(scope: ConfigScope, key: string) {
   // Coerce to string: v-model returns a number for `type="number"` inputs,
   // but the backend API expects string values for every field kind.
-  const value = String(drafts[draftKey(scope, key)] ?? '');
+  const id = draftKey(scope, key);
+  const value = String(drafts[id] ?? '');
   const ok = await store.setConfigField(scope, key, value);
-  if (ok) drafts[draftKey(scope, key)] = value;
+  if (ok) {
+    drafts[id] = value;
+    savedKeys.add(id);
+    setTimeout(() => savedKeys.delete(id), 1500);
+  }
 }
 
 async function remove(scope: ConfigScope, key: string) {
@@ -152,7 +167,7 @@ async function remove(scope: ConfigScope, key: string) {
               :checked="draftBool(activeScope.scope, key)"
               @change="onCheckbox(activeScope.scope, key, $event)"
             />
-            {{ drafts[draftKey(activeScope.scope, key)] || value || 'false' }}
+            {{ draftBool(activeScope.scope, key) ? 'on' : 'off' }}
           </label>
 
           <input
@@ -162,9 +177,16 @@ async function remove(scope: ConfigScope, key: string) {
             :type="specOf(key)?.kind === 'int' ? 'number' : 'text'"
             :placeholder="value === '' ? (specOf(key)?.kind === 'list' ? 'a, b, c (not set)' : '(not set)') : value"
             spellcheck="false"
+            @keydown.enter="save(activeScope.scope, key)"
           />
 
-          <button class="btn" @click="save(activeScope.scope, key)">save</button>
+          <button
+            class="btn"
+            :class="{ dirty: isDirty(activeScope, key), saved: savedKeys.has(draftKey(activeScope.scope, key)) }"
+            @click="save(activeScope.scope, key)"
+          >
+            {{ savedKeys.has(draftKey(activeScope.scope, key)) ? 'saved ✓' : 'save' }}
+          </button>
           <button
             v-if="isSet(activeScope, key)"
             class="btn danger"
@@ -249,7 +271,7 @@ async function remove(scope: ConfigScope, key: string) {
 }
 
 .tag.warn {
-  color: #d8a24a;
+  color: var(--warn);
 }
 
 .path {
@@ -335,6 +357,16 @@ async function remove(scope: ConfigScope, key: string) {
   border-color: var(--accent);
 }
 
+.btn.dirty {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn.saved {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
 .btn.danger:hover {
   border-color: var(--err);
   color: var(--err);
@@ -344,5 +376,20 @@ async function remove(scope: ConfigScope, key: string) {
   margin-top: 12px;
   color: var(--fg-dim);
   font-size: 11px;
+}
+
+/* Narrow viewports: stack the field column above its value. */
+@media (max-width: 640px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .editor .row {
+    flex-wrap: wrap;
+  }
+
+  .editor .row .k {
+    width: 100%;
+  }
 }
 </style>

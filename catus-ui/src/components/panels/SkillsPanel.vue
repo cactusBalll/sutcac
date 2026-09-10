@@ -26,26 +26,31 @@ async function showPreview(name: string) {
   <div class="page">
     <div class="list">
       <div v-if="!store.skillCatalog.length" class="empty">no skills discovered</div>
-      <div
+      <button
         v-for="skill in store.skillCatalog"
         :key="skill.name"
+        type="button"
         class="item"
         :class="{ selected: preview?.name === skill.name }"
         @click="showPreview(skill.name)"
       >
         <div class="row">
           <span class="name">{{ skill.name }}</span>
-          <button
+          <span
+            role="button"
+            tabindex="0"
             class="switch"
             :class="{ off: skill.disabled }"
             :title="skill.disabled ? 'use_skill rejects it; the prompt catalog is unchanged (manual use still works)' : 'enabled'"
-            @click="store.toggleSkill(skill.name)"
+            @click.stop="store.toggleSkill(skill.name)"
+            @keydown.enter.stop="store.toggleSkill(skill.name)"
+            @keydown.space.prevent.stop="store.toggleSkill(skill.name)"
           >
             {{ skill.disabled ? 'disabled' : 'enabled' }}
-          </button>
+          </span>
         </div>
         <div class="desc">{{ skill.description }}</div>
-      </div>
+      </button>
     </div>
     <div class="preview">
       <div v-if="previewLoading" class="empty">loading…</div>
@@ -80,6 +85,12 @@ async function showPreview(name: string) {
 }
 
 .item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: none;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 8px 12px;
@@ -112,10 +123,11 @@ async function showPreview(name: string) {
 .switch {
   font-size: 11px;
   padding: 1px 10px;
+  border: 1px solid var(--ok);
   border-radius: 10px;
   color: var(--ok);
-  border-color: var(--ok);
   background: none;
+  cursor: pointer;
 }
 
 .switch.off {
@@ -148,5 +160,18 @@ async function showPreview(name: string) {
 
 .empty.error {
   color: var(--err);
+}
+
+@media (max-width: 640px) {
+  .page {
+    flex-direction: column;
+  }
+
+  .list {
+    width: 100%;
+    min-width: 0;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
 }
 </style>

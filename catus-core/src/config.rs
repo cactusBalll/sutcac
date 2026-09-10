@@ -211,7 +211,7 @@ pub struct McpConfig {
 }
 
 /// Configuration for a single MCP server connection.
-#[derive(Debug, Deserialize, Clone, Serialize)]
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 #[serde(default)]
 pub struct McpServerConfig {
     /// Human-readable name for this server. Used to prefix tool names, e.g.
@@ -335,14 +335,21 @@ pub fn scope_config_path(scope: ConfigScope) -> PathBuf {
 }
 
 /// Per-scope config state for editor frontends: the file path, whether it
-/// exists yet, and the values of the editable keys as written in that file
-/// (an empty string means the key is not set in that scope).
+/// exists yet, the values of the editable keys as written in that file (an
+/// empty string means the key is not set in that scope), and the
+/// `[[models]]` / `[[mcp.servers]]` entries as written in that file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigScopeSnapshot {
     pub scope: ConfigScope,
     pub path: String,
     pub exists: bool,
     pub fields: Vec<(String, String)>,
+    /// `[[models]]` entries defined in this scope's file (not the merged
+    /// effective list; frontends merge the scopes themselves).
+    pub models: Vec<ModelEntry>,
+    /// `[[mcp.servers]]` entries defined in this scope's file (not the
+    /// merged effective list; frontends merge the scopes themselves).
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 /// The value type of one editable config field (drives editor widgets and
@@ -456,6 +463,235 @@ pub fn doc_remove_dotted(
             .ok_or_else(|| format!("key '{}' not found", key))?;
     }
     Ok(table.remove(last).is_some())
+}
+
+/// Extract the `[[models]]` entries from a parsed config TOML; `None` when
+/// the key is absent. Errors when `models` is present but not a list of
+/// well-formed model tables.
+pub fn models_from_toml(value: &toml::Value) -> Result<Option<Vec<ModelEntry>>, String> {
+    let Some(raw) = value.get("models") else {
+        return Ok(None);
+    };
+    let models = raw
+        .clone()
+        .try_into()
+        .map_err(|e| format!("invalid [[models]] entries: {}", e))?;
+    Ok(Some(models))
+}
+
+/// Insert or update one `[[models]]` entry in a `toml_edit` document,
+/// matching existing entries by `id` and appending a new table otherwise,
+/// while preserving all untouched content (comments, formatting, unknown
+/// keys). An empty `name` and a zero `context_window` are not written.
+pub fn doc_upsert_model(
+    doc: &mut toml_edit::DocumentMut,
+    entry: &ModelEntry,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let item = doc
+        .as_table_mut()
+        .entry("models")
+        .or_insert(toml_edit::Item::ArrayOfTables(
+            toml_edit::ArrayOfTables::new(),
+        ));
+    let array = item
+        .as_array_of_tables_mut()
+        .ok_or_else(|| "'models' in the config file is not an array of tables".to_string())?;
+    let slot = array
+        .iter_mut()
+        .find(|t| t.get("id").and_then(|i| i.as_str()) == Some(entry.id.as_str()));
+    let table = match slot {
+        Some(table) => table,
+        None => {
+            array.push(toml_edit::Table::new());
+            array
+                .iter_mut()
+                .last()
+                .expect("pushed table must be present")
+        }
+    };
+    table.insert("id", toml_edit::value(entry.id.clone()));
+    if entry.name.trim().is_empty() {
+        table.remove("name");
+    } else {
+        table.insert("name", toml_edit::value(entry.name.clone()));
+    }
+    if entry.context_window == 0 {
+        table.remove("context_window");
+    } else {
+        let window = i64::try_from(entry.context_window)
+            .map_err(|_| "context window value is out of range".to_string())?;
+        table.insert("context_window", toml_edit::value(window));
+    }
+    table.insert("provider", toml_edit::value(entry.provider.clone()));
+    Ok(())
+}
+
+/// Remove one `[[models]]` entry (matched by `id`) from a `toml_edit`
+/// document. Returns whether an entry was removed; the `models` key itself
+/// is dropped when the array becomes empty.
+pub fn doc_remove_model(
+    doc: &mut toml_edit::DocumentMut,
+    id: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(item) = doc.as_table_mut().get_mut("models") else {
+        return Ok(false);
+    };
+    let array = item
+        .as_array_of_tables_mut()
+        .ok_or_else(|| "'models' in the config file is not an array of tables".to_string())?;
+    let Some(index) = array
+        .iter()
+        .position(|t| t.get("id").and_then(|i| i.as_str()) == Some(id))
+    else {
+        return Ok(false);
+    };
+    array.remove(index);
+    if array.is_empty() {
+        doc.as_table_mut().remove("models");
+    }
+    Ok(true)
+}
+
+/// Parse the `[[mcp.servers]]` entries out of a raw config value; a missing
+/// `mcp.servers` key yields `None`.
+pub fn mcp_servers_from_toml(value: &toml::Value) -> Result<Option<Vec<McpServerConfig>>, String> {
+    let Some(raw) = value.get("mcp").and_then(|m| m.get("servers")) else {
+        return Ok(None);
+    };
+    let servers = raw
+        .clone()
+        .try_into()
+        .map_err(|e| format!("invalid [[mcp.servers]] entries: {}", e))?;
+    Ok(Some(servers))
+}
+
+/// Write one `McpServerConfig` table into a `toml_edit` document (`env` and
+/// `headers` become inline tables; fields that do not apply to the entry's
+/// transport are removed). Existing entries are matched by `name`.
+pub fn doc_upsert_mcp_server(
+    doc: &mut toml_edit::DocumentMut,
+    entry: &McpServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mcp_item = doc
+        .as_table_mut()
+        .entry("mcp")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let mcp = mcp_item
+        .as_table_mut()
+        .ok_or_else(|| "'mcp' in the config file is not a table".to_string())?;
+    let item = mcp
+        .entry("servers")
+        .or_insert(toml_edit::Item::ArrayOfTables(
+            toml_edit::ArrayOfTables::new(),
+        ));
+    let array = item
+        .as_array_of_tables_mut()
+        .ok_or_else(|| "'mcp.servers' in the config file is not an array of tables".to_string())?;
+    let slot = array
+        .iter_mut()
+        .find(|t| t.get("name").and_then(|i| i.as_str()) == Some(entry.name.as_str()));
+    let table = match slot {
+        Some(table) => table,
+        None => {
+            array.push(toml_edit::Table::new());
+            array
+                .iter_mut()
+                .last()
+                .expect("pushed table must be present")
+        }
+    };
+    table.insert("name", toml_edit::value(entry.name.clone()));
+    let transport = match entry.transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::StreamableHttp => "streamable-http",
+    };
+    table.insert("transport", toml_edit::value(transport));
+    match entry.transport {
+        McpTransport::Stdio => {
+            table.insert("command", toml_edit::value(entry.command.clone()));
+            if entry.args.is_empty() {
+                table.remove("args");
+            } else {
+                table.insert(
+                    "args",
+                    toml_edit::value(toml_edit::Array::from_iter(entry.args.iter().cloned())),
+                );
+            }
+            if entry.env.is_empty() {
+                table.remove("env");
+            } else {
+                table.insert("env", string_map_item(&entry.env));
+            }
+            table.remove("url");
+            table.remove("headers");
+        }
+        McpTransport::StreamableHttp => {
+            table.insert(
+                "url",
+                toml_edit::value(entry.url.clone().unwrap_or_default()),
+            );
+            if entry.headers.is_empty() {
+                table.remove("headers");
+            } else {
+                table.insert("headers", string_map_item(&entry.headers));
+            }
+            table.remove("command");
+            table.remove("args");
+            table.remove("env");
+        }
+    }
+    Ok(())
+}
+
+/// Render a `HashMap<String, String>` as a `toml_edit` inline table.
+fn string_map_item(map: &std::collections::HashMap<String, String>) -> toml_edit::Item {
+    let mut table = toml_edit::Table::new();
+    table.set_implicit(true);
+    for (key, value) in map {
+        table.insert(key, toml_edit::value(value.clone()));
+    }
+    toml_edit::Item::Value(toml_edit::Value::InlineTable(table.into_inline_table()))
+}
+
+/// Remove one `[[mcp.servers]]` entry (matched by `name`) from a
+/// `toml_edit` document. Returns whether an entry was removed; the
+/// `servers` key (and an empty `mcp` table) is dropped when it becomes
+/// empty.
+pub fn doc_remove_mcp_server(
+    doc: &mut toml_edit::DocumentMut,
+    name: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(item) = doc
+        .as_table_mut()
+        .get_mut("mcp")
+        .and_then(|m| m.as_table_mut())
+        .and_then(|m| m.get_mut("servers"))
+    else {
+        return Ok(false);
+    };
+    let array = item
+        .as_array_of_tables_mut()
+        .ok_or_else(|| "'mcp.servers' in the config file is not an array of tables".to_string())?;
+    let Some(index) = array
+        .iter()
+        .position(|t| t.get("name").and_then(|i| i.as_str()) == Some(name))
+    else {
+        return Ok(false);
+    };
+    array.remove(index);
+    if array.is_empty() {
+        if let Some(mcp) = doc
+            .as_table_mut()
+            .get_mut("mcp")
+            .and_then(|m| m.as_table_mut())
+        {
+            mcp.remove("servers");
+            if mcp.is_empty() {
+                doc.as_table_mut().remove("mcp");
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// The application log file (`<xdg>/catus/catus.log`). Not configurable.
@@ -629,7 +865,7 @@ impl AppConfig {
     /// their providers attached. An unset `efficient` tier falls back to the
     /// `performance` model.
     pub fn resolve_tier_models(&self, models: &[Model]) -> Result<TierModels, String> {
-        let resolve = |reference: &str| -> Result<Model, String> {
+        let resolve = |tier: &str, reference: &str| -> Result<Model, String> {
             models
                 .iter()
                 .find(|m| {
@@ -639,8 +875,8 @@ impl AppConfig {
                 .cloned()
                 .ok_or_else(|| {
                     format!(
-                        "tier reference '{}' does not match any configured [[models]] id or name",
-                        reference
+                        "[agent.models].{} '{}' does not match any configured [[models]] id or name",
+                        tier, reference
                     )
                 })
         };
@@ -652,7 +888,7 @@ impl AppConfig {
                     .to_string(),
             );
         }
-        let performance = resolve(performance_ref)?;
+        let performance = resolve("performance", performance_ref)?;
         let efficient = match self
             .agent
             .models
@@ -661,7 +897,7 @@ impl AppConfig {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            Some(efficient_ref) => resolve(efficient_ref)?,
+            Some(efficient_ref) => resolve("efficient", efficient_ref)?,
             None => performance.clone(),
         };
         Ok(TierModels {
@@ -1311,5 +1547,225 @@ Authorization = "Bearer sk-remote"
             server.headers.get("Authorization"),
             Some(&"Bearer sk-remote".to_string())
         );
+    }
+
+    #[test]
+    fn models_from_toml_round_trips_entries() {
+        let value: toml::Value = toml::from_str(
+            r#"
+[[models]]
+id = "m1"
+name = "Model One"
+context_window = "128k"
+provider = "openai"
+
+[[models]]
+id = "m2"
+provider = "openai"
+"#,
+        )
+        .unwrap();
+        let models = models_from_toml(&value).unwrap().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].context_window, 128 * 1024);
+        assert_eq!(models[1].context_window, 0);
+
+        let empty: toml::Value = toml::from_str("[shell]\nperm_mode = \"allow_all\"\n").unwrap();
+        assert!(models_from_toml(&empty).unwrap().is_none());
+
+        let bad: toml::Value = toml::from_str("models = 3\n").unwrap();
+        assert!(models_from_toml(&bad).is_err());
+    }
+
+    #[test]
+    fn doc_upsert_model_appends_updates_and_preserves_content() {
+        let mut doc: toml_edit::DocumentMut = r#"
+# api vendor
+[[providers]]
+name = "openai"
+
+[[models]]
+id = "m1"
+name = "Model One"
+context_window = 4096
+provider = "openai"
+"#
+        .parse()
+        .unwrap();
+
+        // New entry appended.
+        doc_upsert_model(
+            &mut doc,
+            &ModelEntry {
+                id: "m2".to_string(),
+                name: String::new(),
+                context_window: 0,
+                provider: "openai".to_string(),
+            },
+        )
+        .unwrap();
+        // Existing entry updated.
+        doc_upsert_model(
+            &mut doc,
+            &ModelEntry {
+                id: "m1".to_string(),
+                name: String::new(),
+                context_window: 8192,
+                provider: "other".to_string(),
+            },
+        )
+        .unwrap();
+
+        let saved = doc.to_string();
+        let models = models_from_toml(&toml::from_str::<toml::Value>(&saved).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(models.len(), 2);
+        let m1 = models.iter().find(|m| m.id == "m1").unwrap();
+        assert_eq!(m1.context_window, 8192);
+        assert_eq!(m1.provider, "other");
+        assert!(m1.name.is_empty());
+        let m2 = models.iter().find(|m| m.id == "m2").unwrap();
+        assert_eq!(m2.provider, "openai");
+
+        // Untouched content survives.
+        let saved = doc.to_string();
+        assert!(saved.contains("# api vendor"));
+        assert!(saved.contains("name = \"openai\""));
+    }
+
+    #[test]
+    fn doc_remove_model_drops_entry_and_empty_array() {
+        let mut doc: toml_edit::DocumentMut = "[[models]]\nid = \"m1\"\nprovider = \"p\"\n\n[[models]]\nid = \"m2\"\nprovider = \"p\"\n"
+            .parse()
+            .unwrap();
+        assert!(doc_remove_model(&mut doc, "m1").unwrap());
+        assert!(!doc_remove_model(&mut doc, "m1").unwrap());
+        assert!(doc_remove_model(&mut doc, "m2").unwrap());
+        // The emptied array is dropped from the document.
+        assert!(doc.as_table().get("models").is_none());
+        assert!(doc_remove_model(&mut doc, "nosuch").unwrap() == false);
+    }
+
+    #[test]
+    fn doc_upsert_mcp_server_appends_updates_and_preserves_content() {
+        let mut doc: toml_edit::DocumentMut = r#"
+# calculators
+[mcp]
+
+[[mcp.servers]]
+name = "calc"
+command = "calc-server"
+args = ["--stdio"]
+
+[[mcp.servers]]
+name = "remote"
+transport = "streamable-http"
+url = "https://mcp.example.com/mcp"
+
+[mcp.servers.headers]
+Authorization = "Bearer old"
+"#
+        .parse()
+        .unwrap();
+
+        // New stdio entry appended.
+        doc_upsert_mcp_server(
+            &mut doc,
+            &McpServerConfig {
+                name: "calc2".to_string(),
+                transport: McpTransport::Stdio,
+                command: "calc2-server".to_string(),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+                url: None,
+                headers: std::collections::HashMap::new(),
+            },
+        )
+        .unwrap();
+        // Existing http entry updated (transport switch drops stale fields).
+        doc_upsert_mcp_server(
+            &mut doc,
+            &McpServerConfig {
+                name: "remote".to_string(),
+                transport: McpTransport::StreamableHttp,
+                command: String::new(),
+                args: Vec::new(),
+                env: std::collections::HashMap::new(),
+                url: Some("http://127.0.0.1:8000/mcp".to_string()),
+                headers: [("X-Session".to_string(), "abc".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        )
+        .unwrap();
+
+        let saved = doc.to_string();
+        let servers = mcp_servers_from_toml(&toml::from_str::<toml::Value>(&saved).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(servers.len(), 3);
+        let remote = servers.iter().find(|s| s.name == "remote").unwrap();
+        assert_eq!(remote.transport, McpTransport::StreamableHttp);
+        assert_eq!(remote.url.as_deref(), Some("http://127.0.0.1:8000/mcp"));
+        assert!(remote.command.is_empty());
+        assert_eq!(remote.headers.get("X-Session"), Some(&"abc".to_string()));
+        assert!(!remote.headers.contains_key("Authorization"));
+        let calc2 = servers.iter().find(|s| s.name == "calc2").unwrap();
+        assert_eq!(calc2.transport, McpTransport::Stdio);
+        assert!(calc2.command == "calc2-server");
+
+        // Untouched content survives.
+        assert!(saved.contains("# calculators"));
+        assert!(saved.contains("name = \"calc\""));
+    }
+
+    #[test]
+    fn doc_upsert_mcp_server_creates_nested_table_in_fresh_document() {
+        let mut doc: toml_edit::DocumentMut =
+            "[shell]\nperm_mode = \"allow_all\"\n".parse().unwrap();
+        doc_upsert_mcp_server(
+            &mut doc,
+            &McpServerConfig {
+                name: "calc".to_string(),
+                transport: McpTransport::Stdio,
+                command: "mcp-calc-server".to_string(),
+                args: vec!["--http".to_string()],
+                env: std::collections::HashMap::new(),
+                url: None,
+                headers: std::collections::HashMap::new(),
+            },
+        )
+        .unwrap();
+        let servers =
+            mcp_servers_from_toml(&toml::from_str::<toml::Value>(&doc.to_string()).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].args, vec!["--http"]);
+        // Untouched content survives.
+        assert!(doc.to_string().contains("perm_mode"));
+    }
+
+    #[test]
+    fn doc_remove_mcp_server_drops_entry_and_empty_tables() {
+        let mut doc: toml_edit::DocumentMut = r#"
+[[mcp.servers]]
+name = "calc"
+command = "calc-server"
+
+[[mcp.servers]]
+name = "remote"
+transport = "streamable-http"
+url = "https://mcp.example.com/mcp"
+"#
+        .parse()
+        .unwrap();
+        assert!(doc_remove_mcp_server(&mut doc, "calc").unwrap());
+        assert!(!doc_remove_mcp_server(&mut doc, "calc").unwrap());
+        assert!(doc_remove_mcp_server(&mut doc, "remote").unwrap());
+        // The emptied array and the bare `mcp` table are dropped.
+        assert!(doc.as_table().get("mcp").is_none());
+        assert!(!doc_remove_mcp_server(&mut doc, "nosuch").unwrap());
     }
 }

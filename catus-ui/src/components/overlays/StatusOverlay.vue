@@ -81,6 +81,17 @@ function fmt(n: number) {
   gap: 6px 14px;
 }
 
+@media (max-width: 560px) {
+  .grid {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .k {
+    margin-top: 6px;
+  }
+}
+
 .k {
   color: var(--fg-dim);
 }

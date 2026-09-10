@@ -1,8 +1,30 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { useRuntimeStore } from '../stores/runtime';
 
 const store = useRuntimeStore();
+
+/** Narrow viewport (phone / narrow window): the open sidebar overlays the
+ *  chat as a drawer, and the app starts with the icon rail. */
+const narrow = ref(window.matchMedia('(max-width: 768px)').matches);
+
+function onNarrowChange(event: MediaQueryListEvent) {
+  narrow.value = event.matches;
+  // Auto-collapse when entering the narrow layout; leaving it narrow does
+  // not force the drawer back open.
+  if (event.matches) store.sidebarOpen = false;
+}
+
+function closeDrawer() {
+  store.sidebarOpen = false;
+}
+
+onMounted(() =>
+  window.matchMedia('(max-width: 768px)').addEventListener('change', onNarrowChange),
+);
+onUnmounted(() =>
+  window.matchMedia('(max-width: 768px)').removeEventListener('change', onNarrowChange),
+);
 
 function firstPrompt(summary: string): string {
   return summary.length > 50 ? `${summary.slice(0, 50)}…` : summary;
@@ -23,7 +45,12 @@ const disabledMcp = computed(() => store.mcpServers.filter((s) => !s.enabled).le
 </script>
 
 <template>
-  <aside class="sidebar" :class="{ collapsed: !store.sidebarOpen }">
+  <div
+    v-if="narrow && store.sidebarOpen"
+    class="drawer-backdrop"
+    @click="closeDrawer"
+  />
+  <aside class="sidebar" :class="{ collapsed: !store.sidebarOpen, drawer: narrow && store.sidebarOpen }">
     <button class="toggle" :title="store.sidebarOpen ? 'collapse' : 'expand'" @click="store.sidebarOpen = !store.sidebarOpen">
       {{ store.sidebarOpen ? '‹' : '›' }}
     </button>
@@ -42,6 +69,7 @@ const disabledMcp = computed(() => store.mcpServers.filter((s) => !s.enabled).le
         </button>
       </div>
       <template v-if="store.sidebarOpen">
+        <div v-if="!store.recentSessions.length" class="no-sessions">no sessions yet</div>
         <button
           v-for="s in store.recentSessions"
           :key="s.id"
@@ -76,6 +104,15 @@ const disabledMcp = computed(() => store.mcpServers.filter((s) => !s.enabled).le
       <span v-if="store.sidebarOpen" class="label">agents</span>
       <span v-if="store.sidebarOpen && disabledAgents" class="badge warn">{{ disabledAgents }}</span>
     </button>
+    <button class="entry" title="Models" @click="store.openPanel('models')">
+      <span class="icon">◆</span>
+      <span v-if="store.sidebarOpen" class="label">models</span>
+      <span v-if="store.sidebarOpen" class="badge">{{ store.models.length }}</span>
+    </button>
+    <button class="entry" title="config editor" @click="store.openConfigPage()">
+      <span class="icon">⚙</span>
+      <span v-if="store.sidebarOpen" class="label">config</span>
+    </button>
   </aside>
 </template>
 
@@ -95,6 +132,24 @@ const disabledMcp = computed(() => store.mcpServers.filter((s) => !s.enabled).le
 .sidebar.collapsed {
   width: 44px;
   align-items: center;
+}
+
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 29;
+  background: rgba(6, 8, 12, 0.6);
+}
+
+/* On narrow viewports the expanded sidebar floats over the chat as a
+   drawer; the icon rail stays in the flex flow. */
+.sidebar.drawer {
+  position: fixed;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  z-index: 30;
+  box-shadow: 4px 0 16px rgba(0, 0, 0, 0.45);
 }
 
 .sidebar.collapsed .entry,
@@ -221,6 +276,12 @@ const disabledMcp = computed(() => store.mcpServers.filter((s) => !s.enabled).le
 
 .expand:hover {
   text-decoration: underline;
+}
+
+.no-sessions {
+  color: var(--fg-dim);
+  font-size: 11px;
+  padding: 4px 8px 4px 32px;
 }
 
 .spacer {

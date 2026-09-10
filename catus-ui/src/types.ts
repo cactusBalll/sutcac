@@ -36,6 +36,17 @@ export interface ModelInfo {
   id: string;
   name: string;
   context_window: number;
+  /** The provider is skipped by serde (it carries the api key); only its name. */
+  provider_name: string;
+}
+
+/** Configuration form of one `[[models]]` entry (editable on the models page). */
+export interface ModelEntry {
+  id: string;
+  name: string;
+  /** Token count; the backend also accepts `"128k"`-style strings. */
+  context_window: number | string;
+  provider: string;
 }
 
 export type AppStatus = 'idle' | 'streaming' | 'running_tool' | 'error';
@@ -118,6 +129,10 @@ export interface ConfigScopeSnapshot {
   path: string;
   exists: boolean;
   fields: [string, string][];
+  /** `[[models]]` entries as written in this scope's file. */
+  models: ModelEntry[];
+  /** `[[mcp.servers]]` entries as written in this scope's file. */
+  mcp_servers: McpServerEntry[];
 }
 
 /** Value type of an editable config field (drives the editor widget). */
@@ -149,6 +164,22 @@ export interface McpServerInfo {
   enabled: boolean;
   connected: boolean;
   tools: string[];
+}
+
+/** Configuration form of one `[[mcp.servers]]` entry (editable on the MCP page). */
+export interface McpServerEntry {
+  name: string;
+  transport: 'stdio' | 'streamable-http';
+  /** stdio transport: the executable (resolved via PATH if relative). */
+  command: string;
+  /** stdio transport: command arguments. */
+  args: string[];
+  /** stdio transport: extra environment variables for the child process. */
+  env: Record<string, string>;
+  /** streamable-http transport: the server endpoint URL. */
+  url: string;
+  /** streamable-http transport: extra HTTP headers (e.g. Authorization). */
+  headers: Record<string, string>;
 }
 
 /** One agent definition in the snapshot's agent catalog. */

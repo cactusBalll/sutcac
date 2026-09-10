@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { nextTick, onMounted, ref } from 'vue';
 import { useRuntimeStore } from '../../stores/runtime';
 
 const props = defineProps<{
@@ -13,6 +13,14 @@ const props = defineProps<{
 
 const store = useRuntimeStore();
 const cursor = ref(props.selected ?? 0);
+const root = ref<HTMLElement | null>(null);
+const list = ref<HTMLElement | null>(null);
+
+onMounted(async () => {
+  await nextTick();
+  root.value?.focus();
+  scrollCursorIntoView();
+});
 
 function pick(item: string) {
   if (props.action === 'prefill_agent') {
@@ -24,19 +32,45 @@ function pick(item: string) {
   store.closeOverlay();
   store.pick(props.action, item);
 }
+
+function scrollCursorIntoView() {
+  const el = list.value?.children[cursor.value] as HTMLElement | undefined;
+  el?.scrollIntoView({ block: 'nearest' });
+}
+
+function move(delta: number) {
+  if (!props.items.length) return;
+  const len = props.items.length;
+  cursor.value = (((cursor.value + delta) % len) + len) % len;
+  scrollCursorIntoView();
+}
+
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    move(-1);
+  } else if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    move(1);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const item = props.items[cursor.value];
+    if (item !== undefined) pick(item);
+  }
+}
 </script>
 
 <template>
-  <div class="picker panel">
+  <div ref="root" class="picker panel" tabindex="-1" @keydown="onKeydown">
     <div class="head">{{ title }}</div>
-    <div class="items">
+    <div ref="list" class="items">
       <button
         v-for="(item, index) in items"
         :key="item"
         class="item"
         :class="{ cursor: index === cursor }"
         @click="pick(item)"
-        @mousemove="cursor = index"
+        @mouseenter="cursor = index"
       >
         <span class="marker">{{ index === cursor ? '›' : ' ' }}</span>
         {{ item }}
@@ -58,6 +92,7 @@ function pick(item: string) {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px 18px;
+  outline: none;
 }
 
 .head {
@@ -88,7 +123,7 @@ function pick(item: string) {
 
 .item.cursor {
   background: var(--accent-dim);
-  color: #fff;
+  color: var(--on-accent);
 }
 
 .marker {

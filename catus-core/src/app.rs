@@ -145,6 +145,27 @@ pub struct SubagentSummary {
     pub error: Option<String>,
 }
 
+/// One configured model in the snapshot. The provider itself is skipped by
+/// serde (it carries the api key), so only its name is exposed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModelSnapshot {
+    pub id: String,
+    pub name: String,
+    pub context_window: usize,
+    pub provider_name: String,
+}
+
+impl From<&Model> for ModelSnapshot {
+    fn from(model: &Model) -> Self {
+        ModelSnapshot {
+            id: model.id.clone(),
+            name: model.name.clone(),
+            context_window: model.context_window,
+            provider_name: model.provider.name.clone(),
+        }
+    }
+}
+
 /// Serializable snapshot of the session state for remote frontends.
 ///
 /// A frontend that cannot read `App` fields directly (e.g. a Tauri webview)
@@ -157,7 +178,7 @@ pub struct AppSnapshot {
     pub session_id: String,
     pub session_cwd: String,
     pub current_model: Model,
-    pub models: Vec<Model>,
+    pub models: Vec<ModelSnapshot>,
     pub messages: Vec<Message>,
     pub usage: Usage,
     pub request_count: usize,
@@ -344,6 +365,16 @@ pub const CONFIG_FIELD_SPECS: &[crate::config::ConfigFieldSpec] = &[
         description: "trace | debug | info | warn | error (applies on next start)",
     },
     crate::config::ConfigFieldSpec {
+        key: "agent.models.performance",
+        kind: crate::config::ConfigFieldKind::String,
+        description: "performance-tier model: a [[models]] id or name",
+    },
+    crate::config::ConfigFieldSpec {
+        key: "agent.models.efficient",
+        kind: crate::config::ConfigFieldKind::String,
+        description: "efficient-tier model (empty = falls back to performance)",
+    },
+    crate::config::ConfigFieldSpec {
         key: "agent.auto_include_skills",
         kind: crate::config::ConfigFieldKind::Bool,
         description: "append the skill catalog to the system prompt",
@@ -432,6 +463,8 @@ fn config_field_value_of(config: &crate::config::AppConfig, key: &str) -> Option
     match key {
         "agent.max_tool_rounds" => Some(config.agent.max_tool_rounds.to_string()),
         "agent.log_level" => Some(config.agent.log_level.clone()),
+        "agent.models.performance" => Some(config.agent.models.performance.clone()),
+        "agent.models.efficient" => Some(config.agent.models.efficient.clone().unwrap_or_default()),
         "agent.auto_include_skills" => Some(config.agent.auto_include_skills.to_string()),
         "agent.memory.enabled" => Some(config.agent.memory.enabled.to_string()),
         "agent.memory.auto_recall" => Some(config.agent.memory.auto_recall.to_string()),
@@ -461,6 +494,34 @@ fn workspace_overrides_key(key: &str) -> Result<bool, Box<dyn std::error::Error>
     }
     let value = crate::config::read_config_toml(&path)?;
     Ok(crate::config::value_get_dotted(&value, key).is_some())
+}
+
+/// The merged effective TOML for a scope-aware edit: global-base +
+/// workspace-over (the same rule as config loading), with the edited
+/// scope's file standing in for its side of the merge. `edited` is the
+/// document as it will be written to the scope's file.
+fn merged_scope_toml(
+    scope: crate::config::ConfigScope,
+    edited: &str,
+) -> Result<toml::Value, Box<dyn std::error::Error>> {
+    use crate::config::{merge_toml_values, read_config_toml};
+    let edited_value: toml::Value =
+        toml::from_str(edited).map_err(|e| format!("invalid TOML produced by the edit: {}", e))?;
+    match scope {
+        crate::config::ConfigScope::Workspace => {
+            // The global file is the base; the edited workspace overlays it.
+            let mut merged = read_config_toml(&crate::config::xdg_config_path())?;
+            merge_toml_values(&mut merged, &edited_value);
+            Ok(merged)
+        }
+        crate::config::ConfigScope::Global => {
+            // The edited global file is the base; the workspace overlays it.
+            let mut merged = edited_value;
+            let ws = read_config_toml(&crate::config::workspace_config_path())?;
+            merge_toml_values(&mut merged, &ws);
+            Ok(merged)
+        }
+    }
 }
 
 /// Built-in default for an editable config key (used when neither scope
@@ -1219,7 +1280,7 @@ impl App {
             session_id: self.session_id.clone(),
             session_cwd: self.session_cwd.clone(),
             current_model: self.current_model.clone(),
-            models: self.models.clone(),
+            models: self.models.iter().map(ModelSnapshot::from).collect(),
             messages: self.messages.clone(),
             usage: self.usage,
             request_count: self.request_count,
@@ -1462,8 +1523,10 @@ impl App {
     }
 
     /// Connect to one configured MCP server on demand (the web UI's connect
-    /// action). Servers already connected are reported as such; the gateway
-    /// tool is registered after a successful connect.
+    /// action). An already-connected server is disconnected first, so this
+    /// doubles as a reconnect for dead connections (e.g. an exited stdio
+    /// child that still sits in the connection map); the gateway tool is
+    /// registered after a successful connect.
     pub async fn connect_mcp_server(
         &mut self,
         name: &str,
@@ -1478,13 +1541,12 @@ impl App {
         if self.disabled_mcp.contains(name) {
             return Err(format!("mcp server '{}' is disabled; enable it first", name).into());
         }
-        if self
-            .mcp_manager
-            .as_ref()
-            .map(|m| m.is_connected(name))
-            .unwrap_or(false)
-        {
-            return Ok(format!("mcp server '{}' is already connected", name));
+        let mut verb = "connected";
+        if let Some(manager) = &self.mcp_manager {
+            if manager.is_connected(name) {
+                verb = "reconnected";
+                manager.disconnect(name);
+            }
         }
         let manager = self
             .mcp_manager
@@ -1497,8 +1559,181 @@ impl App {
         self.rebuild_toolbox();
         self.persist_session();
         Ok(format!(
-            "connected mcp server '{}' ({} tool(s))",
-            name, count
+            "{} mcp server '{}' ({} tool(s))",
+            verb, name, count
+        ))
+    }
+
+    /// Check one prospective `[[mcp.servers]]` entry is usable: the name is
+    /// set, and the entry carries the fields its transport requires.
+    fn validate_mcp_server(
+        server: &crate::config::McpServerConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::config::McpTransport;
+
+        if server.name.trim().is_empty() {
+            return Err("mcp server name must not be empty".into());
+        }
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.trim().is_empty() {
+                    return Err(format!(
+                        "mcp server '{}' needs a command for the stdio transport",
+                        server.name
+                    )
+                    .into());
+                }
+            }
+            McpTransport::StreamableHttp => {
+                let url = server.url.as_deref().unwrap_or("").trim();
+                if url.is_empty() {
+                    return Err(format!(
+                        "mcp server '{}' needs a url for the streamable-http transport",
+                        server.name
+                    )
+                    .into());
+                }
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(format!(
+                        "mcp server '{}' url must start with http:// or https://",
+                        server.name
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert or update one `[[mcp.servers]]` entry in one scope
+    /// (`workspace` or `global`), writing the entry into that scope's TOML
+    /// file while preserving all untouched content (comments, formatting,
+    /// unknown keys). The name is the entry key: renaming means removing the
+    /// entry and adding it again.
+    ///
+    /// On success the runtime adopts the merged effective server list; a
+    /// changed entry's live connection is dropped so the next connect uses
+    /// the new configuration.
+    pub fn upsert_mcp_server_in(
+        &mut self,
+        scope: crate::config::ConfigScope,
+        server: crate::config::McpServerConfig,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use crate::config::{doc_upsert_mcp_server, mcp_servers_from_toml};
+
+        Self::validate_mcp_server(&server)?;
+        let old = self
+            .config
+            .mcp
+            .as_ref()
+            .and_then(|m| m.servers.iter().find(|s| s.name == server.name))
+            .cloned();
+
+        let path = crate::config::scope_config_path(scope);
+        let mut doc: toml_edit::DocumentMut = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or_default();
+        // Whether the entry was already defined in this scope's file.
+        let existed = {
+            let before: toml::Value = toml::from_str(&doc.to_string())
+                .map_err(|e| format!("invalid TOML in {}: {}", path.display(), e))?;
+            mcp_servers_from_toml(&before)?
+                .unwrap_or_default()
+                .iter()
+                .any(|s| s.name == server.name)
+        };
+        doc_upsert_mcp_server(&mut doc, &server)?;
+
+        // Validate against the merged configuration that results from this
+        // edit: always global-base + workspace-over, with the edited scope's
+        // file (as it will be written) standing in for its side of the merge.
+        let merged = merged_scope_toml(scope, &doc.to_string())?;
+        let servers = mcp_servers_from_toml(&merged)?.unwrap_or_default();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, doc.to_string())?;
+
+        // Adopt the effective list; a stale connection for a changed entry
+        // is dropped so the next connect uses the new configuration.
+        let changed = old.as_ref() != Some(&server);
+        self.config.mcp = Some(crate::config::McpConfig { servers });
+        if changed {
+            if let Some(manager) = &self.mcp_manager {
+                manager.disconnect(&server.name);
+            }
+        }
+        self.rebuild_toolbox();
+        self.persist_session();
+        let verb = if existed { "updated" } else { "added" };
+        Ok(format!(
+            "{} mcp server '{}' in {}",
+            verb,
+            server.name,
+            path.display()
+        ))
+    }
+
+    /// Remove one `[[mcp.servers]]` entry (matched by `name`) from one
+    /// scope. The runtime adopts the remaining effective list; a connection
+    /// to a server that is no longer effective is dropped.
+    pub fn remove_mcp_server_in(
+        &mut self,
+        scope: crate::config::ConfigScope,
+        name: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use crate::config::{ConfigScope, doc_remove_mcp_server, mcp_servers_from_toml};
+
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("mcp server name must not be empty".into());
+        }
+        let path = crate::config::scope_config_path(scope);
+        if !path.exists() {
+            return Err(format!("no config file at {}", path.display()).into());
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .map_err(|e| format!("invalid TOML in {}: {}", path.display(), e))?;
+        if !doc_remove_mcp_server(&mut doc, name)? {
+            return Err(
+                format!("mcp server '{}' is not defined in {}", name, path.display()).into(),
+            );
+        }
+
+        // Validate the merged configuration that results from this removal.
+        let merged = merged_scope_toml(scope, &doc.to_string())?;
+        let servers = mcp_servers_from_toml(&merged)?.unwrap_or_default();
+
+        std::fs::write(&path, doc.to_string())?;
+
+        self.config.mcp = Some(crate::config::McpConfig { servers });
+        let still_effective = self
+            .config
+            .mcp
+            .as_ref()
+            .is_some_and(|m| m.servers.iter().any(|s| s.name == name));
+        if !still_effective {
+            if let Some(manager) = &self.mcp_manager {
+                manager.disconnect(name);
+            }
+        }
+        self.rebuild_toolbox();
+        self.persist_session();
+
+        let mut note = String::new();
+        if still_effective && scope == ConfigScope::Global {
+            note =
+                "; note: the workspace config still defines this server, so it remains effective"
+                    .to_string();
+        }
+        Ok(format!(
+            "removed mcp server '{}' from {}{}",
+            name,
+            path.display(),
+            note
         ))
     }
 
@@ -1770,6 +2005,40 @@ impl App {
             .join(", ")
     }
 
+    /// Set the `[agent.models]` tier mapping (`performance` or `efficient`)
+    /// to a configured model (matched by id or display name) and save the
+    /// change: to the workspace config when it exists, otherwise to the XDG
+    /// config. The reference is validated before the file is written; on
+    /// success the tier resolution is refreshed for future subagents.
+    pub fn set_tier_model(
+        &mut self,
+        tier: crate::config::ModelTier,
+        reference: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(format!("usage: /model set-{} <model-id-or-name>", tier.as_str()).into());
+        }
+        let key = format!("agent.models.{}", tier.as_str());
+        let scope = if crate::config::workspace_config_path().exists() {
+            crate::config::ConfigScope::Workspace
+        } else {
+            crate::config::ConfigScope::Global
+        };
+        self.set_config_field_in(scope, &key, reference)?;
+        // Report the resolved display name when the reference matches one.
+        let label = self
+            .models
+            .iter()
+            .find(|m| {
+                m.id == reference
+                    || (!m.display_name().trim().is_empty() && m.display_name() == reference)
+            })
+            .map(|m| m.display_name().to_string())
+            .unwrap_or_else(|| reference.to_string());
+        Ok(format!("{} model set to {}", tier.as_str(), label))
+    }
+
     /// Update a single config field by key, save the config file, and refresh
     /// any runtime component that depends on the changed value.
     pub fn set_config_field(
@@ -1795,6 +2064,10 @@ impl App {
     /// Effects by field:
     /// - `agent.max_tool_rounds` — applied to the live turn loop.
     /// - `agent.log_level` — config only; picked up on the next start.
+    /// - `agent.models.performance` / `agent.models.efficient` — config +
+    ///   tier resolution; an empty `efficient` unsets it (falls back to
+    ///   `performance`), an empty `performance` is rejected. The reference
+    ///   must match a configured `[[models]]` id or name.
     /// - `agent.auto_include_skills` — rebuilds the system prompt in place.
     /// - `agent.memory.enabled` — config; also syncs the session toggle so
     ///   the change is visible immediately when memory is available.
@@ -1811,6 +2084,35 @@ impl App {
                 self.max_tool_rounds = self.config.agent.max_tool_rounds;
             }
             "agent.log_level" => self.config.agent.log_level = value.to_string(),
+            "agent.models.performance" | "agent.models.efficient" => {
+                let reference = value.trim().to_string();
+                // Validate on a copy first so a rejected value (unknown
+                // model reference, empty performance tier) leaves both the
+                // config and the runtime state untouched.
+                let mut config = self.config.clone();
+                if key == "agent.models.performance" {
+                    if reference.is_empty() {
+                        return Err(
+                            "[agent.models].performance is required; set it to a [[models]] \
+                             id or name"
+                                .into(),
+                        );
+                    }
+                    config.agent.models.performance = reference;
+                } else {
+                    // An empty efficient tier unsets it (falls back to
+                    // performance).
+                    config.agent.models.efficient = (!reference.is_empty()).then_some(reference);
+                }
+                let tiers = config
+                    .resolve_tier_models(&self.models)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                self.config = config;
+                // Subagents resolve their tier through the parent's tier
+                // mapping, so keep the manager's snapshot in sync.
+                self.subagents.update_parent_tier_models(tiers);
+                self.persist_session();
+            }
             "agent.auto_include_skills" => {
                 self.config.agent.auto_include_skills = parse_bool_value(key, value)?;
                 let prompt =
@@ -1877,32 +2179,33 @@ impl App {
             .and_then(|text| text.parse().ok())
             .unwrap_or_default();
         doc_set_dotted(&mut doc, key, item)?;
+
+        // Apply the runtime effect before persisting: a value that fails
+        // validation (e.g. a tier reference no configured model matches)
+        // then leaves both the file and the runtime state untouched.
+        let overridden = matches!(scope, ConfigScope::Global) && workspace_overrides_key(key)?;
+        if !overridden {
+            self.apply_config_field_effect(key, value)?;
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, doc.to_string())?;
 
-        match scope {
-            ConfigScope::Workspace => {
-                self.apply_config_field_effect(key, value)?;
-                Ok(format!(
-                    "saved {} to {} (workspace override)",
-                    key,
-                    path.display()
-                ))
-            }
-            ConfigScope::Global => {
-                if workspace_overrides_key(key)? {
-                    Ok(format!(
-                        "saved {} to {}; note: the workspace config overrides this key, so the effective value is unchanged",
-                        key,
-                        path.display()
-                    ))
-                } else {
-                    self.apply_config_field_effect(key, value)?;
-                    Ok(format!("saved {} to {}", key, path.display()))
-                }
-            }
+        if overridden {
+            Ok(format!(
+                "saved {} to {}; note: the workspace config overrides this key, so the effective value is unchanged",
+                key,
+                path.display()
+            ))
+        } else if scope == ConfigScope::Workspace {
+            Ok(format!(
+                "saved {} to {} (workspace override)",
+                key,
+                path.display()
+            ))
+        } else {
+            Ok(format!("saved {} to {}", key, path.display()))
         }
     }
 
@@ -1928,14 +2231,21 @@ impl App {
         if !removed {
             return Err(format!("{} is not set in {}", key, path.display()).into());
         }
-        std::fs::write(&path, doc.to_string())?;
 
-        let merged = crate::config::merged_config_toml()?;
+        // The effective value after the removal: global-base + workspace-over
+        // (the same rule as config loading) with the edited scope's file (the
+        // key gone) standing in for its side of the merge.
+        let merged = merged_scope_toml(scope, &doc.to_string())?;
         let effective = value_get_dotted(&merged, key)
             .map(toml_display_value)
             .or_else(|| default_config_field(key))
             .ok_or_else(|| format!("unknown config field: {}", key))?;
+
+        // Apply the runtime effect before persisting: an effective value
+        // that fails validation (e.g. no performance tier left) then leaves
+        // the file untouched and the key still set.
         self.apply_config_field_effect(key, &effective)?;
+        std::fs::write(&path, doc.to_string())?;
         Ok(format!(
             "removed {} from {}; effective value: {}",
             key,
@@ -1944,10 +2254,204 @@ impl App {
         ))
     }
 
+    /// Insert or update one `[[models]]` entry in one scope (`workspace` or
+    /// `global`), writing the entry into that scope's TOML file while
+    /// preserving all untouched content (comments, formatting, unknown keys).
+    ///
+    /// The edit is validated against the merged effective configuration that
+    /// results from it: the id/provider must be set, the provider must exist,
+    /// and the `[agent.models]` tier references must still resolve. On
+    /// success the runtime re-resolves its model list and keeps the current
+    /// model in sync (falling back to the performance-tier model when it was
+    /// replaced).
+    pub fn upsert_model_in(
+        &mut self,
+        scope: crate::config::ConfigScope,
+        entry: crate::config::ModelEntry,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use crate::config::{doc_upsert_model, models_from_toml};
+
+        if entry.id.trim().is_empty() {
+            return Err("model id must not be empty".into());
+        }
+        if entry.provider.trim().is_empty() {
+            return Err(format!("model '{}' must reference a provider", entry.id).into());
+        }
+
+        let mut doc: toml_edit::DocumentMut =
+            std::fs::read_to_string(crate::config::scope_config_path(scope))
+                .ok()
+                .and_then(|text| text.parse().ok())
+                .unwrap_or_default();
+        doc_upsert_model(&mut doc, &entry)?;
+
+        // Validate against the merged configuration that results from this
+        // edit: always global-base + workspace-over, with the edited scope's
+        // file (as it will be written) standing in for its side of the merge.
+        let merged = merged_scope_toml(scope, &doc.to_string())?;
+        let models = models_from_toml(&merged)?.unwrap_or_default();
+        Self::validate_model_entries(&self.config, &models)?;
+        let existed = models.iter().any(|m| m.id == entry.id);
+        let path = crate::config::scope_config_path(scope);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, doc.to_string())?;
+
+        self.refresh_models(models)?;
+        let verb = if existed { "updated" } else { "added" };
+        Ok(format!(
+            "{} model '{}' in {}",
+            verb,
+            entry.id,
+            path.display()
+        ))
+    }
+
+    /// Remove one `[[models]]` entry (matched by `id`) from one scope. The
+    /// remaining effective configuration must still satisfy
+    /// [`Self::validate_model_entries`], so removing a model referenced by
+    /// `[agent.models]` is rejected. On success the runtime re-resolves its
+    /// model list.
+    pub fn remove_model_in(
+        &mut self,
+        scope: crate::config::ConfigScope,
+        id: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        use crate::config::{ConfigScope, doc_remove_model, models_from_toml, read_config_toml};
+
+        let id = id.trim();
+        if id.is_empty() {
+            return Err("model id must not be empty".into());
+        }
+        let path = crate::config::scope_config_path(scope);
+        if !path.exists() {
+            return Err(format!("no config file at {}", path.display()).into());
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let mut doc: toml_edit::DocumentMut = text
+            .parse()
+            .map_err(|e| format!("invalid TOML in {}: {}", path.display(), e))?;
+        if !doc_remove_model(&mut doc, id)? {
+            return Err(format!("model '{}' is not defined in {}", id, path.display()).into());
+        }
+
+        // Validate the merged configuration that results from this removal.
+        let merged = merged_scope_toml(scope, &doc.to_string())?;
+        let models = models_from_toml(&merged)?.unwrap_or_default();
+        Self::validate_model_entries(&self.config, &models)?;
+
+        std::fs::write(&path, doc.to_string())?;
+
+        self.refresh_models(models)?;
+        // The id may still be effective through the other scope.
+        let mut note = String::new();
+        if scope == ConfigScope::Global {
+            let ws = read_config_toml(&crate::config::workspace_config_path())?;
+            if let Some(models) = models_from_toml(&ws)? {
+                if models.iter().any(|m| m.id == id) {
+                    note = "; note: the workspace config still defines this id, so it remains effective"
+                        .to_string();
+                }
+            }
+        }
+        Ok(format!(
+            "removed model '{}' from {}{}",
+            id,
+            path.display(),
+            note
+        ))
+    }
+
+    /// Check that a prospective effective `[[models]]` list is usable: every
+    /// entry needs an id and an existing provider, and the `[agent.models]`
+    /// tier references (merged config) must still match a configured model.
+    fn validate_model_entries(
+        config: &AppConfig,
+        models: &[crate::config::ModelEntry],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for model in models {
+            if model.id.trim().is_empty() {
+                return Err("a [[models]] entry is missing its id".into());
+            }
+            if config.providers.iter().all(|p| p.name != model.provider) {
+                return Err(format!(
+                    "model '{}' references unknown provider '{}'",
+                    model.id, model.provider
+                )
+                .into());
+            }
+        }
+        let matches = |reference: &str| {
+            models.iter().any(|m| {
+                m.id == reference || (!m.name.trim().is_empty() && m.name.trim() == reference)
+            })
+        };
+        let performance = config.agent.models.performance.trim();
+        if performance.is_empty() || !matches(performance) {
+            return Err(format!(
+                "[agent.models].performance '{}' does not match any configured [[models]] id or name",
+                performance
+            )
+            .into());
+        }
+        if let Some(efficient) = config
+            .agent
+            .models
+            .efficient
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !matches(efficient) {
+                return Err(format!(
+                    "[agent.models].efficient '{}' does not match any configured [[models]] id or name",
+                    efficient
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Adopt a new effective `[[models]]` list into the runtime: re-resolve
+    /// the model list, keep the current model in sync (or fall back to the
+    /// performance-tier model when it disappeared), and persist the session.
+    fn refresh_models(
+        &mut self,
+        models: Vec<crate::config::ModelEntry>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.config.models = models;
+        self.models = self
+            .config
+            .resolve_models()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        if let Some(model) = self.models.iter().find(|m| m.id == self.current_model.id) {
+            self.current_model = model.clone();
+        } else {
+            let tiers = self
+                .config
+                .resolve_tier_models(&self.models)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            self.current_model = tiers.performance;
+        }
+        self.rebuild_client();
+        // Tier-less subagent definitions resolve against the parent's current
+        // model, so keep the subagent manager's snapshot in sync.
+        self.subagents
+            .update_parent_model(self.current_model.clone());
+        self.persist_session();
+        Ok(())
+    }
+
     /// Per-scope config state for editor frontends: both config files with
-    /// the values of the editable keys as written in each of them.
+    /// the values of the editable keys and the `[[models]]` entries as
+    /// written in each of them.
     pub fn config_scopes(&self) -> Vec<crate::config::ConfigScopeSnapshot> {
-        use crate::config::{ConfigScope, toml_display_value, value_get_dotted};
+        use crate::config::{
+            ConfigScope, mcp_servers_from_toml, models_from_toml, toml_display_value,
+            value_get_dotted,
+        };
 
         [ConfigScope::Workspace, ConfigScope::Global]
             .into_iter()
@@ -1970,11 +2474,23 @@ impl App {
                         (spec.key.to_string(), value)
                     })
                     .collect();
+                let models = parsed
+                    .as_ref()
+                    .and_then(|v| models_from_toml(v).ok())
+                    .flatten()
+                    .unwrap_or_default();
+                let mcp_servers = parsed
+                    .as_ref()
+                    .and_then(|v| mcp_servers_from_toml(v).ok())
+                    .flatten()
+                    .unwrap_or_default();
                 crate::config::ConfigScopeSnapshot {
                     scope,
                     path: path.display().to_string(),
                     exists,
                     fields,
+                    models,
+                    mcp_servers,
                 }
             })
             .collect()
@@ -3777,6 +4293,8 @@ mod tests {
         let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"agent.max_tool_rounds"));
         assert!(keys.contains(&"agent.log_level"));
+        assert!(keys.contains(&"agent.models.performance"));
+        assert!(keys.contains(&"agent.models.efficient"));
         assert!(!keys.iter().any(|k| k.starts_with("api.")));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3815,6 +4333,385 @@ log_level = "info"
 
         let saved = std::fs::read_to_string(&config_path).unwrap();
         assert!(saved.contains("max_tool_rounds = 12"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_tier_model_updates_config_and_subagent_tiers() {
+        let dir = std::env::temp_dir().join(format!("catus_tier_model_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _xdg = isolate_xdg_config(&dir);
+        let _ws = isolate_workspace(&dir);
+
+        // Global config with two models; no workspace config file yet, so
+        // tier edits land in the global file.
+        let global = r#"
+[[providers]]
+name = "test"
+base_url = "https://example.com/v1"
+api_key = "test"
+
+[[models]]
+id = "test-model"
+provider = "test"
+
+[[models]]
+id = "fast-model"
+provider = "test"
+
+[agent.models]
+performance = "test-model"
+"#;
+        std::fs::create_dir_all(crate::config::xdg_catus_dir()).unwrap();
+        std::fs::write(crate::config::xdg_config_path(), global).unwrap();
+
+        let mut config = test_config_with_history_dir(&dir);
+        config.models.push(crate::config::ModelEntry {
+            id: "fast-model".to_string(),
+            name: String::new(),
+            context_window: 2048,
+            provider: "test".to_string(),
+        });
+        let mut app = App::new(config);
+        assert_eq!(
+            app.subagents.parent_tier_models_for_test().efficient.id,
+            "test-model"
+        );
+
+        // Setting the efficient tier updates the config, the resolved tiers
+        // for future subagents, and the global file.
+        let msg = app
+            .set_tier_model(
+                crate::config::ModelTier::parse("efficient").unwrap(),
+                "fast-model",
+            )
+            .unwrap();
+        assert!(msg.contains("efficient"), "unexpected message: {}", msg);
+        assert_eq!(
+            app.config.agent.models.efficient.as_deref(),
+            Some("fast-model")
+        );
+        assert_eq!(
+            app.subagents.parent_tier_models_for_test().efficient.id,
+            "fast-model"
+        );
+        let saved = std::fs::read_to_string(crate::config::xdg_config_path()).unwrap();
+        assert!(saved.contains("efficient = \"fast-model\""));
+        // Untouched content survives the edit.
+        assert!(saved.contains("performance = \"test-model\""));
+
+        // A reference that matches no model is rejected without touching
+        // the file or the runtime state.
+        let before = std::fs::read_to_string(crate::config::xdg_config_path()).unwrap();
+        assert!(
+            app.set_tier_model(
+                crate::config::ModelTier::parse("efficient").unwrap(),
+                "nosuch"
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::config::xdg_config_path()).unwrap(),
+            before
+        );
+        assert_eq!(
+            app.subagents.parent_tier_models_for_test().efficient.id,
+            "fast-model"
+        );
+
+        // Clearing the efficient tier falls back to the performance model.
+        app.remove_config_field_in(crate::config::ConfigScope::Global, "agent.models.efficient")
+            .unwrap();
+        assert_eq!(app.config.agent.models.efficient, None);
+        assert_eq!(
+            app.subagents.parent_tier_models_for_test().efficient.id,
+            "test-model"
+        );
+
+        // Removing the performance tier is rejected: no fallback remains,
+        // and the file keeps the key.
+        let before = std::fs::read_to_string(crate::config::xdg_config_path()).unwrap();
+        assert!(
+            app.remove_config_field_in(
+                crate::config::ConfigScope::Global,
+                "agent.models.performance",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::config::xdg_config_path()).unwrap(),
+            before
+        );
+
+        // Once a workspace config file exists, tier edits go there.
+        std::fs::create_dir_all(crate::config::workspace_config_path().parent().unwrap()).unwrap();
+        std::fs::write(
+            crate::config::workspace_config_path(),
+            "[agent.models]\nperformance = \"test-model\"\n",
+        )
+        .unwrap();
+        app.set_tier_model(
+            crate::config::ModelTier::parse("efficient").unwrap(),
+            "fast-model",
+        )
+        .unwrap();
+        let saved = std::fs::read_to_string(crate::config::workspace_config_path()).unwrap();
+        assert!(saved.contains("efficient = \"fast-model\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn model_command_set_tier_updates_config() {
+        let dir = std::env::temp_dir().join(format!("catus_tier_cmd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _xdg = isolate_xdg_config(&dir);
+        let _ws = isolate_workspace(&dir);
+
+        let global = r#"
+[[providers]]
+name = "test"
+base_url = "https://example.com/v1"
+api_key = "test"
+
+[[models]]
+id = "test-model"
+provider = "test"
+
+[agent.models]
+performance = "test-model"
+"#;
+        std::fs::create_dir_all(crate::config::xdg_catus_dir()).unwrap();
+        std::fs::write(crate::config::xdg_config_path(), global).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+
+        let outcome = app.handle_command("/model set-efficient test-model").await;
+        assert!(outcome.handled);
+        assert!(
+            app.status_message.contains("efficient model set to"),
+            "unexpected status: {}",
+            app.status_message
+        );
+        assert_eq!(
+            app.config.agent.models.efficient.as_deref(),
+            Some("test-model")
+        );
+        let saved = std::fs::read_to_string(crate::config::xdg_config_path()).unwrap();
+        assert!(saved.contains("efficient = \"test-model\""));
+
+        // A reference matching no configured model surfaces the validation
+        // error without changing the effective tier.
+        assert!(
+            app.handle_command("/model set-efficient nosuch")
+                .await
+                .handled
+        );
+        assert!(
+            app.status_message.contains("does not match any configured"),
+            "unexpected status: {}",
+            app.status_message
+        );
+        assert_eq!(
+            app.config.agent.models.efficient.as_deref(),
+            Some("test-model")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_remove_mcp_server_in_edits_scopes_and_runtime() {
+        let dir = std::env::temp_dir().join(format!("catus_mcp_edit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _xdg = isolate_xdg_config(&dir);
+        let _ws = isolate_workspace(&dir);
+
+        let global = r#"
+[[providers]]
+name = "test"
+base_url = "https://example.com/v1"
+api_key = "test"
+
+[[models]]
+id = "test-model"
+provider = "test"
+
+[agent.models]
+performance = "test-model"
+
+[[mcp.servers]]
+name = "calc"
+command = "calc-server"
+"#;
+        std::fs::create_dir_all(crate::config::xdg_catus_dir()).unwrap();
+        std::fs::write(crate::config::xdg_config_path(), global).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+
+        // The scope snapshot lists the global mcp server entry.
+        let scopes = app.config_scopes();
+        assert_eq!(scopes[1].mcp_servers.len(), 1);
+        assert_eq!(scopes[0].mcp_servers.len(), 0);
+
+        // Validation failures leave the file untouched.
+        let before = std::fs::read_to_string(crate::config::xdg_config_path()).unwrap();
+        for server in [
+            crate::config::McpServerConfig {
+                name: "bad".to_string(),
+                transport: crate::config::McpTransport::Stdio,
+                command: String::new(),
+                ..Default::default()
+            },
+            crate::config::McpServerConfig {
+                name: "bad".to_string(),
+                transport: crate::config::McpTransport::StreamableHttp,
+                url: None,
+                ..Default::default()
+            },
+            crate::config::McpServerConfig {
+                name: "bad".to_string(),
+                transport: crate::config::McpTransport::StreamableHttp,
+                url: Some("ftp://example.com".to_string()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                app.upsert_mcp_server_in(crate::config::ConfigScope::Global, server)
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(crate::config::xdg_config_path()).unwrap(),
+            before
+        );
+
+        // Adding a remote server writes the entry and adopts the effective
+        // list into the runtime.
+        let msg = app
+            .upsert_mcp_server_in(
+                crate::config::ConfigScope::Global,
+                crate::config::McpServerConfig {
+                    name: "remote".to_string(),
+                    transport: crate::config::McpTransport::StreamableHttp,
+                    url: Some("https://mcp.example.com/mcp".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(msg.contains("added"), "unexpected message: {}", msg);
+        let saved = std::fs::read_to_string(crate::config::xdg_config_path()).unwrap();
+        assert!(saved.contains("name = \"remote\""));
+        assert!(saved.contains("transport = \"streamable-http\""));
+        let effective = app.config.mcp.as_ref().unwrap();
+        assert!(effective.servers.iter().any(|s| s.name == "remote"));
+        let catalog = app.mcp_catalog();
+        assert!(catalog.iter().any(|s| s.name == "remote" && !s.connected));
+
+        // Updating an existing entry keeps its slot and updates the runtime.
+        let msg = app
+            .upsert_mcp_server_in(
+                crate::config::ConfigScope::Global,
+                crate::config::McpServerConfig {
+                    name: "calc".to_string(),
+                    transport: crate::config::McpTransport::Stdio,
+                    command: "calc-server-v2".to_string(),
+                    args: vec!["--verbose".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(msg.contains("updated"), "unexpected message: {}", msg);
+        let effective = &app.config.mcp.as_ref().unwrap().servers;
+        let calc = effective.iter().find(|s| s.name == "calc").unwrap();
+        assert_eq!(calc.command, "calc-server-v2");
+        assert_eq!(calc.args, vec!["--verbose".to_string()]);
+
+        // A workspace override wins over the global entry (matched by name).
+        app.upsert_mcp_server_in(
+            crate::config::ConfigScope::Workspace,
+            crate::config::McpServerConfig {
+                name: "calc".to_string(),
+                transport: crate::config::McpTransport::Stdio,
+                command: "workspace-calc".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let effective = &app.config.mcp.as_ref().unwrap().servers;
+        assert_eq!(
+            effective.iter().find(|s| s.name == "calc").unwrap().command,
+            "workspace-calc"
+        );
+        let scopes = app.config_scopes();
+        assert!(scopes[0].mcp_servers.iter().any(|s| s.name == "calc"));
+        assert!(scopes[1].mcp_servers.iter().any(|s| s.name == "calc"));
+
+        // Removing the global entry is noted: the workspace still defines
+        // the server, so it remains effective.
+        let msg = app
+            .remove_mcp_server_in(crate::config::ConfigScope::Global, "calc")
+            .unwrap();
+        assert!(msg.contains("remains effective"), "unexpected: {}", msg);
+        assert!(
+            app.config
+                .mcp
+                .as_ref()
+                .unwrap()
+                .servers
+                .iter()
+                .any(|s| s.name == "calc")
+        );
+
+        // Bringing the global entry back loses against the workspace value.
+        app.upsert_mcp_server_in(
+            crate::config::ConfigScope::Global,
+            crate::config::McpServerConfig {
+                name: "calc".to_string(),
+                transport: crate::config::McpTransport::Stdio,
+                command: "calc-server-v2".to_string(),
+                args: vec!["--verbose".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let effective = &app.config.mcp.as_ref().unwrap().servers;
+        assert_eq!(
+            effective.iter().find(|s| s.name == "calc").unwrap().command,
+            "workspace-calc"
+        );
+
+        // Removing the workspace entry falls back to the global command.
+        let msg = app
+            .remove_mcp_server_in(crate::config::ConfigScope::Workspace, "calc")
+            .unwrap();
+        assert!(
+            !msg.contains("remains effective"),
+            "unexpected note: {}",
+            msg
+        );
+        let effective = &app.config.mcp.as_ref().unwrap().servers;
+        assert_eq!(
+            effective.iter().find(|s| s.name == "calc").unwrap().command,
+            "calc-server-v2"
+        );
+
+        // Removing a server not defined in the scope fails.
+        assert!(
+            app.remove_mcp_server_in(crate::config::ConfigScope::Workspace, "nosuch")
+                .is_err()
+        );
+
+        // Removing the global entry now drops it from the effective list.
+        app.remove_mcp_server_in(crate::config::ConfigScope::Global, "calc")
+            .unwrap();
+        let effective = &app.config.mcp.as_ref().unwrap().servers;
+        assert!(!effective.iter().any(|s| s.name == "calc"));
+        assert!(effective.iter().any(|s| s.name == "remote"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4352,6 +5249,154 @@ log_level = "info"
             _lock: lock,
             previous,
         }
+    }
+
+    /// Serialize current-directory changes and point the workspace config
+    /// path (`current_dir/.sutcac/config.toml`) into a scratch directory for
+    /// the guard's lifetime.
+    static WORKSPACE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct WorkspaceGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: std::path::PathBuf,
+    }
+
+    impl Drop for WorkspaceGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    fn isolate_workspace(base: &std::path::Path) -> WorkspaceGuard {
+        let lock = WORKSPACE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::env::set_current_dir(&work).unwrap();
+        WorkspaceGuard {
+            _lock: lock,
+            previous,
+        }
+    }
+
+    #[test]
+    fn upsert_model_in_adds_updates_and_refreshes_runtime() {
+        let dir = std::env::temp_dir().join(format!("catus_upsert_model_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _xdg = isolate_xdg_config(&dir);
+        let _ws = isolate_workspace(&dir);
+
+        let global = r#"
+[[providers]]
+name = "test"
+base_url = "https://example.com/v1"
+api_key = "test"
+
+[[models]]
+id = "test-model"
+name = "Test Model"
+provider = "test"
+
+[agent.models]
+performance = "test-model"
+"#;
+        std::fs::create_dir_all(crate::config::xdg_catus_dir()).unwrap();
+        std::fs::write(crate::config::xdg_config_path(), global).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        // The scope snapshot lists the global model entry.
+        let scopes = app.config_scopes();
+        assert_eq!(scopes[1].models.len(), 1);
+        assert_eq!(scopes[0].models.len(), 0);
+
+        // Adding a model writes the entry and refreshes the runtime list.
+        app.upsert_model_in(
+            crate::config::ConfigScope::Global,
+            crate::config::ModelEntry {
+                id: "m2".to_string(),
+                name: "Model Two".to_string(),
+                context_window: 8192,
+                provider: "test".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(app.models.iter().any(|m| m.id == "m2"));
+        let saved = std::fs::read_to_string(crate::config::xdg_config_path()).unwrap();
+        assert!(saved.contains("id = \"m2\""));
+
+        // Updating the same id in the workspace scope writes an override and
+        // keeps the id effective.
+        app.upsert_model_in(
+            crate::config::ConfigScope::Workspace,
+            crate::config::ModelEntry {
+                id: "m2".to_string(),
+                name: "Workspace Two".to_string(),
+                context_window: 0,
+                provider: "test".to_string(),
+            },
+        )
+        .unwrap();
+        let scopes = app.config_scopes();
+        assert!(scopes[0].models.iter().any(|m| m.id == "m2"));
+        let saved = std::fs::read_to_string(crate::config::workspace_config_path()).unwrap();
+        assert!(saved.contains("name = \"Workspace Two\""));
+
+        // Unknown providers are rejected without touching the file.
+        let before = std::fs::read_to_string(crate::config::workspace_config_path()).unwrap();
+        assert!(
+            app.upsert_model_in(
+                crate::config::ConfigScope::Workspace,
+                crate::config::ModelEntry {
+                    id: "m3".to_string(),
+                    name: String::new(),
+                    context_window: 0,
+                    provider: "nosuch".to_string(),
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::config::workspace_config_path()).unwrap(),
+            before
+        );
+
+        // Removing a model not defined in the scope fails.
+        assert!(
+            app.remove_model_in(crate::config::ConfigScope::Workspace, "test-model")
+                .is_err()
+        );
+
+        // Removing the performance-tier model is rejected.
+        assert!(
+            app.remove_model_in(crate::config::ConfigScope::Global, "test-model")
+                .is_err()
+        );
+
+        // Removing a non-tier model works; when it is the current model the
+        // runtime falls back to the performance-tier model.
+        app.set_model("m2").unwrap();
+        assert_eq!(app.current_model.id, "m2");
+        let msg = app
+            .remove_model_in(crate::config::ConfigScope::Global, "m2")
+            .unwrap();
+        // The workspace still defines m2, so it remains effective.
+        assert!(msg.contains("remains effective"));
+        assert!(app.models.iter().any(|m| m.id == "m2"));
+        // After the workspace override is removed too, m2 disappears and the
+        // current model falls back.
+        app.remove_model_in(crate::config::ConfigScope::Workspace, "m2")
+            .unwrap();
+        assert!(!app.models.iter().any(|m| m.id == "m2"));
+        assert_eq!(app.current_model.id, "test-model");
+        assert_eq!(
+            app.subagents.parent_current_model_for_test().id,
+            "test-model"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
