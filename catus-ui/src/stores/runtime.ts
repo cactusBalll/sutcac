@@ -109,6 +109,9 @@ export const useRuntimeStore = defineStore('runtime', {
         // The actor may not be ready yet; events will refresh the state.
       }
       this.started = true;
+      // Populate the sidebar history list without waiting for the user to
+      // open the sessions page.
+      this.refreshSessions();
     },
 
     applySnapshot(snap: AppSnapshot) {
