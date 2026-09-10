@@ -288,6 +288,28 @@ fn diff_rows(diffs: &[diff_match_patch_rs::dmp::Diff<u8>], old: &str, new: &str)
                 text: new_lines[ni].to_string(),
             });
             ni += 1;
+        } else if oi < old_lines.len() && ni >= new_lines.len() {
+            // One side is exhausted while the other still has unflagged
+            // lines (e.g. the edit appended text to a file's last line
+            // without a trailing newline): the leftover old lines pair with
+            // the just-emitted added rows, so render them as removed.
+            rows.push(Row {
+                old_no: Some(oi + 1),
+                new_no: None,
+                prefix: '-',
+                text: old_lines[oi].to_string(),
+            });
+            oi += 1;
+        } else if ni < new_lines.len() && oi >= old_lines.len() {
+            // Mirror case: old side exhausted, leftover new lines render
+            // as added instead of producing an out-of-range old number.
+            rows.push(Row {
+                old_no: None,
+                new_no: Some(ni + 1),
+                prefix: '+',
+                text: new_lines[ni].to_string(),
+            });
+            ni += 1;
         } else {
             // Classifications disagree (a partial-line change made one side
             // look deleted while the other looks untouched): fall back to
@@ -518,6 +540,29 @@ mod tests {
     #[test]
     fn unified_diff_is_empty_for_identical_texts() {
         assert_eq!(unified_diff("same\n", "same\n", "f.txt"), "");
+    }
+
+    #[test]
+    fn unified_diff_handles_append_to_unterminated_last_line() {
+        // Regression: the old fallback row indexed new_lines out of bounds
+        // (panic "len is 173 but the index is 173") when an edit appended
+        // text to the last line of a file without a trailing newline.
+        let diff = unified_diff("A\nB", "A\nBB", "f.txt");
+        assert!(diff.contains(" A\n"), "{}", diff);
+        assert!(diff.contains("+BB\n"), "{}", diff);
+        assert!(diff.contains("-B\n"), "{}", diff);
+        assert!(diff.contains("@@ -1,2 +1,2 @@"), "{}", diff);
+    }
+
+    #[test]
+    fn unified_diff_handles_trim_of_unterminated_last_line() {
+        // Mirror case: the old fallback produced an out-of-range old line
+        // number when text was removed from the end of such a file.
+        let diff = unified_diff("A\nBB", "A\nB", "f.txt");
+        assert!(diff.contains(" A\n"), "{}", diff);
+        assert!(diff.contains("-BB\n"), "{}", diff);
+        assert!(diff.contains("+B\n"), "{}", diff);
+        assert!(diff.contains("@@ -1,2 +1,2 @@"), "{}", diff);
     }
 
     #[test]

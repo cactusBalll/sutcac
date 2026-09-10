@@ -369,6 +369,32 @@ impl LlmClient {
         }
     }
 
+    /// Debug-level fingerprint of one request body: session id, byte size,
+    /// and a hash of the serialized request. Lets request logs be matched
+    /// against a provider dashboard when diagnosing prompt-cache behavior.
+    fn log_request_fingerprint(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        stream: bool,
+    ) {
+        if !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
+        let body = self.build_request(messages, tools, stream);
+        let json = serde_json::to_string(&body).unwrap_or_default();
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        json.hash(&mut hasher);
+        log::debug!(
+            "llm request [session={}]: stream={} bytes={} hash={:016x}",
+            self.session_id,
+            stream,
+            json.len(),
+            hasher.finish()
+        );
+    }
+
     fn build_request(
         &self,
         messages: &[Message],
@@ -420,6 +446,7 @@ impl LlmClient {
         tools: &[ToolDefinition],
     ) -> Result<ChatReply, LlmError> {
         let body = self.build_request(messages, tools, false);
+        self.log_request_fingerprint(messages, tools, false);
         let response = self
             .apply_headers(self.client.post(&self.url()))
             .json(&body)
@@ -478,6 +505,7 @@ impl LlmClient {
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<(), LlmError> {
         let body = self.build_request(messages, tools, true);
+        self.log_request_fingerprint(messages, tools, true);
         let response = self
             .apply_headers(self.client.post(&self.url()))
             .json(&body)
@@ -491,6 +519,9 @@ impl LlmClient {
         }
 
         let mut partial_calls: HashMap<usize, PartialToolCall> = HashMap::new();
+        // Some gateways emit the usage chunk twice with identical values;
+        // keep only the first occurrence so usage is not double-counted.
+        let mut last_usage: Option<Usage> = None;
         let mut stream = response.bytes_stream().eventsource();
 
         while let Some(event) = stream.next().await {
@@ -521,14 +552,18 @@ impl LlmClient {
             // Providers send a final chunk with empty `choices` carrying only
             // the token usage.
             if let Some(usage) = parsed.usage {
-                log::info!(
-                    "sse usage: prompt={} completion={} total={} cached={}",
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens,
-                    usage.cached_tokens
-                );
-                let _ = tx.send(StreamEvent::Usage(usage)).await;
+                if last_usage != Some(usage) {
+                    log::info!(
+                        "sse usage [session={}]: prompt={} completion={} total={} cached={}",
+                        self.session_id,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.total_tokens,
+                        usage.cached_tokens
+                    );
+                    last_usage = Some(usage);
+                    let _ = tx.send(StreamEvent::Usage(usage)).await;
+                }
             }
 
             let choices = parsed.choices.unwrap_or_default();
@@ -632,6 +667,23 @@ where
 {
     let opt = Option::<T>::deserialize(deserializer)?;
     Ok(opt.unwrap_or_default())
+}
+
+/// Serialize the API-visible form of each message, exactly as
+/// [`LlmClient::build_request`] sends it (`Event` messages filtered).
+///
+/// Exposed for the request-prefix-stability regression test: a later
+/// request's message list must extend an earlier one byte-for-byte, never
+/// rewrite it.
+#[cfg(test)]
+pub(crate) fn api_request_messages(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|m| m.role != Role::Event)
+        .map(|m| {
+            serde_json::to_string(&into_api_message(m)).expect("api message always serializes")
+        })
+        .collect()
 }
 
 fn into_api_message(msg: &Message) -> ApiMessage {
@@ -929,5 +981,76 @@ mod tests {
         assert_eq!(model.display_name(), "gpt-4o");
         model.name = "GPT-4o".to_string();
         assert_eq!(model.display_name(), "GPT-4o");
+    }
+
+    /// Serve one canned SSE response on a local port; returns its address.
+    fn spawn_sse_server(body: &'static str) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            // Drain the request until the end of its headers; the body is
+            // ignored. One short read is normally enough, loop for safety.
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = sock.read(&mut chunk).unwrap_or(0);
+                if n == 0 || buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes());
+            let _ = sock.flush();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn stream_chat_dedups_duplicate_usage_chunks() {
+        // Regression: some gateways emit the usage chunk twice with
+        // identical values; the client must surface it once.
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],",
+            "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"cached_tokens\":5}}\n\n",
+            "data: {\"choices\":[],",
+            "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"cached_tokens\":5}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let addr = spawn_sse_server(body);
+        let provider = Provider {
+            name: "test".to_string(),
+            base_url: format!("http://{}", addr),
+            api_key: "key".to_string(),
+            session_header: None,
+        };
+        let model = Model {
+            id: "test-model".to_string(),
+            name: String::new(),
+            context_window: 0,
+            provider: provider.clone(),
+        };
+        let client = LlmClient::new(provider, model, "sess-1");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let messages = vec![
+            Message::system("s".to_string()),
+            Message::user("u".to_string()),
+        ];
+        client.stream_chat(&messages, &[], tx).await.unwrap();
+
+        let mut usages = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::Usage(usage) = event {
+                usages.push(usage);
+            }
+        }
+        assert_eq!(usages.len(), 1, "duplicate usage chunks must be dropped");
+        assert_eq!(usages[0].cached_tokens, 5);
     }
 }

@@ -532,11 +532,23 @@ fn default_config_field(key: &str) -> Option<String> {
 
 /// Generate the per-conversation session ID: stable for the lifetime of one
 /// process (one conversation in the TUI).
+///
+/// The `ses_` prefix matches the session-id shape platform gateways expect
+/// (e.g. the opencode zen `x-opencode-session`), so session-scoped routing
+/// and prompt-cache keys recognize the value.
 fn new_session_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // A stack address mixes in ASLR entropy so two ids generated within the
+    // same millisecond still differ.
+    let marker = 0u8;
+    let ptr = &marker as *const u8 as usize;
     format!(
-        "catus-{}-{:08x}",
-        chrono::Utc::now().timestamp_millis(),
-        std::process::id()
+        "ses_{:016x}{:08x}",
+        nanos,
+        std::process::id() as u64 ^ (ptr as u64).rotate_left(17)
     )
 }
 
@@ -1556,11 +1568,32 @@ impl App {
             .await
             .map_err(|e| format!("failed to connect mcp server '{}': {}", name, e))?;
         let count = catalog.len();
+        // Providers render `tools` ahead of the messages, so a changed tool
+        // set invalidates their prompt-prefix cache for this conversation.
+        let tools_before: Vec<String> = self
+            .toolbox
+            .definitions()
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect();
         self.rebuild_toolbox();
+        let tools_after: Vec<String> = self
+            .toolbox
+            .definitions()
+            .iter()
+            .map(|d| d.function.name.clone())
+            .collect();
         self.persist_session();
+        let cache_note = if tools_before == tools_after {
+            String::new()
+        } else {
+            "; the advertised tool set changed, so the provider's prompt-prefix \
+             cache resets from the next request"
+                .to_string()
+        };
         Ok(format!(
-            "{} mcp server '{}' ({} tool(s))",
-            verb, name, count
+            "{} mcp server '{}' ({} tool(s)){}",
+            verb, name, count, cache_note
         ))
     }
 
@@ -2119,7 +2152,18 @@ impl App {
                     Self::build_system_prompt(&self.main_agent, &self.config, &self.skill_registry);
                 if let Some(first) = self.messages.first_mut() {
                     if first.is_system() {
+                        // The system prompt sits at the head of every
+                        // request; rewriting it invalidates the provider's
+                        // prefix cache for the rest of the conversation.
+                        let changed = first.content != prompt;
                         *first = Message::system(prompt);
+                        if changed {
+                            self.add_event_message(
+                                "system prompt changed: the provider's prompt-prefix cache \
+                                 is invalidated for the rest of this conversation"
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
             }
@@ -4160,6 +4204,133 @@ mod tests {
         assert!(last.is_assistant());
         assert!(last.had_tool_calls);
         assert_eq!(last.tool_calls.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn request_prefix_is_byte_stable_across_tool_rounds() {
+        let dir = std::env::temp_dir().join(format!("catus_prefix_round_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.messages[0] = Message::system("test system prompt".to_string());
+
+        app.submit_user_message("check the todo list".to_string());
+        let round1 = crate::llm::api_request_messages(&app.messages);
+        assert_eq!(round1.len(), 2); // system + user
+
+        // Stream a tool call, then run it through the real dispatch path.
+        app.start_assistant_message();
+        app.append_stream_text("Let me check.");
+        app.add_tool_call(ToolCall {
+            id: "call_1".to_string(),
+            name: "todo".to_string(),
+            arguments: r#"{"action":"list"}"#.to_string(),
+        });
+        app.run_pending_tool().await;
+
+        let round2 = crate::llm::api_request_messages(&app.messages);
+        assert_eq!(round2.len(), 4); // + assistant(tool_calls) + tool result
+        assert!(
+            round2[..round1.len()] == round1[..],
+            "the earlier request must be a byte-stable prefix of the later one"
+        );
+
+        // A follow-up assistant-only round keeps extending without rewrite.
+        app.start_assistant_message();
+        app.append_stream_text("done");
+        let round3 = crate::llm::api_request_messages(&app.messages);
+        assert_eq!(round3.len(), 5); // + final assistant reply
+        assert!(
+            round3[..round2.len()] == round2[..],
+            "the tool-round request must be a byte-stable prefix of the final one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn request_prefix_is_byte_stable_across_interaction_pause() {
+        let dir = std::env::temp_dir().join(format!("catus_prefix_ask_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.messages[0] = Message::system("test system prompt".to_string());
+        app.submit_user_message("ask me something".to_string());
+        let round1 = crate::llm::api_request_messages(&app.messages);
+        assert_eq!(round1.len(), 2); // system + user
+
+        // The assistant calls ask_user; the turn pauses for the overlay.
+        app.start_assistant_message();
+        app.add_tool_call(ToolCall {
+            id: "call_ask".to_string(),
+            name: "ask_user".to_string(),
+            arguments: r#"{"questions":[{"prompt":"Pick","title":"Pick","options":[{"label":"a"},{"label":"b"}],"multiSelect":false}]}"#.to_string(),
+        });
+        let round1 = crate::llm::api_request_messages(&app.messages);
+        assert_eq!(round1.len(), 3); // system + user + assistant(tool_calls)
+
+        app.run_pending_tool().await;
+        assert!(app.has_pending_interaction());
+
+        // The user answers; the tool result is appended and the turn resumes.
+        assert!(app.complete_interaction(vec![crate::tool::AskAnswer {
+            prompt: "Pick".to_string(),
+            answer: crate::tool::Answer::One("a".to_string()),
+        }]));
+        let round2 = crate::llm::api_request_messages(&app.messages);
+        assert_eq!(round2.len(), 4); // + tool result
+        assert!(round2[..round1.len()] == round1[..]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_session_id_uses_platform_session_format() {
+        let a = new_session_id();
+        let b = new_session_id();
+        assert!(a.starts_with("ses_"), "{}", a);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn auto_include_skills_toggle_notes_prefix_invalidation() {
+        use crate::skills::SkillRegistry;
+        let dir = std::env::temp_dir().join(format!("catus_auto_skills_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("demo")).unwrap();
+        std::fs::write(
+            dir.join("demo/SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill.\n---\nDo the demo thing.",
+        )
+        .unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.skill_registry = SkillRegistry::discover(&[dir.clone()]).unwrap();
+
+        // Enabling appends the catalog to messages[0]: a real prefix change.
+        app.apply_config_field_effect("agent.auto_include_skills", "true")
+            .unwrap();
+        assert!(app.messages[0].content.contains("- demo:"));
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.is_event() && m.content.contains("prompt-prefix cache")),
+            "a changed system prompt must surface the cache-invalidation notice"
+        );
+
+        // Writing the same value again must not add another notice.
+        app.apply_config_field_effect("agent.auto_include_skills", "true")
+            .unwrap();
+        let notices = app
+            .messages
+            .iter()
+            .filter(|m| m.is_event() && m.content.contains("prompt-prefix cache"))
+            .count();
+        assert_eq!(notices, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

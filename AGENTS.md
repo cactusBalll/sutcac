@@ -2,6 +2,14 @@
 
 Guide for AI agents working in this repo. All commands run from the workspace root.
 
+Special docs: `docs/prompt-cache-investigation.md` — findings from the 2026-09-10
+prompt-prefix-cache investigation (opencode zen gateway): the provider cache is
+content-keyed (session id irrelevant), intermittent misses are gateway-side
+multi-instance routing; catus request paths are append-only with regression
+tests (`request_prefix_is_byte_stable_*`), so keep messages append-only and the
+system prompt byte-stable when touching the turn loop.
+
+
 ## Overview
 
 Rust workspace (edition 2024, needs Rust 1.85+) with six crates:
