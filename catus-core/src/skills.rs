@@ -138,12 +138,19 @@ impl Skill {
 #[derive(Debug, Clone, Default)]
 pub struct SkillRegistry {
     skills: Vec<Skill>,
+    /// Names of skills disabled for the LLM (session-scoped). Disabled
+    /// skills are hidden from the prompt catalog and the `use_skill` tool
+    /// rejects them; manual activation (`/skill use`) is unaffected.
+    disabled: Vec<String>,
 }
 
 impl SkillRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self { skills: Vec::new() }
+        Self {
+            skills: Vec::new(),
+            disabled: Vec::new(),
+        }
     }
 
     /// Discover skills under each search path.
@@ -211,11 +218,42 @@ impl SkillRegistry {
     }
 
     /// Return the names and descriptions of all discovered skills.
+    ///
+    /// Note: always includes disabled skills. The system prompt must not
+    /// depend on the session's disable flags, or every toggle would
+    /// invalidate the provider's prompt prefix cache.
     pub fn names_and_descriptions(&self) -> Vec<(&str, &str)> {
         self.skills
             .iter()
             .map(|s| (s.name.as_str(), s.description.as_str()))
             .collect()
+    }
+
+    /// Whether a skill is disabled for the LLM in this session.
+    pub fn is_disabled(&self, name: &str) -> bool {
+        self.disabled.iter().any(|n| n == name)
+    }
+
+    /// Disable or re-enable a skill for the LLM. Manual activation is not
+    /// affected by this flag.
+    pub fn set_disabled(&mut self, name: &str, disabled: bool) {
+        if disabled {
+            if !self.is_disabled(name) {
+                self.disabled.push(name.to_string());
+            }
+        } else {
+            self.disabled.retain(|n| n != name);
+        }
+    }
+
+    /// The disabled skill names (persisted as session state).
+    pub fn disabled_names(&self) -> &[String] {
+        &self.disabled
+    }
+
+    /// Restore the disabled set (session resume).
+    pub fn set_disabled_names(&mut self, names: Vec<String>) {
+        self.disabled = names;
     }
 
     /// Return true if no skills were discovered.

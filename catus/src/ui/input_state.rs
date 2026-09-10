@@ -336,7 +336,16 @@ mod tests {
         let mut state = InputState::new();
         state.input = "/mc".to_string();
         state.recompute_candidates();
-        assert_eq!(state.candidates, vec!["/mcp", "/mcp list", "/mcp status"]);
+        assert_eq!(
+            state.candidates,
+            vec![
+                "/mcp",
+                "/mcp disable",
+                "/mcp enable",
+                "/mcp list",
+                "/mcp status"
+            ]
+        );
     }
 
     #[test]
@@ -344,7 +353,10 @@ mod tests {
         let mut state = InputState::new();
         state.input = "/mcp ".to_string();
         state.recompute_candidates();
-        assert_eq!(state.candidates, vec!["/mcp list", "/mcp status"]);
+        assert_eq!(
+            state.candidates,
+            vec!["/mcp disable", "/mcp enable", "/mcp list", "/mcp status"]
+        );
 
         state.input = "/help ".to_string();
         state.recompute_candidates();

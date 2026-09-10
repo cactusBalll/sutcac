@@ -14,22 +14,26 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{FunctionDefinition, Tool, ToolCall, ToolContext, ToolDefinition, ToolResult};
-use crate::mcp::{CachedTool, McpManager};
+use crate::mcp::{CachedTool, McpDisabledServers, McpManager};
 
 /// The per-server MCP gateway tool exposed to the LLM.
 pub struct McpServerTool {
     manager: Arc<McpManager>,
     server: String,
     tool_name: String,
+    /// Shared session disable flags. The tool stays advertised when its
+    /// server is disabled (prefix stability) but rejects every action.
+    disabled: McpDisabledServers,
 }
 
 impl McpServerTool {
     /// Build the gateway tool for one connected server.
-    pub fn new(manager: Arc<McpManager>, server: &str) -> Self {
+    pub fn new(manager: Arc<McpManager>, server: &str, disabled: McpDisabledServers) -> Self {
         Self {
             manager,
             server: server.to_string(),
             tool_name: gateway_tool_name(server),
+            disabled,
         }
     }
 
@@ -38,6 +42,12 @@ impl McpServerTool {
     /// On success returns `(stdout, stderr)`; stderr carries MCP results that
     /// report diagnostic content.
     async fn run(&self, call: &ToolCall) -> Result<(String, String), String> {
+        if self.disabled.contains(&self.server) {
+            return Err(format!(
+                "mcp server '{}' is disabled for this session; its tools cannot be used",
+                self.server
+            ));
+        }
         let args: GatewayArguments = serde_json::from_str(&call.arguments).map_err(|_| {
             format!(
                 "arguments must be a JSON object with a string \"action\" field \
@@ -49,7 +59,7 @@ impl McpServerTool {
         match args.action.as_str() {
             "list" => {
                 let catalog = self.catalog()?;
-                Ok((format_catalog(&self.server, catalog), String::new()))
+                Ok((format_catalog(&self.server, &catalog), String::new()))
             }
             "help" => {
                 let tool = args.require_tool()?;
@@ -104,8 +114,8 @@ impl McpServerTool {
         }
     }
 
-    /// The server's cached tool catalog.
-    fn catalog(&self) -> Result<&[CachedTool], String> {
+    /// The server's cached tool catalog (cloned out of the manager's cache).
+    fn catalog(&self) -> Result<Vec<CachedTool>, String> {
         self.manager
             .tool_catalog(&self.server)
             .ok_or_else(|| format!("unknown mcp server: {}", self.server))
@@ -302,7 +312,7 @@ mod tests {
 
     #[test]
     fn definition_advertises_gateway_actions() {
-        let tool = McpServerTool::new(test_manager(), "calc");
+        let tool = McpServerTool::new(test_manager(), "calc", McpDisabledServers::new());
         assert_eq!(tool.name(), "mcp_calc");
         let def = tool.definition();
         assert_eq!(def.function.name, "mcp_calc");
@@ -319,7 +329,7 @@ mod tests {
 
     #[test]
     fn describe_call_compact_format() {
-        let tool = McpServerTool::new(test_manager(), "calc");
+        let tool = McpServerTool::new(test_manager(), "calc", McpDisabledServers::new());
         let call = ToolCall {
             id: "c".to_string(),
             name: "mcp_calc".to_string(),
@@ -344,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_action_is_rejected() {
-        let tool = McpServerTool::new(test_manager(), "calc");
+        let tool = McpServerTool::new(test_manager(), "calc", McpDisabledServers::new());
         let call = ToolCall {
             id: "c".to_string(),
             name: "mcp_calc".to_string(),
@@ -358,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_arguments_are_rejected() {
-        let tool = McpServerTool::new(test_manager(), "calc");
+        let tool = McpServerTool::new(test_manager(), "calc", McpDisabledServers::new());
         let call = ToolCall {
             id: "c".to_string(),
             name: "mcp_calc".to_string(),
@@ -371,8 +381,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_server_rejects_every_action_but_stays_advertised() {
+        let disabled = McpDisabledServers::new();
+        let tool = McpServerTool::new(test_manager(), "calc", disabled.clone());
+        // The definition is unchanged while disabled (prefix stability).
+        assert_eq!(tool.definition().function.name, "mcp_calc");
+
+        disabled.set("calc", true);
+        let mut ctx = test_context();
+        for arguments in [
+            r#"{"action":"list"}"#,
+            r#"{"action":"help","tool":"sum"}"#,
+            r#"{"action":"invoke","tool":"sum","arguments":{}}"#,
+        ] {
+            let call = ToolCall {
+                id: "c".to_string(),
+                name: "mcp_calc".to_string(),
+                arguments: arguments.to_string(),
+            };
+            let result = tool.execute(&call, &mut ctx).await;
+            assert_eq!(result.status, 1, "arguments: {arguments}");
+            assert!(result.stderr.contains("disabled"), "arguments: {arguments}");
+        }
+
+        // Re-enabling restores the tool without any re-registration.
+        disabled.set("calc", false);
+        let call = ToolCall {
+            id: "c".to_string(),
+            name: "mcp_calc".to_string(),
+            arguments: r#"{"action":"list"}"#.to_string(),
+        };
+        let result = tool.execute(&call, &mut ctx).await;
+        assert_eq!(result.status, 0);
+        assert!(result.stdout.contains("sum"));
+    }
+
+    #[tokio::test]
     async fn list_and_help_serve_cached_catalog() {
-        let tool = McpServerTool::new(test_manager(), "calc");
+        let tool = McpServerTool::new(test_manager(), "calc", McpDisabledServers::new());
         let mut ctx = test_context();
 
         let list_call = ToolCall {
@@ -416,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn invoke_requires_object_arguments() {
-        let tool = McpServerTool::new(test_manager(), "calc");
+        let tool = McpServerTool::new(test_manager(), "calc", McpDisabledServers::new());
         let mut ctx = test_context();
 
         let call = ToolCall {

@@ -151,6 +151,18 @@ impl Tool for TaskSyncTool {
                     };
                 }
             };
+            if agent_registry.is_disabled(&args.agent) {
+                return ToolResult {
+                    call: call.clone(),
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "catus: subagent '{}' is disabled for this session; it cannot be dispatched",
+                        args.agent
+                    ),
+                    interaction: None,
+                };
+            }
 
             let (_id, mut rx) = subagents.spawn_sync(
                 &definition,

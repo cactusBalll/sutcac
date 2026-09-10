@@ -7,12 +7,15 @@
 // Payload types mirror the serde shapes of the catus-core runtime boundary.
 
 import type {
+  AgentDetail,
   AppSnapshot,
   AskAnswer,
   ConfigScope,
   InputLineOutcome,
   Message,
   RuntimeEventPayload,
+  SessionSummary,
+  SkillPreview,
 } from './types';
 
 export interface TransportHandlers {
@@ -40,6 +43,19 @@ export interface CatusTransport {
   setConfigField(scope: ConfigScope, key: string, value: string): Promise<string>;
   /** Remove a config field from one scope; resolves with the status message. */
   removeConfigField(scope: ConfigScope, key: string): Promise<string>;
+  /**
+   * List history sessions. `scope='all'` returns every workspace's
+   * sessions; the default returns the current workspace's 10 newest.
+   */
+  listSessions(scope: string): Promise<SessionSummary[]>;
+  /** Full raw `SKILL.md` contents for the skill preview. */
+  skillPreview(name: string): Promise<SkillPreview>;
+  /** Detail of one agent definition (raw `.md` content) for the editor. */
+  agentDetail(name: string): Promise<AgentDetail>;
+  /** Save an edited agent definition back to its source file. */
+  saveAgent(name: string, content: string): Promise<string>;
+  /** Create a new agent definition in the workspace agents directory. */
+  createAgent(name: string, content: string): Promise<string>;
   /** Subscribe to pushed events. Resolves once subscription is active. */
   subscribe(handlers: TransportHandlers): Promise<void>;
 }

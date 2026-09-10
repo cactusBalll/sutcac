@@ -1515,6 +1515,7 @@ mod tests {
                     "catus-seed",
                     "test-model",
                     &catus_core::app::session_cwd(),
+                    "",
                 )
                 .unwrap();
             store

@@ -121,6 +121,11 @@ fn build_router(state: SharedState) -> axum::Router {
         .route("/api/config", post(api::set_config_field))
         .route("/api/config/remove", post(api::remove_config_field))
         .route("/api/completion", get(api::completion_candidates))
+        .route("/api/sessions", get(api::list_sessions))
+        .route("/api/skills/{name}/preview", get(api::skill_preview))
+        .route("/api/agents/{name}", get(api::get_agent_detail))
+        .route("/api/agents/{name}", post(api::save_agent))
+        .route("/api/agents", post(api::create_agent))
         .route(
             "/api/subagents/{id}/messages",
             get(api::get_subagent_messages),

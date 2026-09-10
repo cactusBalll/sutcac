@@ -12,9 +12,10 @@ use log::LevelFilter;
 use simplelog::{Config, WriteLogger};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use catus_core::app::{AppSnapshot, InputLineOutcome, RuntimeEvent};
+use catus_core::app::{AgentDetail, AppSnapshot, InputLineOutcome, RuntimeEvent, SkillPreview};
 use catus_core::bootstrap::{bootstrap_runtime, load_config};
 use catus_core::config::AppConfig;
+use catus_core::history::SessionSummary;
 use catus_core::message::Message;
 use catus_core::runtime::Runtime;
 use catus_core::tool::AskAnswer;
@@ -60,6 +61,34 @@ pub enum Command {
     RemoveConfigField {
         scope: catus_core::config::ConfigScope,
         key: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// List history sessions: `"current"` filters the session cwd, `"all"`
+    /// returns every workspace's sessions (grouped client-side).
+    ListSessions {
+        scope: String,
+        reply: oneshot::Sender<Vec<SessionSummary>>,
+    },
+    /// Full raw `SKILL.md` contents for the skill preview page.
+    SkillPreview {
+        name: String,
+        reply: oneshot::Sender<Result<SkillPreview, String>>,
+    },
+    /// Detail of one agent definition (raw `.md` content) for the editor.
+    AgentDetail {
+        name: String,
+        reply: oneshot::Sender<Result<AgentDetail, String>>,
+    },
+    /// Save an edited agent definition back to its source file.
+    SaveAgent {
+        name: String,
+        content: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    /// Create a new agent definition in the workspace agents directory.
+    CreateAgent {
+        name: String,
+        content: String,
         reply: oneshot::Sender<Result<String, String>>,
     },
     /// Persist the session and shut down the process.
@@ -217,6 +246,46 @@ async fn handle_command(
             emit_snapshot(events, runtime.app.snapshot());
             let _ = reply.send(result.map_err(|e| e.to_string()));
         }
+        Command::ListSessions { scope, reply } => {
+            let sessions = if scope == "all" {
+                runtime.app.list_all_sessions()
+            } else {
+                runtime.app.list_recent_sessions(10)
+            };
+            let _ = reply.send(sessions);
+        }
+        Command::SkillPreview { name, reply } => {
+            let _ = reply.send(runtime.app.skill_preview(&name).map_err(|e| e.to_string()));
+        }
+        Command::AgentDetail { name, reply } => {
+            let _ = reply.send(runtime.app.agent_detail(&name).map_err(|e| e.to_string()));
+        }
+        Command::SaveAgent {
+            name,
+            content,
+            reply,
+        } => {
+            let result = runtime.app.save_agent(&name, &content);
+            match &result {
+                Ok(msg) => runtime.app.set_transient_message(msg),
+                Err(e) => runtime.app.set_error(&e.to_string()),
+            }
+            emit_snapshot(events, runtime.app.snapshot());
+            let _ = reply.send(result.map_err(|e| e.to_string()));
+        }
+        Command::CreateAgent {
+            name,
+            content,
+            reply,
+        } => {
+            let result = runtime.app.create_agent(&name, &content);
+            match &result {
+                Ok(msg) => runtime.app.set_transient_message(msg),
+                Err(e) => runtime.app.set_error(&e.to_string()),
+            }
+            emit_snapshot(events, runtime.app.snapshot());
+            let _ = reply.send(result.map_err(|e| e.to_string()));
+        }
         Command::Shutdown => {
             return true;
         }
@@ -273,6 +342,77 @@ async fn apply_overlay_action(runtime: &mut Runtime, action: &str, value: &str) 
         },
         // Pure view change: the web frontend opens its own monitor page.
         "watch_subagent" => format!("watching subagent {}", value),
+        // Sidebar manager actions (skill / MCP / agent toggles, connect, new
+        // session). Each mutates session state; a fresh snapshot is emitted
+        // by the caller afterwards.
+        "toggle_skill" => {
+            let disable = !runtime.app.skill_registry.is_disabled(value);
+            match runtime.app.set_skill_disabled(value, disable) {
+                Ok(msg) => {
+                    runtime.app.status = catus_core::app::AppStatus::Idle;
+                    runtime.app.set_transient_message(msg.as_str());
+                    msg
+                }
+                Err(e) => {
+                    runtime.app.set_error(e.to_string());
+                    e.to_string()
+                }
+            }
+        }
+        "toggle_mcp" => {
+            let enable = runtime.app.disabled_mcp.contains(value);
+            match runtime.app.set_mcp_enabled(value, enable) {
+                Ok(msg) => {
+                    runtime.app.status = catus_core::app::AppStatus::Idle;
+                    runtime.app.set_transient_message(msg.as_str());
+                    msg
+                }
+                Err(e) => {
+                    runtime.app.set_error(e.to_string());
+                    e.to_string()
+                }
+            }
+        }
+        "toggle_agent" => {
+            let enable = runtime.app.agent_registry.is_disabled(value);
+            match runtime.app.set_agent_enabled(value, enable) {
+                Ok(msg) => {
+                    runtime.app.status = catus_core::app::AppStatus::Idle;
+                    runtime.app.set_transient_message(msg.as_str());
+                    msg
+                }
+                Err(e) => {
+                    runtime.app.set_error(e.to_string());
+                    e.to_string()
+                }
+            }
+        }
+        "connect_mcp" => match runtime.app.connect_mcp_server(value).await {
+            Ok(msg) => {
+                runtime.app.status = catus_core::app::AppStatus::Idle;
+                runtime.app.set_transient_message(msg.as_str());
+                msg
+            }
+            Err(e) => {
+                runtime.app.set_error(e.to_string());
+                e.to_string()
+            }
+        },
+        "new_session" => {
+            let path = value.trim();
+            let path = if path.is_empty() { None } else { Some(path) };
+            match runtime.app.start_new_session(path).await {
+                Ok(msg) => {
+                    runtime.app.status = catus_core::app::AppStatus::Idle;
+                    runtime.app.set_transient_message(msg.as_str());
+                    msg
+                }
+                Err(e) => {
+                    runtime.app.set_error(e.to_string());
+                    e.to_string()
+                }
+            }
+        }
         _ => {
             let msg = format!("unknown overlay action: {}", action);
             runtime.app.set_error(msg.as_str());

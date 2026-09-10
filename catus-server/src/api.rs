@@ -12,7 +12,8 @@ use tokio::sync::oneshot;
 
 use crate::actor::Command;
 use crate::state::SharedState;
-use catus_core::app::{AppSnapshot, InputLineOutcome};
+use catus_core::app::{AgentDetail, AppSnapshot, InputLineOutcome, SkillPreview};
+use catus_core::history::SessionSummary;
 use catus_core::message::Message;
 use catus_core::tool::AskAnswer;
 
@@ -73,6 +74,25 @@ pub struct SetConfigFieldBody {
 pub struct RemoveConfigFieldBody {
     pub scope: catus_core::config::ConfigScope,
     pub key: String,
+}
+
+#[derive(Deserialize)]
+pub struct AgentContentBody {
+    pub content: String,
+}
+
+#[derive(Deserialize)]
+pub struct CreateAgentBody {
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Deserialize)]
+pub struct SessionsQuery {
+    /// `"current"` (default): the current workspace's 10 newest sessions.
+    /// `"all"`: every workspace's sessions (grouped client-side).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 /// Slash-command completion candidates for the current input prefix.
@@ -215,6 +235,95 @@ pub async fn remove_config_field(
         Command::RemoveConfigField {
             scope: body.scope,
             key: body.key,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await
+        .map_err(|_| ApiError::actor_stopped())?
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+/// List history sessions. `scope=all` returns every workspace's sessions;
+/// the default returns the current workspace's 10 newest (sidebar menu).
+pub async fn list_sessions(
+    State(state): State<SharedState>,
+    Query(params): Query<SessionsQuery>,
+) -> Result<Json<Vec<SessionSummary>>, ApiError> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::ListSessions {
+            scope: params.scope.unwrap_or_default(),
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await.map(Json).map_err(|_| ApiError::actor_stopped())
+}
+
+/// Full raw `SKILL.md` contents for the skill preview page.
+pub async fn skill_preview(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<SkillPreview>, ApiError> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(&state, Command::SkillPreview { name, reply: tx }).await?;
+    rx.await
+        .map_err(|_| ApiError::actor_stopped())?
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+/// Detail of one agent definition (raw `.md` content) for the editor page.
+pub async fn get_agent_detail(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+) -> Result<Json<AgentDetail>, ApiError> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(&state, Command::AgentDetail { name, reply: tx }).await?;
+    rx.await
+        .map_err(|_| ApiError::actor_stopped())?
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+/// Save an edited agent definition back to its source file.
+pub async fn save_agent(
+    State(state): State<SharedState>,
+    Path(name): Path<String>,
+    body: Result<Json<AgentContentBody>, JsonRejection>,
+) -> Result<Json<String>, ApiError> {
+    let Json(body) = json_body(body)?;
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::SaveAgent {
+            name,
+            content: body.content,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await
+        .map_err(|_| ApiError::actor_stopped())?
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+/// Create a new agent definition in the workspace agents directory.
+pub async fn create_agent(
+    State(state): State<SharedState>,
+    body: Result<Json<CreateAgentBody>, JsonRejection>,
+) -> Result<Json<String>, ApiError> {
+    let Json(body) = json_body(body)?;
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::CreateAgent {
+            name: body.name,
+            content: body.content,
             reply: tx,
         },
     )

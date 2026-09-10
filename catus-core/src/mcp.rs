@@ -9,6 +9,7 @@
 //! a single gateway tool per server stand in for every advertised MCP tool.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use http::{HeaderName, HeaderValue};
 use rmcp::{
@@ -99,6 +100,50 @@ impl CachedTool {
     }
 }
 
+/// Session-scoped set of temporarily disabled MCP server names, shared
+/// between `App` and every registered gateway tool.
+///
+/// Toggling a server mutates this set instead of adding/removing gateway
+/// tools, so the advertised tool list — and with it the request prefix the
+/// provider caches — stays byte-stable. A disabled gateway tool stays
+/// advertised but rejects every action until re-enabled.
+#[derive(Clone, Default)]
+pub struct McpDisabledServers(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl McpDisabledServers {
+    pub fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Vec::new())))
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.lock().unwrap().iter().any(|n| n == name)
+    }
+
+    pub fn set(&self, name: &str, disabled: bool) {
+        let mut guard = self.0.lock().unwrap();
+        if disabled {
+            if !guard.iter().any(|n| n == name) {
+                guard.push(name.to_string());
+            }
+        } else {
+            guard.retain(|n| n != name);
+        }
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
+
+    pub fn replace(&self, names: Vec<String>) {
+        *self.0.lock().unwrap() = names;
+    }
+
+    /// A copy of the disabled names (for persistence and snapshots).
+    pub fn snapshot(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 /// A connection to a single MCP server.
 pub struct McpClient {
     peer: RunningService<RoleClient, ()>,
@@ -162,12 +207,24 @@ impl McpClient {
 ///
 /// Each server's tool catalog is fetched once at connect time and cached in
 /// [`McpManager::catalogs`]; only `invoke` traffic goes to the server.
+///
+/// The connection maps sit behind mutexes so servers can be connected on
+/// demand (the web UI's connect action) while the manager lives behind an
+/// `Arc` shared with the gateway tools.
 pub struct McpManager {
-    clients: HashMap<String, McpClient>,
-    catalogs: HashMap<String, Vec<CachedTool>>,
+    clients: std::sync::Mutex<HashMap<String, Arc<McpClient>>>,
+    catalogs: std::sync::Mutex<HashMap<String, Vec<CachedTool>>>,
 }
 
 impl McpManager {
+    /// An empty manager with no connections (used before the first connect).
+    pub fn empty() -> Self {
+        Self {
+            clients: std::sync::Mutex::new(HashMap::new()),
+            catalogs: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
     /// Connect to every configured MCP server and cache their tool catalogs.
     ///
     /// Returns the manager and a list of per-server connection warnings. A
@@ -175,7 +232,7 @@ impl McpManager {
     /// A server that connects but fails to list its tools is kept with an
     /// empty catalog and produces a warning.
     pub async fn connect(servers: &[McpServerConfig]) -> (Self, Vec<String>) {
-        let mut clients = HashMap::new();
+        let mut clients: HashMap<String, Arc<McpClient>> = HashMap::new();
         let mut catalogs = HashMap::new();
         let mut warnings = Vec::new();
 
@@ -203,7 +260,7 @@ impl McpManager {
                         }
                     };
                     catalogs.insert(config.name.clone(), catalog);
-                    clients.insert(config.name.clone(), client);
+                    clients.insert(config.name.clone(), Arc::new(client));
                 }
                 Err(e) => {
                     log::warn!("failed to connect to mcp server '{}': {}", config.name, e);
@@ -212,27 +269,68 @@ impl McpManager {
             }
         }
 
-        (Self { clients, catalogs }, warnings)
+        (
+            Self {
+                clients: std::sync::Mutex::new(clients),
+                catalogs: std::sync::Mutex::new(catalogs),
+            },
+            warnings,
+        )
+    }
+
+    /// Connect a single server on demand and cache its tool catalog.
+    ///
+    /// Used by the web UI's connect action for servers that failed at
+    /// startup or were configured after boot. An already-connected server is
+    /// reconnected only by explicit request; callers should check
+    /// [`McpManager::is_connected`] first.
+    pub async fn connect_one(&self, config: &McpServerConfig) -> Result<Vec<CachedTool>, McpError> {
+        let client = McpClient::connect(config).await?;
+        let catalog = client.list_tools().await?;
+        let cached: Vec<CachedTool> = catalog.into_iter().map(CachedTool::from_rmcp).collect();
+        log::info!(
+            "connected to mcp server '{}' ({} tool(s))",
+            config.name,
+            cached.len()
+        );
+        self.catalogs
+            .lock()
+            .unwrap()
+            .insert(config.name.clone(), cached.clone());
+        self.clients
+            .lock()
+            .unwrap()
+            .insert(config.name.clone(), Arc::new(client));
+        Ok(cached)
+    }
+
+    /// Whether one server currently has a live connection.
+    pub fn is_connected(&self, server: &str) -> bool {
+        self.clients.lock().unwrap().contains_key(server)
     }
 
     /// Return true if no MCP servers are connected.
     pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
+        self.clients.lock().unwrap().is_empty()
     }
 
     /// Number of connected MCP servers.
     pub fn len(&self) -> usize {
-        self.clients.len()
+        self.clients.lock().unwrap().len()
     }
 
     /// Names of all connected MCP servers.
-    pub fn server_names(&self) -> Vec<&str> {
-        self.clients.keys().map(|s| s.as_str()).collect()
+    pub fn server_names(&self) -> Vec<String> {
+        // Sorted so the gateway-tool registration order (part of the
+        // advertised tool list) is deterministic across toolbox rebuilds.
+        let mut names: Vec<String> = self.clients.lock().unwrap().keys().cloned().collect();
+        names.sort();
+        names
     }
 
-    /// The cached tool catalog of one connected server.
-    pub fn tool_catalog(&self, server: &str) -> Option<&[CachedTool]> {
-        self.catalogs.get(server).map(|c| c.as_slice())
+    /// The cached tool catalog of one server, cloned out from under the lock.
+    pub fn tool_catalog(&self, server: &str) -> Option<Vec<CachedTool>> {
+        self.catalogs.lock().unwrap().get(server).cloned()
     }
 
     /// Invoke one tool on a server. `server` must be a connected server name
@@ -244,11 +342,13 @@ impl McpManager {
         tool_name: &str,
         arguments: serde_json::Map<String, Value>,
     ) -> Result<ToolResult, McpError> {
-        if !self.clients.contains_key(server) {
+        if !self.is_connected(server) {
             return Err(McpError::UnknownServer(server.to_string()));
         }
         let known = self
             .catalogs
+            .lock()
+            .unwrap()
             .get(server)
             .map(|c| c.iter().any(|t| t.name == tool_name))
             .unwrap_or(false);
@@ -259,7 +359,10 @@ impl McpManager {
             });
         }
 
-        let client = &self.clients[server];
+        let client = self.clients.lock().unwrap().get(server).cloned();
+        let Some(client) = client else {
+            return Err(McpError::UnknownServer(server.to_string()));
+        };
         client.call_tool(tool_name, arguments).await
     }
 }
@@ -271,8 +374,8 @@ impl McpManager {
     /// Enough for `list`/`help` tests; `invoke` reports an unknown server.
     pub(crate) fn with_catalogs(catalogs: HashMap<String, Vec<CachedTool>>) -> Self {
         Self {
-            clients: HashMap::new(),
-            catalogs,
+            clients: std::sync::Mutex::new(HashMap::new()),
+            catalogs: std::sync::Mutex::new(catalogs),
         }
     }
 }

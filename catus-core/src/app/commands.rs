@@ -154,6 +154,44 @@ impl SlashCommand for ConfigCommand {
     }
 }
 
+/// Persist the current session and start a new conversation context.
+///
+/// With an optional path, the process fully switches workspace (config,
+/// agents, skills, and MCP are reloaded from the target directory).
+pub struct NewCommand;
+
+impl SlashCommand for NewCommand {
+    fn name(&self) -> &'static str {
+        "new"
+    }
+
+    fn description(&self) -> &'static str {
+        "Save the session and start a new context (optionally switching workspace)"
+    }
+
+    fn usage(&self) -> &'static str {
+        "/new [path]"
+    }
+
+    fn record_history(&self, _args: Option<&str>) -> bool {
+        false
+    }
+
+    fn execute<'a>(
+        &'a self,
+        app: &'a mut App,
+        args: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
+        Box::pin(async move {
+            let msg = app.start_new_session(args).await?;
+            app.status = AppStatus::Idle;
+            app.add_event_message(msg.clone());
+            app.set_transient_message(msg);
+            Ok(None)
+        })
+    }
+}
+
 /// Resume a saved conversation.
 pub struct ResumeCommand;
 
@@ -237,11 +275,13 @@ impl SlashCommand for AgentCommand {
     }
 
     fn usage(&self) -> &'static str {
-        "/agent [list | status | use <name> <task> | watch <id> | close [id]]"
+        "/agent [list | status | use <name> <task> | watch <id> | close [id] | disable <name> | enable <name>]"
     }
 
     fn subcommands(&self) -> &[&'static str] {
-        &["list", "status", "use", "watch", "close"]
+        &[
+            "list", "status", "use", "watch", "close", "disable", "enable",
+        ]
     }
 
     fn help(&self, subcommand: Option<&str>) -> String {
@@ -251,6 +291,13 @@ impl SlashCommand for AgentCommand {
             Some("use") => "Usage: /agent use <name> <task> [fork|create]\nDispatch a task to a subagent manually.".to_string(),
             Some("watch") => "Usage: /agent watch <id>\nOpen the subagent monitor page. Left/Right switch between subagents, Esc returns to the main view. Without an id, opens the subagent picker.".to_string(),
             Some("close") => "Usage: /agent close [id]\nRemove a subagent from the status list. Without an id, opens the subagent picker.".to_string(),
+            Some("disable") => "Usage: /agent disable <name>\n\
+                Temporarily disable a plain subagent: task/taskSync and /agent use reject it.\n\
+                Special-role agents (main, memory) cannot be disabled."
+                .to_string(),
+            Some("enable") => {
+                "Usage: /agent enable <name>\nRe-enable a temporarily disabled agent.".to_string()
+            }
             Some(sub) => format!("Unknown subcommand '{}' for /agent", sub),
             None => format!("Usage: {}\n{}", self.usage(), self.description()),
         }
@@ -336,9 +383,19 @@ impl SlashCommand for AgentCommand {
                                 return Ok(Some(UiRequest::CloseSubagentPicker { items }));
                             }
                         },
+                        "disable" | "enable" => {
+                            let name = parts
+                                .next()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .ok_or_else(|| format!("usage: /agent {} <name>", sub))?;
+                            let msg = app.set_agent_enabled(name, sub == "enable")?;
+                            app.set_transient_message(msg);
+                        }
                         _ => {
                             return Err(format!(
-                                "unknown /agent subcommand: {}. Try /agent list, status, use, watch, or close",
+                                "unknown /agent subcommand: {}. Try /agent list, status, use, \
+                                 watch, close, disable <name>, or enable <name>",
                                 sub
                             )
                             .into());
@@ -369,17 +426,24 @@ impl SlashCommand for SkillCommand {
     }
 
     fn usage(&self) -> &'static str {
-        "/skill [list | use <name>]"
+        "/skill [list | use <name> | disable <name> | enable <name>]"
     }
 
     fn subcommands(&self) -> &[&'static str] {
-        &["list", "use"]
+        &["list", "use", "disable", "enable"]
     }
 
     fn help(&self, subcommand: Option<&str>) -> String {
         match subcommand {
             Some("list") => "Usage: /skill list\nList discovered Agent Skills.".to_string(),
             Some("use") => "Usage: /skill use <name>\nActivate a skill by name.".to_string(),
+            Some("disable") => "Usage: /skill disable <name>\n\
+                Disable a skill for the LLM: hidden from the prompt catalog and use_skill\n\
+                rejects it. Manual activation (/skill use) is unaffected."
+                .to_string(),
+            Some("enable") => {
+                "Usage: /skill enable <name>\nRe-enable a skill for the LLM.".to_string()
+            }
             Some(sub) => format!("Unknown subcommand '{}' for /skill", sub),
             None => format!("Usage: {}\n{}", self.usage(), self.description()),
         }
@@ -413,9 +477,19 @@ impl SlashCommand for SkillCommand {
                             }
                             None => return Err("usage: /skill use <name>".into()),
                         },
+                        "disable" | "enable" => match sub_arg {
+                            Some(name) => {
+                                let msg = app.set_skill_disabled(name.trim(), sub == "disable")?;
+                                app.set_transient_message(msg);
+                            }
+                            None => {
+                                return Err(format!("usage: /skill {} <name>", sub).into());
+                            }
+                        },
                         _ => {
                             return Err(format!(
-                                "unknown /skill subcommand: {}. Try /skill list or /skill use <name>",
+                                "unknown /skill subcommand: {}. Try /skill list, use <name>, \
+                                 disable <name>, or enable <name>",
                                 sub
                             )
                             .into());
@@ -657,11 +731,11 @@ impl SlashCommand for McpCommand {
     }
 
     fn usage(&self) -> &'static str {
-        "/mcp [list | status]"
+        "/mcp [list | status | disable <name> | enable <name>]"
     }
 
     fn subcommands(&self) -> &[&'static str] {
-        &["list", "status"]
+        &["list", "status", "disable", "enable"]
     }
 
     fn help(&self, subcommand: Option<&str>) -> String {
@@ -670,6 +744,13 @@ impl SlashCommand for McpCommand {
                 "Usage: /mcp list\nList configured MCP servers and available tools.".to_string()
             }
             Some("status") => "Usage: /mcp status\nShow MCP server connection status.".to_string(),
+            Some("disable") => "Usage: /mcp disable <name>\n\
+                Temporarily disable an MCP server: its gateway tool is hidden from the LLM;\n\
+                the connection (if any) stays open. Connecting is web-UI only."
+                .to_string(),
+            Some("enable") => "Usage: /mcp enable <name>\n\
+                Re-enable a temporarily disabled MCP server."
+                .to_string(),
             Some(sub) => format!("Unknown subcommand '{}' for /mcp", sub),
             None => format!("Usage: {}\n{}", self.usage(), self.description()),
         }
@@ -699,9 +780,19 @@ impl SlashCommand for McpCommand {
                             app.add_event_message(app.mcp_status_message());
                             app.set_transient_message("MCP status listed");
                         }
+                        "disable" | "enable" => {
+                            let name = parts
+                                .next()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .ok_or_else(|| format!("usage: /mcp {} <name>", sub))?;
+                            let msg = app.set_mcp_enabled(name, sub == "enable")?;
+                            app.set_transient_message(msg);
+                        }
                         _ => {
                             return Err(format!(
-                                "unknown /mcp subcommand: {}. Try /mcp list or /mcp status",
+                                "unknown /mcp subcommand: {}. Try /mcp list, status, \
+                                 disable <name>, or enable <name>",
                                 sub
                             )
                             .into());
@@ -826,6 +917,7 @@ pub static BUILT_IN_REGISTRY: LazyLock<CommandRegistry> = LazyLock::new(|| {
     CommandRegistry::new(vec![
         Box::new(HelpCommand),
         Box::new(ExitCommand),
+        Box::new(NewCommand),
         Box::new(ConfigCommand),
         Box::new(ResumeCommand),
         Box::new(StatusCommand),
@@ -857,10 +949,255 @@ mod tests {
             .map(|c| c.name())
             .collect();
         assert!(names.contains(&"help"));
+        assert!(names.contains(&"new"));
         assert!(names.contains(&"mcp"));
         assert!(names.contains(&"model"));
         assert!(names.contains(&"skill"));
         assert!(names.contains(&"memory"));
+    }
+
+    mod new_command {
+        use super::*;
+        use crate::config::AppConfig;
+        #[tokio::test]
+        async fn new_resets_the_conversation() {
+            let mut app = App::new(AppConfig::default());
+            app.submit_user_message("hello there".to_string());
+            app.usage = crate::llm::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_tokens: 0,
+            };
+            app.request_count = 2;
+            app.active_skills = vec!["demo".to_string()];
+            let old_session_id = app.session_id.clone();
+
+            let outcome = app.handle_command("/new").await;
+            assert!(outcome.handled);
+            assert!(!outcome.record_history);
+            // The conversation is reset to the system prompt plus the
+            // "started a new session" event notice, with a fresh identity
+            // and cleared counters.
+            assert_eq!(app.messages.len(), 2);
+            assert!(app.messages[0].is_system());
+            assert_eq!(app.request_count, 0);
+            assert_eq!(app.usage, crate::llm::Usage::default());
+            assert!(app.active_skills.is_empty());
+            assert_ne!(app.session_id, old_session_id);
+            assert!(app.current_session_id.is_none());
+            assert!(
+                app.messages
+                    .iter()
+                    .any(|m| m.is_event() && m.content.contains("started a new session"))
+            );
+        }
+
+        #[tokio::test]
+        async fn new_with_an_unknown_path_is_refused() {
+            let mut app = App::new(AppConfig::default());
+            assert!(
+                app.handle_command("/new /nonexistent-catus-workspace")
+                    .await
+                    .handled
+            );
+            assert!(app.status_message.contains("cannot use workspace"));
+        }
+
+        #[tokio::test]
+        async fn new_refuses_while_a_turn_is_in_progress() {
+            let mut app = App::new(AppConfig::default());
+            app.status = AppStatus::Streaming;
+            assert!(app.handle_command("/new").await.handled);
+            assert!(app.status_message.contains("cannot start a new session"));
+        }
+
+        #[tokio::test]
+        async fn new_clears_session_scoped_toggles() {
+            use crate::skills::SkillRegistry;
+
+            let dir =
+                std::env::temp_dir().join(format!("catus_new_toggles_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("demo")).unwrap();
+            std::fs::write(
+                dir.join("demo/SKILL.md"),
+                "---\nname: demo\ndescription: Demo.\n---\nDo things.",
+            )
+            .unwrap();
+
+            let mut app = App::new(AppConfig::default());
+            app.skill_registry = SkillRegistry::discover(&[dir.clone()]).unwrap();
+            app.config.agent.auto_include_skills = true;
+            let prompt =
+                App::build_system_prompt(&app.main_agent, &app.config, &app.skill_registry);
+            app.messages[0] = crate::message::Message::system(prompt);
+            assert!(app.handle_command("/skill disable demo").await.handled);
+            assert!(app.skill_registry.is_disabled("demo"));
+            // The prompt catalog is unchanged by the toggle (prefix stability).
+            assert!(app.messages[0].content.contains("- demo:"));
+
+            // A new context clears the disable flags.
+            assert!(app.handle_command("/new").await.handled);
+            assert!(!app.skill_registry.is_disabled("demo"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    mod skill_toggle {
+        use super::*;
+        use crate::config::AppConfig;
+        use crate::skills::SkillRegistry;
+
+        fn app_with_skill() -> (App, std::path::PathBuf) {
+            let dir =
+                std::env::temp_dir().join(format!("catus_skill_toggle_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("demo")).unwrap();
+            std::fs::write(
+                dir.join("demo/SKILL.md"),
+                "---\nname: demo\ndescription: Demo skill.\n---\nDo the demo thing.",
+            )
+            .unwrap();
+            let mut app = App::new(AppConfig::default());
+            app.skill_registry = SkillRegistry::discover(&[dir.clone()]).unwrap();
+            app.config.agent.auto_include_skills = true;
+            let prompt =
+                App::build_system_prompt(&app.main_agent, &app.config, &app.skill_registry);
+            app.messages[0] = crate::message::Message::system(prompt);
+            (app, dir)
+        }
+
+        #[tokio::test]
+        async fn disable_hides_the_skill_from_the_catalog_but_manual_use_works() {
+            let (mut app, dir) = app_with_skill();
+            assert!(app.messages[0].content.contains("- demo:"));
+
+            assert!(app.handle_command("/skill disable demo").await.handled);
+            assert!(app.skill_registry.is_disabled("demo"));
+            // The prompt catalog is unchanged by the toggle (prefix
+            // stability); only `use_skill` rejects the skill.
+            assert!(app.messages[0].content.contains("- demo:"));
+
+            // Manual activation is unaffected by the LLM-facing disable flag.
+            assert!(app.handle_command("/skill use demo").await.handled);
+            assert!(app.active_skills.contains(&"demo".to_string()));
+
+            assert!(app.handle_command("/skill enable demo").await.handled);
+            assert!(!app.skill_registry.is_disabled("demo"));
+            assert!(app.messages[0].content.contains("- demo:"));
+
+            // Missing argument / unknown skill are errors.
+            assert!(app.handle_command("/skill disable").await.handled);
+            assert!(app.status_message.contains("usage: /skill disable"));
+            assert!(app.handle_command("/skill disable nosuch").await.handled);
+            assert!(app.status_message.contains("skill not found"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    mod mcp_toggle {
+        use super::*;
+        use crate::config::{AppConfig, McpConfig, McpServerConfig, McpTransport};
+
+        fn app_with_mcp() -> App {
+            let mut app = App::new(AppConfig::default());
+            app.config.mcp = Some(McpConfig {
+                servers: vec![McpServerConfig {
+                    name: "calc".to_string(),
+                    transport: McpTransport::Stdio,
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                    url: None,
+                    headers: Default::default(),
+                }],
+            });
+            app
+        }
+
+        #[tokio::test]
+        async fn disable_and_enable_toggle_the_session_flag() {
+            let mut app = app_with_mcp();
+            assert!(app.handle_command("/mcp disable calc").await.handled);
+            assert!(app.disabled_mcp.contains("calc"));
+            let snapshot = app.snapshot();
+            assert!(!snapshot.mcp_servers[0].enabled);
+
+            assert!(app.handle_command("/mcp enable calc").await.handled);
+            assert!(app.disabled_mcp.snapshot().is_empty());
+            assert!(app.snapshot().mcp_servers[0].enabled);
+
+            // Unknown servers and missing arguments are errors.
+            assert!(app.handle_command("/mcp disable nosuch").await.handled);
+            assert!(app.status_message.contains("mcp server not configured"));
+            assert!(app.handle_command("/mcp disable").await.handled);
+            assert!(app.status_message.contains("usage: /mcp disable"));
+        }
+    }
+
+    mod agent_toggle {
+        use super::*;
+        use crate::agents::AgentRegistry;
+        use crate::config::AppConfig;
+
+        fn app_with_agents() -> (App, std::path::PathBuf) {
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let dir = std::env::temp_dir().join(format!(
+                "catus_agent_toggle_{}_{}",
+                std::process::id(),
+                n
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("coder.md"),
+                "---\nname: coder\ndescription: test agent\n---\nDo things.",
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("main.md"),
+                "---\nname: main\ndescription: main agent\n---\nMain body.",
+            )
+            .unwrap();
+            let mut app = App::new(AppConfig::default());
+            app.agent_registry = AgentRegistry::discover(&[dir.clone()]).unwrap();
+            (app, dir)
+        }
+
+        #[tokio::test]
+        async fn disable_blocks_dispatch_until_enabled() {
+            let (mut app, dir) = app_with_agents();
+
+            assert!(app.handle_command("/agent disable coder").await.handled);
+            assert!(app.agent_registry.is_disabled("coder"));
+
+            // Manual dispatch refuses while disabled.
+            assert!(
+                app.handle_command("/agent use coder fix bugs")
+                    .await
+                    .handled
+            );
+            assert!(app.status_message.contains("cannot be dispatched"));
+
+            assert!(app.handle_command("/agent enable coder").await.handled);
+            assert!(!app.agent_registry.is_disabled("coder"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test]
+        async fn special_role_agents_cannot_be_disabled() {
+            let (mut app, dir) = app_with_agents();
+            assert!(app.handle_command("/agent disable main").await.handled);
+            assert!(app.status_message.contains("special role"));
+            assert!(!app.agent_registry.is_disabled("main"));
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[tokio::test]

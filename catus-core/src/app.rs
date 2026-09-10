@@ -167,6 +167,15 @@ pub struct AppSnapshot {
     pub should_quit: bool,
     pub memory_available: bool,
     pub memory_session_enabled: bool,
+    /// Discovered skill catalog with per-session disabled flags (the web
+    /// skill manager page).
+    pub skill_catalog: Vec<SkillCatalogEntry>,
+    /// Configured MCP servers with connection and enable state (the web MCP
+    /// manager page).
+    pub mcp_servers: Vec<McpServerInfo>,
+    /// Discovered agent definitions with role and disable state (the web
+    /// agent manager page).
+    pub agent_catalog: Vec<AgentCatalogEntry>,
     /// Editable config fields as (key, current_value) pairs (the config page).
     pub config_fields: Vec<(String, String)>,
     /// Metadata for the editable config fields (kind + description, drives
@@ -175,6 +184,64 @@ pub struct AppSnapshot {
     /// Per-scope config files with their editable field values (the web
     /// config editor; workspace values override global ones).
     pub config_scopes: Vec<crate::config::ConfigScopeSnapshot>,
+}
+
+/// One skill in the snapshot's skill catalog.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillCatalogEntry {
+    pub name: String,
+    pub description: String,
+    /// Session-scoped disable flag: disabled skills are hidden from the LLM
+    /// (prompt catalog + `use_skill`); manual activation still works.
+    pub disabled: bool,
+}
+
+/// One configured MCP server in the snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpServerInfo {
+    pub name: String,
+    /// Session-scoped enable flag; disabled servers keep their connection
+    /// but their gateway tool is hidden from the LLM.
+    pub enabled: bool,
+    /// Whether the manager currently holds a live connection.
+    pub connected: bool,
+    /// Tool names from the cached catalog.
+    pub tools: Vec<String>,
+}
+
+/// One agent definition in the snapshot's agent catalog.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentCatalogEntry {
+    pub name: String,
+    pub description: String,
+    /// `main`/`memory` for special-role agents; `None` for plain subagents.
+    pub role: Option<String>,
+    /// Session-scoped dispatch disable flag.
+    pub disabled: bool,
+    /// Whether the file can be edited (special-role agents are preview-only).
+    pub editable: bool,
+}
+
+/// Full detail of one agent definition for the editor page.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentDetail {
+    pub name: String,
+    pub description: String,
+    pub role: Option<String>,
+    pub disabled: bool,
+    /// Special-role agents are preview-only.
+    pub editable: bool,
+    pub source_path: String,
+    /// Raw `.md` file content (frontmatter + body).
+    pub content: String,
+}
+
+/// Full raw contents of one skill's `SKILL.md` for the preview page.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SkillPreview {
+    pub name: String,
+    pub description: String,
+    pub content: String,
 }
 
 /// Mutable application state shared between the TUI and async workers.
@@ -237,6 +304,10 @@ pub struct App {
     pub todos: TodoList,
     /// Connected MCP servers, if any.
     pub mcp_manager: Option<Arc<McpManager>>,
+    /// MCP servers temporarily disabled for this session. Shared with the
+    /// gateway tools: disabled servers keep their connection and advertised
+    /// tool (request prefix stays stable); the tool just rejects actions.
+    pub disabled_mcp: crate::mcp::McpDisabledServers,
     /// Agent Memory subsystem state (recall/write passes and toggles).
     pub memory: crate::memory::MemoryState,
     /// All tools available to the LLM: built-in plus MCP-converted.
@@ -563,6 +634,7 @@ impl App {
             active_skills: Vec::new(),
             todos: TodoList::new(),
             mcp_manager: None,
+            disabled_mcp: crate::mcp::McpDisabledServers::new(),
             memory,
             toolbox,
             status: AppStatus::Idle,
@@ -646,6 +718,10 @@ impl App {
     ) -> String {
         let mut prompt = main_agent.body.clone();
 
+        // The catalog always lists every discovered skill, including
+        // session-disabled ones: the prompt must stay byte-stable across
+        // disable/enable toggles so the provider's prefix cache survives.
+        // Disabled skills are rejected by the `use_skill` tool instead.
         if config.agent.auto_include_skills && !registry.is_empty() {
             prompt.push_str("\nThe following Agent Skills are available. ");
             prompt.push_str("When a task matches a skill's description, activate it ");
@@ -676,44 +752,70 @@ impl App {
             self.mcp_manager = None;
         } else {
             log::info!("{} mcp server(s) connected", manager.len());
-            let manager = Arc::new(manager);
-            // One gateway tool per connected server collapses all of the
-            // server's tools behind list/help/invoke actions.
+            self.mcp_manager = Some(Arc::new(manager));
+        }
+        self.rebuild_toolbox();
+        warnings
+    }
+
+    /// Rebuild the full toolbox: built-in tools, one MCP gateway tool per
+    /// connected server (disabled servers keep their tool — it just rejects
+    /// actions at execute time, so the advertised list stays stable), then
+    /// the main agent's allowed-tools filter. The subagent manager's parent
+    /// snapshot is kept in sync.
+    fn rebuild_toolbox(&mut self) {
+        let mut toolbox = Toolbox::default();
+        toolbox.register(std::sync::Arc::new(ShellTool));
+        toolbox.register(std::sync::Arc::new(EditTool));
+        toolbox.register(std::sync::Arc::new(ReadTool));
+        toolbox.register(std::sync::Arc::new(SkillTool));
+        toolbox.register(std::sync::Arc::new(AskUserTool));
+        toolbox.register(std::sync::Arc::new(AskPermissionTool));
+        // Task dispatch tools are only available to the main agent.
+        toolbox.register(std::sync::Arc::new(TaskTool));
+        toolbox.register(std::sync::Arc::new(TaskSyncTool));
+        // The TODO list is a main-agent-only session tool.
+        toolbox.register(std::sync::Arc::new(TodoTool));
+
+        if let Some(manager) = &self.mcp_manager {
             for server in manager.server_names() {
-                let tool = McpServerTool::new(manager.clone(), server);
+                let tool = McpServerTool::new(manager.clone(), &server, self.disabled_mcp.clone());
                 log::info!(
                     "registered mcp gateway tool '{}' for server '{}'",
                     tool.name(),
                     server
                 );
-                self.toolbox.register(Arc::new(tool));
+                toolbox.register(Arc::new(tool));
             }
-            self.mcp_manager = Some(manager.clone());
-            // Re-apply the main agent tool filter so MCP tools are included in
-            // the subagent parent snapshot if allowed.
-            let parent_toolbox =
-                if self.main_agent.allowed_tools.is_empty() || self.main_agent.inherits_tools() {
-                    self.toolbox.clone()
-                } else {
-                    self.toolbox.filter(&self.main_agent.explicit_tools())
-                };
-            self.subagents
-                .update_parent_toolbox(parent_toolbox, Some(manager));
         }
-        warnings
+
+        let toolbox =
+            if self.main_agent.allowed_tools.is_empty() || self.main_agent.inherits_tools() {
+                toolbox
+            } else {
+                toolbox.filter(&self.main_agent.explicit_tools())
+            };
+        self.toolbox = toolbox;
+        self.subagents
+            .update_parent_toolbox(self.toolbox.clone(), self.mcp_manager.clone());
     }
 
     /// Append `text` as a user message.
     ///
-    /// When the Agent Memory subsystem is enabled with `auto_recall`, this
-    /// also dispatches the memory subagent's recall pass; the caller must
-    /// wait for it to finish (via `awaiting_memory_recall`) before starting
-    /// the main LLM stream.
+    /// When the Agent Memory subsystem is enabled with `auto_recall`, the
+    /// session's first user message also dispatches the memory subagent's
+    /// recall pass; the caller must wait for it to finish (via
+    /// `awaiting_memory_recall`) before starting the main LLM stream. Later
+    /// turns of the same session reuse the memory injected at session start
+    /// and start streaming immediately.
     pub fn submit_user_message(&mut self, text: String) {
+        let session_start = !self.messages.iter().any(|m| m.role == Role::User);
         self.messages.push(Message::user(text.clone()));
         self.tool_rounds_this_turn = 0;
         self.queue_event(RuntimeEvent::MessagesChanged);
-        self.maybe_dispatch_memory_recall(&text);
+        if session_start {
+            self.maybe_dispatch_memory_recall(&text);
+        }
         self.persist_session();
     }
 
@@ -882,6 +984,13 @@ impl App {
             .get(name)
             .ok_or_else(|| format!("agent not found: {}", name))?
             .clone();
+        if self.agent_registry.is_disabled(name) {
+            return Err(format!(
+                "agent '{}' is disabled for this session; it cannot be dispatched",
+                name
+            )
+            .into());
+        }
         let id = self.subagents.spawn(
             &definition,
             task.to_string(),
@@ -918,12 +1027,14 @@ impl App {
         }
     }
 
-    /// Dispatch the memory subagent's recall pass for a just-submitted user
-    /// message.
+    /// Dispatch the memory subagent's recall pass for the session's first
+    /// user message.
     ///
-    /// No-op unless memory is enabled with `auto_recall` and no recall pass
-    /// is already running. The main stream is withheld until the pass
-    /// completes (see [`App::awaiting_memory_recall`]).
+    /// No-op unless memory is enabled with `auto_recall`, no memory pass is
+    /// already running, and the message is the first user message of the
+    /// session (later turns reuse the memory injected at session start).
+    /// The main stream is withheld until the pass completes (see
+    /// [`App::awaiting_memory_recall`]).
     pub fn maybe_dispatch_memory_recall(&mut self, user_prompt: &str) {
         if !self.memory.enabled() || !self.config.agent.memory.auto_recall {
             return;
@@ -931,12 +1042,25 @@ impl App {
         if self.memory.pending_recall.is_some() || self.memory.pending_write.is_some() {
             return;
         }
+        if self
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count()
+            > 1
+        {
+            return;
+        }
         let Some(definition) = self.agent_registry.get_by_role(AgentRole::Memory).cloned() else {
             return;
         };
         let task =
             crate::memory::recall_task(user_prompt, &self.memory.memory_dir, &self.shell_state.cwd);
-        let id = self.spawn_memory_subagent(&definition, task);
+        let id = self.spawn_memory_subagent(
+            &definition,
+            task,
+            crate::subagent::SubagentContextMode::Create,
+        );
         self.memory.pending_recall = Some(id);
         self.status = AppStatus::RunningTool;
         self.status_message = "Recalling memory...".to_string();
@@ -945,6 +1069,12 @@ impl App {
     /// Dispatch the memory subagent's summarize/write pass for the turn that
     /// just completed.
     ///
+    /// The pass runs in `fork` mode: it reuses the main agent's context
+    /// prefix (full conversation, including the latest user turn) instead of
+    /// receiving a transcript. When a memory pass is already running, the
+    /// request is queued and dispatched when that pass finishes instead of
+    /// being skipped.
+    ///
     /// Runs in the background: the finished turn is already visible to the
     /// user, and the pass reports through a subagent event when done.
     pub fn maybe_dispatch_memory_write(&mut self) {
@@ -952,34 +1082,49 @@ impl App {
             return;
         }
         if self.memory.pending_recall.is_some() || self.memory.pending_write.is_some() {
+            // A pass is still running: queue this write instead of skipping.
+            self.memory.write_queued = true;
             return;
         }
         let Some(definition) = self.agent_registry.get_by_role(AgentRole::Memory).cloned() else {
             return;
         };
-        let transcript = crate::memory::format_transcript(&self.messages);
-        if transcript.trim().is_empty() {
+        // Without any user message there is no turn to summarize.
+        if !self.messages.iter().any(|m| m.role == Role::User) {
             return;
         }
         let task = crate::memory::summarize_task(
-            &transcript,
+            &definition.body,
             &self.memory.memory_dir,
             &self.shell_state.cwd,
         );
-        let id = self.spawn_memory_subagent(&definition, task);
+        let id = self.spawn_memory_subagent(
+            &definition,
+            task,
+            crate::subagent::SubagentContextMode::Fork,
+        );
         log::info!("memory write pass dispatched as {}", id);
         self.memory.pending_write = Some(id);
+    }
+
+    /// Dispatch a queued write pass once the running one has finished.
+    fn dispatch_queued_memory_write(&mut self) {
+        if self.memory.write_queued && self.memory.pending_write.is_none() {
+            self.memory.write_queued = false;
+            self.maybe_dispatch_memory_write();
+        }
     }
 
     fn spawn_memory_subagent(
         &mut self,
         definition: &AgentDefinition,
         task: String,
+        mode: crate::subagent::SubagentContextMode,
     ) -> crate::subagent::SubagentId {
         self.subagents.spawn(
             definition,
             task,
-            crate::subagent::SubagentContextMode::Create,
+            mode,
             self.messages.clone(),
             self.shell_state.clone(),
             self.active_skills.clone(),
@@ -995,10 +1140,14 @@ impl App {
     }
 
     /// Drive the subagent event loop until both pending memory passes have
-    /// finished. Used by headless (`--test`) mode where nothing else drains
+    /// finished (including any write pass queued behind them). Used by
+    /// headless (`--test`) mode where nothing else drains
     /// `subagents.event_rx`.
     pub async fn await_memory_passes(&mut self) {
-        while self.memory.pending_recall.is_some() || self.memory.pending_write.is_some() {
+        while self.memory.pending_recall.is_some()
+            || self.memory.pending_write.is_some()
+            || self.memory.write_queued
+        {
             match self.subagents.event_rx.recv().await {
                 Some(event) => {
                     self.handle_subagent_event(event);
@@ -1006,6 +1155,7 @@ impl App {
                 None => {
                     self.memory.pending_recall = None;
                     self.memory.pending_write = None;
+                    self.memory.write_queued = false;
                     break;
                 }
             }
@@ -1039,6 +1189,8 @@ impl App {
         }
         if self.memory.pending_write.is_some() {
             lines.push("write pass: running".to_string());
+        } else if self.memory.write_queued {
+            lines.push("write pass: queued".to_string());
         }
         lines.join("\n")
     }
@@ -1090,6 +1242,9 @@ impl App {
             should_quit: self.should_quit,
             memory_available: self.memory.available,
             memory_session_enabled: self.memory.session_enabled,
+            skill_catalog: self.skill_catalog(),
+            mcp_servers: self.mcp_catalog(),
+            agent_catalog: self.agent_catalog(),
             config_fields: self.config_fields(),
             config_field_specs: self.config_field_specs(),
             config_scopes: self.config_scopes(),
@@ -1129,12 +1284,12 @@ impl App {
         if let Some(manager) = &self.mcp_manager {
             let mut total = 0;
             for server in manager.server_names() {
-                let catalog = manager.tool_catalog(server).unwrap_or(&[]);
+                let catalog = manager.tool_catalog(&server).unwrap_or_default();
                 lines.push(format!("server '{}':", server));
                 if catalog.is_empty() {
                     lines.push("  (no tools)".to_string());
                 } else {
-                    for tool in catalog {
+                    for tool in &catalog {
                         lines.push(format!(
                             "- {}: {}",
                             tool.name,
@@ -1184,6 +1339,351 @@ impl App {
         )));
         self.persist_session();
         Ok(format!("activated skill '{}'", name))
+    }
+
+    /// Enable or disable a skill for the LLM (session-scoped).
+    ///
+    /// Disabled skills are rejected by the `use_skill` tool. The system
+    /// prompt is deliberately left untouched — it must stay byte-stable
+    /// across toggles so the provider's prompt prefix cache survives; the
+    /// catalog keeps listing disabled skills, and a disabled `use_skill`
+    /// call returns an error the model can read.
+    ///
+    /// Manual activation (`/skill use`) and already-active skills are
+    /// unaffected.
+    pub fn set_skill_disabled(
+        &mut self,
+        name: &str,
+        disabled: bool,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        if self.skill_registry.get(name).is_none() {
+            return Err(format!("skill not found: {}", name).into());
+        }
+        self.skill_registry.set_disabled(name, disabled);
+        self.persist_session();
+        Ok(if disabled {
+            format!(
+                "skill '{}' disabled: the use_skill tool rejects it; the system \
+                 prompt is unchanged (manual /skill use still works)",
+                name
+            )
+        } else {
+            format!("skill '{}' enabled", name)
+        })
+    }
+
+    /// The discovered skill catalog with session disable flags.
+    pub fn skill_catalog(&self) -> Vec<SkillCatalogEntry> {
+        self.skill_registry
+            .iter()
+            .map(|s| SkillCatalogEntry {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                disabled: self.skill_registry.is_disabled(&s.name),
+            })
+            .collect()
+    }
+
+    /// Full raw contents of a skill's `SKILL.md` for the preview page.
+    pub fn skill_preview(&self, name: &str) -> Result<SkillPreview, Box<dyn std::error::Error>> {
+        let skill = self
+            .skill_registry
+            .get(name)
+            .ok_or_else(|| format!("skill not found: {}", name))?;
+        let path = skill.root.join("SKILL.md");
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+        Ok(SkillPreview {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            content,
+        })
+    }
+
+    /// The configured MCP servers with connection and enable state.
+    pub fn mcp_catalog(&self) -> Vec<McpServerInfo> {
+        let Some(mcp) = self.config.mcp.as_ref() else {
+            return Vec::new();
+        };
+        mcp.servers
+            .iter()
+            .map(|s| {
+                let connected = self
+                    .mcp_manager
+                    .as_ref()
+                    .map(|m| m.is_connected(&s.name))
+                    .unwrap_or(false);
+                let tools = self
+                    .mcp_manager
+                    .as_ref()
+                    .and_then(|m| m.tool_catalog(&s.name))
+                    .map(|catalog| catalog.iter().map(|t| t.name.clone()).collect())
+                    .unwrap_or_default();
+                McpServerInfo {
+                    name: s.name.clone(),
+                    enabled: !self.disabled_mcp.contains(&s.name),
+                    connected,
+                    tools,
+                }
+            })
+            .collect()
+    }
+
+    /// Enable or disable an MCP server for the LLM (session-scoped).
+    ///
+    /// Disabling only flips a shared flag the gateway tools check at execute
+    /// time: the connection (if any) stays open and the advertised tool list
+    /// is untouched, so the request prefix the provider caches stays stable.
+    pub fn set_mcp_enabled(
+        &mut self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let configured = self
+            .config
+            .mcp
+            .as_ref()
+            .map(|m| m.servers.iter().any(|s| s.name == name))
+            .unwrap_or(false);
+        if !configured {
+            return Err(format!("mcp server not configured: {}", name).into());
+        }
+        self.disabled_mcp.set(name, !enabled);
+        self.persist_session();
+        Ok(if enabled {
+            format!("mcp server '{}' enabled", name)
+        } else {
+            format!(
+                "mcp server '{}' disabled: its gateway tool rejects actions; \
+                 the advertised tool list is unchanged",
+                name
+            )
+        })
+    }
+
+    /// Connect to one configured MCP server on demand (the web UI's connect
+    /// action). Servers already connected are reported as such; the gateway
+    /// tool is registered after a successful connect.
+    pub async fn connect_mcp_server(
+        &mut self,
+        name: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let config = self
+            .config
+            .mcp
+            .as_ref()
+            .and_then(|m| m.servers.iter().find(|s| s.name == name))
+            .cloned()
+            .ok_or_else(|| format!("mcp server not configured: {}", name))?;
+        if self.disabled_mcp.contains(name) {
+            return Err(format!("mcp server '{}' is disabled; enable it first", name).into());
+        }
+        if self
+            .mcp_manager
+            .as_ref()
+            .map(|m| m.is_connected(name))
+            .unwrap_or(false)
+        {
+            return Ok(format!("mcp server '{}' is already connected", name));
+        }
+        let manager = self
+            .mcp_manager
+            .get_or_insert_with(|| Arc::new(McpManager::empty()));
+        let catalog = manager
+            .connect_one(&config)
+            .await
+            .map_err(|e| format!("failed to connect mcp server '{}': {}", name, e))?;
+        let count = catalog.len();
+        self.rebuild_toolbox();
+        self.persist_session();
+        Ok(format!(
+            "connected mcp server '{}' ({} tool(s))",
+            name, count
+        ))
+    }
+
+    /// Enable or disable an agent for dispatch (session-scoped).
+    ///
+    /// Special-role agents (`main`, `memory`) cannot be disabled: the main
+    /// agent drives the conversation and the memory subsystem depends on its
+    /// agent. Restoring saved subagents ignores the flag, so `/resume` keeps
+    /// working.
+    pub fn set_agent_enabled(
+        &mut self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let agent = self
+            .agent_registry
+            .get(name)
+            .ok_or_else(|| format!("agent not found: {}", name))?;
+        if agent.role.is_some() {
+            return Err(
+                format!("agent '{}' has a special role and cannot be disabled", name).into(),
+            );
+        }
+        self.agent_registry.set_disabled(name, !enabled);
+        self.persist_session();
+        Ok(if enabled {
+            format!("agent '{}' enabled", name)
+        } else {
+            format!(
+                "agent '{}' disabled: task/taskSync dispatch and /agent use reject it",
+                name
+            )
+        })
+    }
+
+    /// The discovered agent catalog with role and disable state.
+    pub fn agent_catalog(&self) -> Vec<AgentCatalogEntry> {
+        self.agent_registry
+            .iter()
+            .map(|a| AgentCatalogEntry {
+                name: a.name.clone(),
+                description: a.description.clone(),
+                role: a.role.map(|r| r.as_str().to_string()),
+                disabled: self.agent_registry.is_disabled(&a.name),
+                editable: a.role.is_none(),
+            })
+            .collect()
+    }
+
+    /// Detail of one agent definition for the editor page: the raw `.md`
+    /// file content plus role/disable state. Special-role agents return the
+    /// content too (preview-only; saving is refused by `save_agent`).
+    pub fn agent_detail(&self, name: &str) -> Result<AgentDetail, Box<dyn std::error::Error>> {
+        let agent = self
+            .agent_registry
+            .get(name)
+            .ok_or_else(|| format!("agent not found: {}", name))?;
+        let content = if agent.source_path.as_os_str().is_empty() {
+            String::new()
+        } else {
+            std::fs::read_to_string(&agent.source_path)
+                .map_err(|e| format!("failed to read {}: {}", agent.source_path.display(), e))?
+        };
+        Ok(AgentDetail {
+            name: agent.name.clone(),
+            description: agent.description.clone(),
+            role: agent.role.map(|r| r.as_str().to_string()),
+            disabled: self.agent_registry.is_disabled(name),
+            editable: agent.role.is_none(),
+            source_path: agent.source_path.display().to_string(),
+            content,
+        })
+    }
+
+    /// Validate agent `.md` content against a candidate file name without
+    /// touching any real definition file (a temp file is used and removed).
+    fn validate_agent_content(name: &str, content: &str) -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!(
+            "catus-agent-validate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("failed to create validation dir: {}", e))?;
+        let path = dir.join(format!("{}.md", name));
+        let result = (|| -> Result<(), String> {
+            std::fs::write(&path, content)
+                .map_err(|e| format!("failed to write validation file: {}", e))?;
+            let definition = AgentDefinition::load(&path)
+                .map_err(|e| format!("invalid agent definition: {}", e))?;
+            if definition.name != name {
+                return Err(format!(
+                    "frontmatter name '{}' does not match the agent name '{}'",
+                    definition.name, name
+                ));
+            }
+            if definition.role.is_some() {
+                return Err(
+                    "new/edited agents must be plain subagents (no `role` field)".to_string(),
+                );
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+        result
+    }
+
+    /// Re-discover the agent registry, keeping the session's disabled set
+    /// for agents that still exist.
+    fn reload_agent_registry(&mut self) -> Result<(), String> {
+        let mut search_paths = AgentRegistry::default_paths();
+        if let Some(extra) = &self.config.agent.agent_paths {
+            search_paths.extend(extra.iter().cloned());
+        }
+        let registry = AgentRegistry::discover(&search_paths)?;
+        let disabled: Vec<String> = self
+            .agent_registry
+            .disabled_names()
+            .to_vec()
+            .into_iter()
+            .filter(|n| registry.get(n).is_some())
+            .collect();
+        self.agent_registry = registry;
+        self.agent_registry.set_disabled_names(disabled);
+        Ok(())
+    }
+
+    /// Save an edited agent definition back to its source file. Special-role
+    /// agents (`main`, `memory`) are read-only. The content is validated
+    /// before the file is written; the registry is re-discovered afterwards.
+    pub fn save_agent(
+        &mut self,
+        name: &str,
+        content: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let agent = self
+            .agent_registry
+            .get(name)
+            .ok_or_else(|| format!("agent not found: {}", name))?;
+        if agent.role.is_some() {
+            return Err(format!(
+                "agent '{}' has a special role and is read-only (preview only)",
+                name
+            )
+            .into());
+        }
+        let path = agent.source_path.clone();
+        Self::validate_agent_content(name, content)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, content)?;
+        self.reload_agent_registry()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        Ok(format!("saved agent '{}' to {}", name, path.display()))
+    }
+
+    /// Create a new agent definition in the workspace `.sutcac/agents/`
+    /// directory and re-discover the registry.
+    pub fn create_agent(
+        &mut self,
+        name: &str,
+        content: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        crate::frontmatter::validate_name(name)
+            .map_err(|e| format!("invalid agent name '{}': {}", name, e))?;
+        if self.agent_registry.get(name).is_some() {
+            return Err(format!("agent '{}' already exists", name).into());
+        }
+        let mut dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        dir.push(".sutcac");
+        dir.push("agents");
+        let path = dir.join(format!("{}.md", name));
+        Self::validate_agent_content(name, content)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(&path, content)?;
+        self.reload_agent_registry()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        Ok(format!("created agent '{}' at {}", name, path.display()))
     }
 
     /// Return the editable config fields as (key, current_value) pairs.
@@ -1849,6 +2349,44 @@ impl App {
         }
     }
 
+    /// The newest `limit` sessions of the current workspace, for the web
+    /// sidebar's history menu.
+    pub fn list_recent_sessions(&self, limit: usize) -> Vec<crate::history::SessionSummary> {
+        self.history_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .list_sessions(&self.session_cwd)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .take(limit)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every session of every workspace, grouped client-side by `cwd`.
+    pub fn list_all_sessions(&self) -> Vec<crate::history::SessionSummary> {
+        self.history_store
+            .as_ref()
+            .map(|store| store.list_sessions_all().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// First user prompt of the current session, whitespace-collapsed and
+    /// truncated; persisted with the session row so lists can hint at the
+    /// conversation content.
+    pub fn session_summary(&self) -> String {
+        let raw = self
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        truncate(&collapsed, 200)
+    }
+
     /// Return a human-readable list of available history names for the status
     /// bar.
     pub fn history_names_list(&self) -> String {
@@ -1863,8 +2401,9 @@ impl App {
     /// Build the key/value state persisted alongside the conversation.
     fn persist_state(&self) -> std::collections::HashMap<String, String> {
         use crate::history::{
-            STATE_MEMORY_ENABLED, STATE_PENDING_INTERACTION, STATE_PENDING_TOOL_CALLS,
-            STATE_SHELL_CWD, STATE_SHELL_EXPORTED, STATE_SHELL_VARS, STATE_TODOS,
+            STATE_DISABLED_AGENTS, STATE_DISABLED_MCP, STATE_DISABLED_SKILLS, STATE_MEMORY_ENABLED,
+            STATE_PENDING_INTERACTION, STATE_PENDING_TOOL_CALLS, STATE_SHELL_CWD,
+            STATE_SHELL_EXPORTED, STATE_SHELL_VARS, STATE_TODOS,
         };
         let mut state = std::collections::HashMap::new();
         state.insert(
@@ -1893,6 +2432,15 @@ impl App {
             STATE_MEMORY_ENABLED.to_string(),
             self.memory.session_enabled.to_string(),
         );
+        if let Ok(json) = serde_json::to_string(self.skill_registry.disabled_names()) {
+            state.insert(STATE_DISABLED_SKILLS.to_string(), json);
+        }
+        if let Ok(json) = serde_json::to_string(&self.disabled_mcp.snapshot()) {
+            state.insert(STATE_DISABLED_MCP.to_string(), json);
+        }
+        if let Ok(json) = serde_json::to_string(self.agent_registry.disabled_names()) {
+            state.insert(STATE_DISABLED_AGENTS.to_string(), json);
+        }
         state
     }
 
@@ -1918,6 +2466,7 @@ impl App {
                     &self.session_id,
                     &self.current_model.id,
                     &self.session_cwd,
+                    &self.session_summary(),
                 ) {
                     Ok(id) => {
                         created = Some(id);
@@ -1949,6 +2498,7 @@ impl App {
             usage: self.usage,
             active_skills: self.active_skills.clone(),
             tool_rounds: self.tool_rounds_this_turn,
+            summary: Some(self.session_summary()),
         };
         let subagents = self.subagents.snapshot();
         let state = self.persist_state();
@@ -2045,6 +2595,8 @@ impl App {
                         should_resume = self.status == AppStatus::Idle;
                     }
                 }
+                // A write requested while this pass was running is next.
+                self.dispatch_queued_memory_write();
             }
             SubagentEvent::Error { id, error } => {
                 log::error!("subagent {} error: {}", id, error);
@@ -2071,6 +2623,7 @@ impl App {
                         should_resume = self.status == AppStatus::Idle;
                     }
                 }
+                self.dispatch_queued_memory_write();
             }
         }
         self.subagents.handle_event(&event);
@@ -2099,6 +2652,30 @@ impl App {
         let snapshot = store
             .load_session(id)?
             .ok_or_else(|| format!("history not found: {}", name))?;
+
+        // Session-scoped disable sets are restored before the system prompt
+        // rebuild so the skill catalog reflects them.
+        if let Some(names) = snapshot
+            .state
+            .get(crate::history::STATE_DISABLED_SKILLS)
+            .and_then(|j| serde_json::from_str(j).ok())
+        {
+            self.skill_registry.set_disabled_names(names);
+        }
+        if let Some(names) = snapshot
+            .state
+            .get(crate::history::STATE_DISABLED_MCP)
+            .and_then(|j| serde_json::from_str(j).ok())
+        {
+            self.disabled_mcp.replace(names);
+        }
+        if let Some(names) = snapshot
+            .state
+            .get(crate::history::STATE_DISABLED_AGENTS)
+            .and_then(|j| serde_json::from_str(j).ok())
+        {
+            self.agent_registry.set_disabled_names(names);
+        }
 
         // Reset to the configured system prompt, then load the saved messages.
         let system_prompt =
@@ -2224,6 +2801,7 @@ impl App {
         }
         self.memory.pending_recall = None;
         self.memory.pending_write = None;
+        self.memory.write_queued = false;
 
         // Subagents: terminal records restore as-is; still-running ones
         // restart their turn loop from the saved messages.
@@ -2252,6 +2830,205 @@ impl App {
         self.session_name = snapshot.meta.name.clone();
         self.queue_event(RuntimeEvent::MessagesChanged);
         Ok("session resumed".to_string())
+    }
+
+    /// Persist the current session and start a fresh conversation context
+    /// (`/new`).
+    ///
+    /// With `path`, the process fully switches workspace first: config,
+    /// agent definitions, skills, MCP servers, and the session cwd are
+    /// reloaded from the target directory (mirroring a `-w` restart) while
+    /// the process stays alive. Without `path`, only the conversation state
+    /// resets; registries are re-discovered so on-disk changes are picked up.
+    ///
+    /// Refuses to run while anything is in flight (stream, pending tool
+    /// calls or interaction, memory pass, running subagents).
+    pub async fn start_new_session(
+        &mut self,
+        path: Option<&str>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        if self.status == AppStatus::Streaming || self.status == AppStatus::RunningTool {
+            return Err(
+                "cannot start a new session while a turn is in progress; wait for it to finish"
+                    .into(),
+            );
+        }
+        if self.pending_interaction.is_some() {
+            return Err("cannot start a new session while a question is pending".into());
+        }
+        if !self.pending_tool_calls.is_empty() {
+            return Err("cannot start a new session while tool calls are pending".into());
+        }
+        if self.memory.pending_recall.is_some()
+            || self.memory.pending_write.is_some()
+            || self.memory.write_queued
+        {
+            return Err("cannot start a new session while a memory pass is running".into());
+        }
+        if self.subagents.running_count() > 0 {
+            return Err(
+                "cannot start a new session while subagents are running; close them with /agent close"
+                    .into(),
+            );
+        }
+
+        // Finalize the old session under the old workspace before anything
+        // changes.
+        self.persist_session();
+
+        let mut switched_workspace = false;
+        if let Some(path) = path.map(str::trim).filter(|s| !s.is_empty()) {
+            let resolved = std::path::Path::new(path)
+                .canonicalize()
+                .map_err(|e| format!("cannot use workspace '{}': {}", path, e))?;
+            if !resolved.is_dir() {
+                return Err(
+                    format!("workspace '{}' is not a directory", resolved.display()).into(),
+                );
+            }
+            // Pre-validate that the target workspace provides a main agent so
+            // a failed switch leaves the process untouched. The candidate
+            // workspace path replaces the cwd-derived default search path.
+            let mut search = vec![resolved.join(".sutcac").join("agents")];
+            search.extend(AgentRegistry::default_paths().into_iter().skip(1));
+            let registry = AgentRegistry::discover(&search)
+                .map_err(|e| format!("agent discovery failed in {}: {}", resolved.display(), e))?;
+            if registry.get("main").is_none() {
+                return Err(format!(
+                    "workspace '{}' has no .sutcac/agents/main.md; create it before switching",
+                    resolved.display()
+                )
+                .into());
+            }
+
+            std::env::set_current_dir(&resolved)
+                .map_err(|e| format!("cannot enter workspace '{}': {}", resolved.display(), e))?;
+            let mut config = AppConfig::load()
+                .map_err(|e| format!("failed to load config in new workspace: {}", e))?;
+            // Storage directories (history, memory) stay at the fixed XDG
+            // locations; only workspace-resolved settings are reloaded.
+            config.dirs = self.config.dirs.clone();
+            self.config = config;
+            self.config_path = AppConfig::config_save_path();
+
+            let models = match self.config.resolve_models() {
+                Ok(models) => models,
+                Err(e) => {
+                    log::warn!(
+                        "no usable model configuration in new workspace ({}); using placeholder",
+                        e
+                    );
+                    vec![Model::default()]
+                }
+            };
+            self.models = models;
+            // Keep the current model when the new workspace still configures
+            // it; otherwise fall back to the first configured model.
+            self.current_model = self
+                .models
+                .iter()
+                .find(|m| m.id == self.current_model.id)
+                .cloned()
+                .or_else(|| self.models.first().cloned())
+                .unwrap_or_default();
+
+            let (agent_registry, main_agent, main_agent_from_file) =
+                Self::load_main_agent(&self.config);
+            self.agent_registry = agent_registry;
+            self.main_agent = main_agent;
+            self.main_agent_from_file = main_agent_from_file;
+            self.rebuild_client();
+            switched_workspace = true;
+        }
+
+        // Fresh session identity: the next persist creates a new history row.
+        self.session_id = new_session_id();
+        self.session_name = new_session_name();
+        self.current_session_id = None;
+        self.session_cwd = session_cwd();
+        self.shell_state.cwd = std::path::PathBuf::from(&self.session_cwd);
+
+        // Re-discover workspace skills; session disable flags reset.
+        let mut search_paths = SkillRegistry::default_paths();
+        if let Some(extra) = &self.config.agent.skill_paths {
+            search_paths.extend(extra.iter().cloned());
+        }
+        self.skill_registry = SkillRegistry::discover(&search_paths).unwrap_or_else(|e| {
+            log::warn!("failed to discover skills: {}", e);
+            SkillRegistry::new()
+        });
+        self.agent_registry.set_disabled_names(Vec::new());
+        self.disabled_mcp.clear();
+
+        // Reset turn and session state.
+        self.usage = Usage::default();
+        self.request_count = 0;
+        self.tool_rounds_this_turn = 0;
+        self.pending_tool_calls = Vec::new();
+        self.pending_interaction = None;
+        self.active_skills = Vec::new();
+        self.todos = TodoList::new();
+
+        // Rebuild the shell policy from the config + main agent permission,
+        // which also drops session permission grants and re-bases path
+        // permissions on the (possibly new) workspace.
+        let shell_perm = self
+            .main_agent
+            .permission
+            .clone()
+            .or_else(|| self.config.shell.as_ref().and_then(|s| s.perm_mode.clone()));
+        let mut shell_config = self.config.shell.clone().unwrap_or_default();
+        shell_config.perm_mode = shell_perm;
+        let (permissions, audit_logger) = (
+            shell_config.permission_policy(),
+            shell_config.audit_logger(),
+        );
+        self.shell_state.set_permission_policy(permissions);
+        self.shell_state.set_audit_logger(audit_logger);
+        self.shell_state.permissions.base_dir = self.path_base_dir();
+
+        // Fresh subagent manager with the reset parent snapshot.
+        let tier_models = self
+            .config
+            .resolve_tier_models(&self.models)
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "invalid tier model configuration ({}); tiers fall back to the current model",
+                    e
+                );
+                TierModels {
+                    performance: self.current_model.clone(),
+                    efficient: self.current_model.clone(),
+                }
+            });
+        self.subagents = SubagentManager::new(
+            self.toolbox.clone(),
+            tier_models,
+            self.current_model.clone(),
+            self.config.clone(),
+            None,
+        );
+
+        // Memory subsystem: the session toggle returns to the config default.
+        self.memory = crate::memory::MemoryState::init(&self.config, &self.agent_registry);
+
+        // New conversation with a system prompt honoring the fresh registry.
+        let system_prompt =
+            Self::build_system_prompt(&self.main_agent, &self.config, &self.skill_registry);
+        self.messages = vec![Message::system(system_prompt)];
+
+        if switched_workspace {
+            self.mcp_manager = None;
+            self.connect_mcp().await;
+        } else {
+            self.rebuild_toolbox();
+        }
+
+        self.queue_event(RuntimeEvent::MessagesChanged);
+        Ok(format!(
+            "started a new session (workspace: {})",
+            self.session_cwd
+        ))
     }
 
     /// Handle a slash command. Returns the outcome describing how the input
@@ -2330,8 +3107,9 @@ impl App {
                     TurnPhase::Complete
                 } else {
                     log::info!("no pending tool call; turn complete");
-                    // Turn finished: hand the transcript to the memory
-                    // subagent's summarize/write pass (runs in background).
+                    // Turn finished: hand the turn over to the memory
+                    // subagent's summarize/write pass (forks the main
+                    // context, runs in background; queued when busy).
                     self.maybe_dispatch_memory_write();
                     self.persist_session();
                     TurnPhase::Complete
@@ -2436,6 +3214,137 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn write_demo_skill(root: &std::path::Path) -> std::path::PathBuf {
+        let dir = root.join("skills");
+        std::fs::create_dir_all(dir.join("demo")).unwrap();
+        std::fs::write(
+            dir.join("demo/SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill.\n---\nDo demo things.",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn session_summary_and_disabled_toggles_persist_and_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = write_demo_skill(dir.path());
+
+        let mut app = App::new(test_config_with_history_dir(dir.path()));
+        app.skill_registry = SkillRegistry::discover(&[skills_dir.clone()]).unwrap();
+        app.config.agent.auto_include_skills = true;
+        let prompt = App::build_system_prompt(&app.main_agent, &app.config, &app.skill_registry);
+        app.messages[0] = Message::system(prompt);
+
+        // The first user prompt becomes the session summary.
+        app.submit_user_message("summarize this unique prompt 42".to_string());
+        assert!(
+            app.session_summary()
+                .contains("summarize this unique prompt 42")
+        );
+
+        // The disable flags persist as session state.
+        assert!(app.handle_command("/skill disable demo").await.handled);
+        assert!(app.skill_registry.is_disabled("demo"));
+        // /new starts a fresh context and clears the flags.
+        app.handle_command("/new").await;
+        assert!(!app.skill_registry.is_disabled("demo"));
+        app.skill_registry.set_disabled("demo", true);
+        app.persist_session();
+
+        let name = app.list_session_names().into_iter().next().unwrap();
+
+        // A fresh app resumes the session with the flags intact.
+        let mut app2 = App::new(test_config_with_history_dir(dir.path()));
+        app2.skill_registry = SkillRegistry::discover(&[skills_dir.clone()]).unwrap();
+        app2.config.agent.auto_include_skills = true;
+        app2.resume_history(Some(&name)).await.unwrap();
+        assert!(app2.skill_registry.is_disabled("demo"));
+        // The prompt keeps listing the disabled skill (prefix stability).
+        assert!(app2.messages[0].content.contains("- demo:"));
+
+        // The persisted summary is available through the store listing.
+        let summaries = app2
+            .history_store
+            .as_ref()
+            .unwrap()
+            .list_sessions_all()
+            .unwrap();
+        assert!(
+            summaries
+                .iter()
+                .any(|s| s.summary.contains("summarize this unique prompt 42"))
+        );
+    }
+
+    #[tokio::test]
+    async fn start_new_session_guards_in_flight_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::new(test_config_with_history_dir(dir.path()));
+        app.status = AppStatus::RunningTool;
+        assert!(app.start_new_session(None).await.is_err());
+
+        app.status = AppStatus::Idle;
+        app.pending_tool_calls.push(ToolCall {
+            id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{}".to_string(),
+        });
+        assert!(app.start_new_session(None).await.is_err());
+
+        app.pending_tool_calls.clear();
+        let msg = app.start_new_session(None).await.unwrap();
+        assert!(msg.contains("started a new session"));
+        assert_eq!(app.messages.len(), 1);
+        assert!(app.current_session_id.is_none());
+    }
+
+    #[test]
+    fn agent_catalog_reports_roles_and_editability() {
+        let dir = std::env::temp_dir().join(format!("catus_agent_catalog_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.md"),
+            "---\nname: main\ndescription: main\n---\nBody",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("memory.md"),
+            "---\nname: memory\ndescription: memory\nrole: memory\n---\nBody",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("coder.md"),
+            "---\nname: coder\ndescription: coder\n---\nBody",
+        )
+        .unwrap();
+
+        let mut app = App::new(test_config_with_history_dir(&dir));
+        app.agent_registry = AgentRegistry::discover(&[dir.clone()]).unwrap();
+
+        let catalog = app.agent_catalog();
+        let by_name = |name: &str| catalog.iter().find(|a| a.name == name).unwrap().clone();
+        assert!(by_name("main").role.as_deref() == Some("main"));
+        assert!(!by_name("main").editable);
+        assert!(!by_name("memory").editable);
+        assert!(by_name("coder").role.is_none());
+        assert!(by_name("coder").editable);
+
+        // Disabling shows up in the catalog; special roles are refused.
+        app.set_agent_enabled("coder", false).unwrap();
+        assert!(
+            app.agent_catalog()
+                .iter()
+                .find(|a| a.name == "coder")
+                .unwrap()
+                .disabled
+        );
+        assert!(app.set_agent_enabled("memory", false).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn system_prompt_skills_when_empty_or_disabled() {
         let dir = std::env::temp_dir().join(format!("catus_sysprompt_min_{}", std::process::id()));
@@ -2474,7 +3383,7 @@ mod tests {
     ) -> crate::history::SessionStore {
         let store = crate::history::SessionStore::open(dir).unwrap();
         let id = store
-            .create_session(name, "catus-seed", "test-model", &session_cwd())
+            .create_session(name, "catus-seed", "test-model", &session_cwd(), "")
             .unwrap();
         store
             .replace_messages(id, crate::history::MAIN_AGENT_ID, messages)
@@ -3168,11 +4077,6 @@ log_level = "info"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Helper that submits a user message directly.
-    fn submit_message(app: &mut App, text: &str) {
-        app.submit_user_message(text.to_string());
-    }
-
     fn ask_tool_call() -> ToolCall {
         ToolCall {
             id: "call_ask".to_string(),
@@ -3484,21 +4388,22 @@ log_level = "info"
                 .any(|m| m.is_system() && m.content.contains("opt-level=3"))
         );
 
-        // A recall=false completion injects nothing (the recall injected for
-        // the first turn stays in the conversation).
-        app.submit_user_message("hi".to_string());
-        assert!(app.awaiting_memory_recall());
-        let id = app.memory.pending_recall.clone().unwrap();
-        let recalled = app
-            .messages
-            .iter()
-            .filter(|m| m.is_system() && m.content.contains("Recalled memory"))
-            .count();
+        // A stale completion event is a no-op, and later turns of the
+        // session do not recall again (the session-start memory stays in
+        // the conversation).
         app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {
             id,
             result: r#"{"recall": false}"#.to_string(),
         });
         assert!(!app.awaiting_memory_recall());
+        let recalled = app
+            .messages
+            .iter()
+            .filter(|m| m.is_system() && m.content.contains("Recalled memory"))
+            .count();
+        app.submit_user_message("hi".to_string());
+        assert!(!app.awaiting_memory_recall());
+        assert!(app.memory.pending_recall.is_none());
         assert_eq!(
             app.messages
                 .iter()
@@ -3539,6 +4444,51 @@ log_level = "info"
     }
 
     #[tokio::test]
+    async fn memory_write_queues_while_pass_running() {
+        let dir = std::env::temp_dir().join(format!("catus_memory_queue_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_agent_files(&dir);
+        let _xdg = isolate_xdg_config(&dir);
+
+        let config = memory_test_config(&dir, true);
+        let mut app = App::new(config);
+        app.messages.push(Message::user("remember I like rust"));
+        app.messages.push(Message::assistant("noted"));
+
+        app.maybe_dispatch_memory_write();
+        let first = app.memory.pending_write.clone().expect("first write");
+        // A write requested while the first pass runs is queued, not skipped.
+        app.maybe_dispatch_memory_write();
+        assert!(app.memory.write_queued);
+        assert_eq!(app.memory.pending_write.as_deref(), Some(first.as_str()));
+
+        // Completing the running pass dispatches the queued one.
+        app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {
+            id: first,
+            result: r#"{"written": false}"#.to_string(),
+        });
+        assert!(!app.memory.write_queued);
+        let second = app.memory.pending_write.clone().expect("queued write");
+        assert!(app.subagents.get(&second).is_some());
+
+        // The queued pass completes normally.
+        app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {
+            id: second,
+            result: r#"{"written": true, "summary": "likes rust"}"#.to_string(),
+        });
+        assert!(app.memory.pending_write.is_none());
+        assert!(!app.memory.write_queued);
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.is_event() && m.content.contains("memory updated: likes rust"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn memory_write_pass_runs_after_turn_completion() {
         let dir = std::env::temp_dir().join(format!("catus_memory_write_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3557,10 +4507,15 @@ log_level = "info"
         app.messages.push(Message::assistant("noted"));
         app.maybe_dispatch_memory_write();
         let id = app.memory.pending_write.clone().expect("write dispatched");
-        // The dispatched task contains the turn transcript and the store path.
-        let task = &app.subagents.get(&id).unwrap().task;
-        assert!(task.contains("remember I like rust"));
-        assert!(task.contains("memory-book"));
+        // The write pass forks the main agent: the task carries the memory
+        // agent's instructions and the store path, and the context mode is
+        // `fork` (the runner clones the main conversation prefix).
+        let sub = app.subagents.get(&id).unwrap();
+        assert_eq!(sub.mode, crate::subagent::SubagentContextMode::Fork);
+        assert!(sub.task.contains("memory-book"));
+        // The memory agent's definition body travels with the task (fork
+        // mode does not inject it as a system message).
+        assert!(sub.task.contains("Memory agent body."));
 
         // A written=false result clears the pass without an event line.
         app.handle_subagent_event(crate::subagent::SubagentEvent::Completed {

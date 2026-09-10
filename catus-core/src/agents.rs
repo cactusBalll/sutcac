@@ -238,12 +238,19 @@ impl AgentDefinition {
 #[derive(Debug, Clone, Default)]
 pub struct AgentRegistry {
     agents: Vec<AgentDefinition>,
+    /// Names of agents temporarily disabled for dispatch (session-scoped).
+    /// Special-role agents (`main`, `memory`) cannot be disabled. Restoring
+    /// saved subagents ignores this flag so `/resume` keeps working.
+    disabled: Vec<String>,
 }
 
 impl AgentRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self { agents: Vec::new() }
+        Self {
+            agents: Vec::new(),
+            disabled: Vec::new(),
+        }
     }
 
     /// Discover agent definitions under each search path.
@@ -345,6 +352,33 @@ impl AgentRegistry {
             .iter()
             .map(|a| (a.name.as_str(), a.description.as_str()))
             .collect()
+    }
+
+    /// Whether an agent is temporarily disabled for dispatch.
+    pub fn is_disabled(&self, name: &str) -> bool {
+        self.disabled.iter().any(|n| n == name)
+    }
+
+    /// Disable or re-enable an agent for dispatch. Callers must refuse to
+    /// disable special-role agents (`main`/`memory`).
+    pub fn set_disabled(&mut self, name: &str, disabled: bool) {
+        if disabled {
+            if !self.is_disabled(name) {
+                self.disabled.push(name.to_string());
+            }
+        } else {
+            self.disabled.retain(|n| n != name);
+        }
+    }
+
+    /// The disabled agent names (persisted as session state).
+    pub fn disabled_names(&self) -> &[String] {
+        &self.disabled
+    }
+
+    /// Restore the disabled set (session resume).
+    pub fn set_disabled_names(&mut self, names: Vec<String>) {
+        self.disabled = names;
     }
 }
 

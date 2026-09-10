@@ -14,7 +14,7 @@ use super::{
 use crate::message::{Message, Role};
 
 /// Current schema version; bump when the layout changes and add a migration.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// SQL result type. `rusqlite::Error` covers open, query, and commit errors.
 type Result<T> = std::result::Result<T, rusqlite::Error>;
@@ -74,7 +74,8 @@ impl SessionStore {
                 usage_json TEXT NOT NULL DEFAULT '{}',
                 active_skills_json TEXT NOT NULL DEFAULT '[]',
                 tool_rounds INTEGER NOT NULL DEFAULT 0,
-                cwd TEXT NOT NULL DEFAULT ''
+                cwd TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS messages (
                 session_id INTEGER NOT NULL,
@@ -124,6 +125,30 @@ impl SessionStore {
                     )?;
                 }
             }
+            // v2 -> v3: add the first-user-prompt summary column and backfill
+            // it from the earliest stored user message.
+            if version < 3 {
+                let has_summary = conn
+                    .prepare("PRAGMA table_info(sessions)")?
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .any(|col| col.as_deref() == Ok("summary"));
+                if !has_summary {
+                    conn.execute(
+                        "ALTER TABLE sessions ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+                        [],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE sessions SET summary = COALESCE((
+                        SELECT substr(m.content, 1, 200) FROM messages m
+                        WHERE m.session_id = sessions.id AND m.agent_id = 'main'
+                              AND m.role = 'user'
+                        ORDER BY m.seq LIMIT 1
+                     ), '')
+                     WHERE summary = ''",
+                    [],
+                )?;
+            }
             conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), [])?;
         } else if version > SCHEMA_VERSION {
             return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
@@ -140,30 +165,34 @@ impl SessionStore {
 
     /// Create a new session row and return its id. The name must be unique;
     /// callers generate timestamp-based names. `cwd` records the working
-    /// directory the session belongs to (sessions are listed per workspace).
+    /// directory the session belongs to (sessions are listed per workspace);
+    /// `summary` carries the first user prompt for list displays.
     pub fn create_session(
         &self,
         name: &str,
         session_id: &str,
         model_id: &str,
         cwd: &str,
+        summary: &str,
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp_millis();
         conn.execute(
-            "INSERT INTO sessions (name, created_at, updated_at, session_id, model_id, cwd)
-             VALUES (?1, ?2, ?2, ?3, ?4, ?5)",
-            params![name, now, session_id, model_id, cwd],
+            "INSERT INTO sessions (name, created_at, updated_at, session_id, model_id, cwd, summary)
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)",
+            params![name, now, session_id, model_id, cwd, summary],
         )?;
         Ok(conn.last_insert_rowid())
     }
 
     /// Persist per-session metadata (upsert by id) and refresh `updated_at`.
+    /// A non-empty `meta.summary` updates the stored first-prompt summary.
     pub fn save_meta(&self, meta: &SessionMeta) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE sessions SET name=?2, updated_at=?3, session_id=?4, model_id=?5,
-             request_count=?6, usage_json=?7, active_skills_json=?8, tool_rounds=?9
+             request_count=?6, usage_json=?7, active_skills_json=?8, tool_rounds=?9,
+             summary=CASE WHEN ?10 != '' THEN ?10 ELSE summary END
              WHERE id=?1",
             params![
                 meta.id,
@@ -175,6 +204,7 @@ impl SessionStore {
                 serde_json::to_string(&meta.usage).unwrap_or_default(),
                 serde_json::to_string(&meta.active_skills).unwrap_or_default(),
                 meta.tool_rounds as i64,
+                meta.summary.as_deref().unwrap_or_default(),
             ],
         )?;
         Ok(())
@@ -291,18 +321,35 @@ impl SessionStore {
     pub fn list_sessions(&self, cwd: &str) -> Result<Vec<SessionSummary>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, updated_at, model_id
+            "SELECT id, name, updated_at, model_id, cwd, summary
              FROM sessions WHERE cwd = ?1 ORDER BY updated_at DESC, id DESC",
         )?;
-        let rows = stmt.query_map(params![cwd], |r| {
-            Ok(SessionSummary {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                updated_at: r.get(2)?,
-                model_id: r.get(3)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![cwd], Self::map_summary)?;
         rows.collect()
+    }
+
+    /// List every session of every working directory. Rows are ordered by
+    /// working directory, then newest first, so callers can group by
+    /// workspace while keeping each group's recency.
+    pub fn list_sessions_all(&self) -> Result<Vec<SessionSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, updated_at, model_id, cwd, summary
+             FROM sessions ORDER BY cwd ASC, updated_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], Self::map_summary)?;
+        rows.collect()
+    }
+
+    fn map_summary(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
+        Ok(SessionSummary {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            updated_at: r.get(2)?,
+            model_id: r.get(3)?,
+            cwd: r.get(4)?,
+            summary: r.get(5)?,
+        })
     }
 
     /// Find a session id by name within one working directory.
@@ -342,6 +389,7 @@ impl SessionStore {
                     usage: serde_json::from_str(&usage_json).unwrap_or_default(),
                     active_skills: serde_json::from_str(&skills_json).unwrap_or_default(),
                     tool_rounds: r.get::<_, i64>(9)? as usize,
+                    summary: None,
                 })
             },
         ) {
@@ -449,7 +497,9 @@ mod tests {
     #[test]
     fn create_list_find_roundtrip() {
         let store = SessionStore::open_in_memory().unwrap();
-        let id = store.create_session("s1", "catus-1", "m1", "/w").unwrap();
+        let id = store
+            .create_session("s1", "catus-1", "m1", "/w", "")
+            .unwrap();
         let summaries = store.list_sessions("/w").unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].name, "s1");
@@ -460,14 +510,14 @@ mod tests {
     #[test]
     fn duplicate_session_name_rejected() {
         let store = SessionStore::open_in_memory().unwrap();
-        store.create_session("dup", "a", "m", "/w").unwrap();
-        assert!(store.create_session("dup", "b", "m", "/w").is_err());
+        store.create_session("dup", "a", "m", "/w", "").unwrap();
+        assert!(store.create_session("dup", "b", "m", "/w", "").is_err());
     }
 
     #[test]
     fn messages_roundtrip_with_tool_calls_and_reasoning() {
         let store = SessionStore::open_in_memory().unwrap();
-        let id = store.create_session("s", "sid", "m", "/w").unwrap();
+        let id = store.create_session("s", "sid", "m", "/w", "").unwrap();
 
         let mut assistant = Message::assistant("partial");
         assistant.reasoning_content = "thinking".to_string();
@@ -504,7 +554,7 @@ mod tests {
     #[test]
     fn subagents_and_state_roundtrip() {
         let store = SessionStore::open_in_memory().unwrap();
-        let id = store.create_session("s", "sid", "m", "/w").unwrap();
+        let id = store.create_session("s", "sid", "m", "/w", "").unwrap();
 
         let record = SubagentRecord {
             id: "subagent-0-coder".to_string(),
@@ -560,7 +610,7 @@ mod tests {
     #[test]
     fn meta_roundtrip() {
         let store = SessionStore::open_in_memory().unwrap();
-        let id = store.create_session("s", "sid", "m", "/w").unwrap();
+        let id = store.create_session("s", "sid", "m", "/w", "").unwrap();
         store
             .save_meta(&SessionMeta {
                 id,
@@ -578,6 +628,7 @@ mod tests {
                 },
                 active_skills: vec!["demo".to_string()],
                 tool_rounds: 7,
+                summary: None,
             })
             .unwrap();
         let snap = store.load_session(id).unwrap().unwrap();
@@ -592,9 +643,9 @@ mod tests {
     #[test]
     fn list_sessions_orders_newest_first() {
         let store = SessionStore::open_in_memory().unwrap();
-        let a = store.create_session("a", "x", "m", "/w").unwrap();
+        let a = store.create_session("a", "x", "m", "/w", "").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let _b = store.create_session("b", "x", "m", "/w").unwrap();
+        let _b = store.create_session("b", "x", "m", "/w", "").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         // Touch a so it becomes newest again.
         store
@@ -609,6 +660,7 @@ mod tests {
                 usage: Usage::default(),
                 active_skills: Vec::new(),
                 tool_rounds: 0,
+                summary: None,
             })
             .unwrap();
         let names: Vec<String> = store
@@ -623,9 +675,11 @@ mod tests {
     #[test]
     fn sessions_are_filtered_by_cwd() {
         let store = SessionStore::open_in_memory().unwrap();
-        store.create_session("here", "x", "m", "/ws-a").unwrap();
-        store.create_session("there", "x", "m", "/ws-b").unwrap();
-        store.create_session("legacy", "x", "m", "").unwrap();
+        store.create_session("here", "x", "m", "/ws-a", "").unwrap();
+        store
+            .create_session("there", "x", "m", "/ws-b", "")
+            .unwrap();
+        store.create_session("legacy", "x", "m", "", "").unwrap();
 
         let names: Vec<String> = store
             .list_sessions("/ws-a")
@@ -639,6 +693,112 @@ mod tests {
         assert_eq!(store.list_sessions("").unwrap().len(), 1);
         assert_eq!(store.find_session("here", "/ws-a").unwrap().is_some(), true);
         assert_eq!(store.find_session("here", "/ws-b").unwrap(), None);
+    }
+
+    #[test]
+    fn list_sessions_all_returns_every_workspace() {
+        let store = SessionStore::open_in_memory().unwrap();
+        store
+            .create_session("a2", "x", "m", "/ws-b", "second prompt")
+            .unwrap();
+        store
+            .create_session("a1", "x", "m", "/ws-a", "first prompt")
+            .unwrap();
+        store.create_session("a3", "x", "m", "/ws-a", "").unwrap();
+
+        let all = store.list_sessions_all().unwrap();
+        // Ordered by cwd, then newest first: /ws-a has a3 (newest) before a1.
+        let names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["a3", "a1", "a2"]);
+        assert_eq!(all[0].cwd, "/ws-a");
+        assert_eq!(all[1].summary, "first prompt");
+        assert_eq!(all[2].cwd, "/ws-b");
+    }
+
+    #[test]
+    fn save_meta_updates_summary_when_set() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let id = store.create_session("s", "sid", "m", "/w", "").unwrap();
+        store
+            .save_meta(&SessionMeta {
+                id,
+                name: "s".to_string(),
+                created_at: 0,
+                updated_at: 0,
+                session_id: "sid".to_string(),
+                model_id: "m".to_string(),
+                request_count: 0,
+                usage: Usage::default(),
+                active_skills: Vec::new(),
+                tool_rounds: 0,
+                summary: Some("the first user prompt".to_string()),
+            })
+            .unwrap();
+        // An empty summary leaves the stored value untouched.
+        store
+            .save_meta(&SessionMeta {
+                id,
+                name: "s".to_string(),
+                created_at: 0,
+                updated_at: 0,
+                session_id: "sid".to_string(),
+                model_id: "m".to_string(),
+                request_count: 1,
+                usage: Usage::default(),
+                active_skills: Vec::new(),
+                tool_rounds: 1,
+                summary: None,
+            })
+            .unwrap();
+        let all = store.list_sessions_all().unwrap();
+        assert_eq!(all[0].summary, "the first user prompt");
+    }
+
+    #[test]
+    fn v2_database_is_migrated_with_summary_backfill() {
+        // Build a legacy v2 database by hand: cwd column exists, no summary.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("sessions.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                session_id TEXT NOT NULL DEFAULT '',
+                model_id TEXT NOT NULL DEFAULT '',
+                request_count INTEGER NOT NULL DEFAULT 0,
+                usage_json TEXT NOT NULL DEFAULT '{}',
+                active_skills_json TEXT NOT NULL DEFAULT '[]',
+                tool_rounds INTEGER NOT NULL DEFAULT 0,
+                cwd TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE messages (
+                session_id INTEGER NOT NULL,
+                agent_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                reasoning_content TEXT NOT NULL DEFAULT '',
+                tool_call_id TEXT,
+                had_tool_calls INTEGER NOT NULL DEFAULT 0,
+                tool_calls_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (session_id, agent_id, seq)
+            );
+            INSERT INTO sessions (name, created_at, updated_at) VALUES ('old', 1, 1);
+            INSERT INTO messages (session_id, agent_id, seq, role, content)
+            VALUES (1, 'main', 0, 'system', 'system prompt'),
+                   (1, 'main', 1, 'user', 'the very first user prompt');
+            PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = SessionStore::open_path(&db).unwrap();
+        let summaries = store.list_sessions_all().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].summary, "the very first user prompt");
     }
 
     #[test]
@@ -678,7 +838,7 @@ mod tests {
         let snap = store.load_session(id).unwrap().unwrap();
         assert_eq!(snap.meta.name, "old");
         // New sessions can still be created on the migrated database.
-        store.create_session("new", "x", "m", "/ws").unwrap();
+        store.create_session("new", "x", "m", "/ws", "").unwrap();
         assert_eq!(store.list_sessions("/ws").unwrap().len(), 1);
     }
 }

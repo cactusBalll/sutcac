@@ -99,6 +99,12 @@ fn activate_skill(ctx: &mut ToolContext<'_>, arguments: &str) -> Result<String, 
     if ctx.active_skills.contains(&name) {
         return Ok(format!("skill '{}' is already active", name));
     }
+    if ctx.skill_registry.is_disabled(&name) {
+        return Err(format!(
+            "skill '{}' is disabled for this session and cannot be activated by the LLM",
+            name
+        ));
+    }
 
     let skill = ctx
         .skill_registry
@@ -239,5 +245,35 @@ mod tests {
         let result = tool.execute(&skill_call(r#""demo""#), &mut ctx).await;
         assert_eq!(result.status, 1);
         assert!(result.stderr.contains("name"));
+    }
+
+    #[tokio::test]
+    async fn skill_tool_rejects_disabled_skills() {
+        let dir = std::env::temp_dir().join(format!("catus_skill_tool_dis_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("demo")).unwrap();
+        std::fs::write(
+            dir.join("demo/SKILL.md"),
+            "---\nname: demo\ndescription: Demo.\n---\nDo the demo thing.",
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::discover(&[dir.clone()]).unwrap();
+        registry.set_disabled("demo", true);
+
+        let mut ctx_fields = (test_shell_state(), registry, Vec::new(), Vec::new());
+        let (ref mut state, ref mut registry, ref mut active, ref mut messages) = ctx_fields;
+        let mut ctx = test_context(state, registry, active, messages);
+
+        let tool = SkillTool;
+        let result = tool
+            .execute(&skill_call(r#"{"name":"demo"}"#), &mut ctx)
+            .await;
+        assert_eq!(result.status, 1);
+        assert!(result.stderr.contains("disabled"));
+        assert!(ctx.active_skills.is_empty());
+        assert!(ctx.messages.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

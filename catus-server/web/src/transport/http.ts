@@ -6,12 +6,15 @@
 // resync logic is needed.
 
 import type {
+  AgentDetail,
   AppSnapshot,
   AskAnswer,
   ConfigScope,
   InputLineOutcome,
   Message,
   RuntimeEventPayload,
+  SessionSummary,
+  SkillPreview,
 } from 'catus-ui';
 import type { CatusTransport, TransportHandlers } from 'catus-ui';
 
@@ -61,6 +64,16 @@ export const httpTransport: CatusTransport = {
     post<string>('/api/config', { scope, key, value }),
   removeConfigField: (scope: ConfigScope, key: string) =>
     post<string>('/api/config/remove', { scope, key }),
+  listSessions: (scope: string) =>
+    get<SessionSummary[]>(`/api/sessions?scope=${encodeURIComponent(scope)}`),
+  skillPreview: (name: string) =>
+    get<SkillPreview>(`/api/skills/${encodeURIComponent(name)}/preview`),
+  agentDetail: (name: string) =>
+    get<AgentDetail>(`/api/agents/${encodeURIComponent(name)}`),
+  saveAgent: (name: string, content: string) =>
+    post<string>(`/api/agents/${encodeURIComponent(name)}`, { content }),
+  createAgent: (name: string, content: string) =>
+    post<string>('/api/agents', { name, content }),
   subscribe(handlers: TransportHandlers) {
     return new Promise<void>((resolve) => {
       connect(handlers, resolve);

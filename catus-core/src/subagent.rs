@@ -1307,7 +1307,7 @@ mod tests {
 
         // Snapshot round-trips through the store.
         let store = crate::history::SessionStore::open_in_memory().unwrap();
-        let session = store.create_session("s", "sid", "m", "").unwrap();
+        let session = store.create_session("s", "sid", "m", "", "").unwrap();
         let snap = manager.snapshot();
         assert_eq!(snap.len(), 1);
         store.replace_subagents(session, &snap).unwrap();

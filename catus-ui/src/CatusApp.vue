@@ -2,10 +2,12 @@
 import { onMounted } from 'vue';
 import type { CatusTransport } from './transport';
 import { useRuntimeStore } from './stores/runtime';
+import Sidebar from './components/Sidebar.vue';
 import ChatView from './components/ChatView.vue';
 import InputLine from './components/InputLine.vue';
 import StatusBar from './components/StatusBar.vue';
 import OverlayHost from './components/overlays/OverlayHost.vue';
+import PanelHost from './components/panels/PanelHost.vue';
 
 const props = defineProps<{ transport: CatusTransport }>();
 const store = useRuntimeStore();
@@ -26,18 +28,28 @@ onMounted(() => {
   </div>
   <div v-else-if="!store.started" class="fatal"><p>loading session…</p></div>
   <div v-else class="app">
-    <ChatView />
-    <InputLine />
-    <StatusBar />
+    <Sidebar />
+    <div class="main">
+      <ChatView />
+      <InputLine />
+      <StatusBar />
+    </div>
     <OverlayHost />
+    <PanelHost />
   </div>
 </template>
 
 <style scoped>
 .app {
   display: flex;
-  flex-direction: column;
   height: 100%;
+}
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
 .fatal {

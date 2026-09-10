@@ -10,7 +10,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot};
 
 use actor::Command;
-use catus_core::app::{AppSnapshot, InputLineOutcome};
+use catus_core::app::{AgentDetail, AppSnapshot, InputLineOutcome, SkillPreview};
+use catus_core::history::SessionSummary;
 use catus_core::message::Message;
 use catus_core::tool::AskAnswer;
 
@@ -146,6 +147,88 @@ async fn quit_app(state: State<'_, mpsc::Sender<Command>>, app: AppHandle) -> Re
     Ok(())
 }
 
+/// List history sessions. `scope=all` returns every workspace's sessions;
+/// the default returns the current workspace's 10 newest (sidebar menu).
+#[tauri::command]
+async fn list_sessions(
+    state: State<'_, mpsc::Sender<Command>>,
+    scope: String,
+) -> Result<Vec<SessionSummary>, String> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(&state, Command::ListSessions { scope, reply: tx }).await?;
+    rx.await.map_err(|_| "actor stopped".to_string())
+}
+
+/// Full raw `SKILL.md` contents for the skill preview page.
+#[tauri::command]
+async fn skill_preview(
+    state: State<'_, mpsc::Sender<Command>>,
+    name: String,
+) -> Result<SkillPreview, String> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(&state, Command::SkillPreview { name, reply: tx }).await?;
+    rx.await
+        .map_err(|_| "actor stopped".to_string())?
+        .map_err(|e| e)
+}
+
+/// Detail of one agent definition (raw `.md` content) for the editor page.
+#[tauri::command]
+async fn get_agent_detail(
+    state: State<'_, mpsc::Sender<Command>>,
+    name: String,
+) -> Result<AgentDetail, String> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(&state, Command::AgentDetail { name, reply: tx }).await?;
+    rx.await
+        .map_err(|_| "actor stopped".to_string())?
+        .map_err(|e| e)
+}
+
+/// Save an edited agent definition back to its source file.
+#[tauri::command]
+async fn save_agent(
+    state: State<'_, mpsc::Sender<Command>>,
+    name: String,
+    content: String,
+) -> Result<String, String> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::SaveAgent {
+            name,
+            content,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await
+        .map_err(|_| "actor stopped".to_string())?
+        .map_err(|e| e)
+}
+
+/// Create a new agent definition in the workspace agents directory.
+#[tauri::command]
+async fn create_agent(
+    state: State<'_, mpsc::Sender<Command>>,
+    name: String,
+    content: String,
+) -> Result<String, String> {
+    let (tx, rx) = oneshot::channel();
+    dispatch(
+        &state,
+        Command::CreateAgent {
+            name,
+            content,
+            reply: tx,
+        },
+    )
+    .await?;
+    rx.await
+        .map_err(|_| "actor stopped".to_string())?
+        .map_err(|e| e)
+}
+
 async fn dispatch(
     state: &State<'_, mpsc::Sender<Command>>,
     command: Command,
@@ -183,7 +266,12 @@ pub fn run() {
             quit_app,
             completion_candidates,
             set_config_field,
-            remove_config_field
+            remove_config_field,
+            list_sessions,
+            skill_preview,
+            get_agent_detail,
+            save_agent,
+            create_agent
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

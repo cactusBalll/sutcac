@@ -2,28 +2,32 @@
 //!
 //! The memory store is an mdbook project (`book.toml` + `src/SUMMARY.md` +
 //! topical chapter files) maintained by the `memory`-role subagent. When the
-//! subsystem is enabled, catus dispatches the memory subagent twice around
-//! each user turn:
+//! subsystem is enabled, catus dispatches the memory subagent twice:
 //!
-//! - **Recall** (before the main LLM request): the subagent decides whether
-//!   the request is simple enough to skip memory; otherwise it searches the
-//!   store and returns the relevant memory, which is injected into the main
-//!   conversation as a system message.
-//! - **Write** (after the turn completes): the subagent summarizes key facts
-//!   of the turn, decides whether any are worth keeping, and updates the
-//!   mdbook store.
+//! - **Recall** (once, before the main LLM request of the session's first
+//!   user turn): the subagent decides whether the request is simple enough
+//!   to skip memory; otherwise it searches the store and returns the
+//!   relevant memory, which is injected into the main conversation as a
+//!   system message. Later turns of the same session reuse that memory.
+//! - **Write** (after a turn completes): the subagent summarizes key facts
+//!   of the latest user turn, decides whether any are worth keeping, and
+//!   updates the mdbook store. The pass runs in `fork` mode — it reuses the
+//!   main agent's context prefix instead of receiving a transcript — and
+//!   write requests that arrive while another pass is still running are
+//!   queued, not skipped.
 //!
-//! Both passes run through the regular subagent runtime (`completeTask`
+//! Recall runs through the regular subagent runtime (`completeTask`
 //! protocol) in `create` mode, so the memory agent has its own context,
 //! toolbox, and shell permissions. `mdbook build` is optional: when the
 //! `mdbook` binary is unavailable the store is maintained as plain Markdown.
 //!
 //! The task prompts built here carry only the control-chain contract: pass
-//! type, store and workspace paths, the user request / turn transcript, and
-//! the exact `completeTask` JSON schema. All judgment rules (when recall is
-//! worthwhile, what is worth keeping) and the store layout (mdbook scaffold,
-//! `src/global/` vs. `src/workspaces/<slug>/` chapters) live in the memory
-//! agent's definition (`agents/memory.md`).
+//! type, store and workspace paths, and the exact `completeTask` JSON
+//! schema. All judgment rules (when recall is worthwhile, what is worth
+//! keeping) and the store layout (mdbook scaffold, `src/global/` vs.
+//! `src/workspaces/<slug>/` chapters) live in the memory agent's definition
+//! (`agents/memory.md`); the write prompt embeds that definition body
+//! because `fork` mode does not inject it as a system message.
 
 use std::path::{Path, PathBuf};
 
@@ -31,14 +35,9 @@ use serde::Deserialize;
 
 use crate::agents::{AgentRegistry, AgentRole};
 use crate::config::AppConfig;
-use crate::message::{Message, Role};
 
 /// Upper bound for the memory injected into the main conversation.
 const RECALL_MAX_CHARS: usize = 8000;
-/// Upper bound for the per-turn transcript sent to the write pass.
-const TRANSCRIPT_MAX_CHARS: usize = 24000;
-/// Upper bound for one tool result line in the transcript.
-const TRANSCRIPT_TOOL_CHARS: usize = 500;
 
 /// Runtime state of the Agent Memory subsystem.
 pub struct MemoryState {
@@ -53,6 +52,10 @@ pub struct MemoryState {
     pub pending_recall: Option<String>,
     /// Subagent currently running a summarize/write pass, if any.
     pub pending_write: Option<String>,
+    /// A write pass was requested while another memory pass was still
+    /// running; it is dispatched when that pass finishes instead of being
+    /// skipped.
+    pub write_queued: bool,
     /// Startup warnings (e.g. enabled in config but no memory agent found).
     pub warnings: Vec<String>,
 }
@@ -68,6 +71,7 @@ impl MemoryState {
             memory_dir: config.dirs.memory.clone(),
             pending_recall: None,
             pending_write: None,
+            write_queued: false,
             warnings: Vec::new(),
         };
         if !config.agent.memory.enabled {
@@ -128,24 +132,29 @@ pub fn recall_task(user_prompt: &str, memory_dir: &Path, workspace: &Path) -> St
 
 /// Build the task prompt for the post-turn summarize/write pass.
 ///
-/// Same split as [`recall_task`]: only the contract, no judgment rules.
-pub fn summarize_task(transcript: &str, memory_dir: &Path, workspace: &Path) -> String {
+/// The pass runs in `fork` mode, so the full main-agent conversation prefix
+/// (including the latest user turn) is already part of the subagent
+/// context. The prompt carries the control contract plus the memory agent's
+/// own definition body: `fork` mode does not inject the agent definition as
+/// a system message, so the judgment rules must travel with the task.
+pub fn summarize_task(agent_instructions: &str, memory_dir: &Path, workspace: &Path) -> String {
     format!(
         "Memory write pass.\n\n\
+         You were forked from the main agent: the conversation above is the \
+         full session context. Summarize the latest user turn (from the last \
+         user message onwards).\n\n\
          Memory store directory: {}\n\
          Current workspace: {}\n\n\
-         Below is the transcript of the conversation turn that just \
-         finished:\n<turn_transcript>\n{}\n</turn_transcript>\n\n\
-         Follow your memory-management instructions to decide whether any \
-         fact is worth keeping long-term; if so, update the store \
-         accordingly (workspace-specific facts under the current workspace's \
-         chapters, cross-workspace facts in the global chapters).\n\n\
+         Your memory-management instructions are reproduced below. They \
+         cover both the recall and the write pass; this is the write pass, \
+         so only the store layout rules and the write flow apply:\n\
+         <memory_instructions>\n{}\n</memory_instructions>\n\n\
          Call completeTask with exactly one of:\n\
          - {{\"written\": false}}\n\
          - {{\"written\": true, \"summary\": \"<one line describing what was recorded>\"}}",
         memory_dir.display(),
         workspace.display(),
-        transcript
+        agent_instructions
     )
 }
 
@@ -197,64 +206,6 @@ fn extract_json_object(text: &str) -> Option<String> {
 /// Trim a recalled memory to the injection limit.
 pub fn truncate_recall(memory: &str) -> String {
     truncate(memory, RECALL_MAX_CHARS)
-}
-
-/// Build a compact transcript of the current user turn: from the last user
-/// message (exclusive of system/event chatter) to the end of the conversation.
-///
-/// Returns an empty string when there is no user message to summarize.
-pub fn format_transcript(messages: &[Message]) -> String {
-    let start = messages
-        .iter()
-        .rposition(|m| m.role == Role::User)
-        .unwrap_or(messages.len());
-    let mut out = String::new();
-    for message in &messages[start..] {
-        match message.role {
-            Role::User => {
-                push_line(&mut out, &format!("user: {}", message.content));
-            }
-            Role::Assistant => {
-                if !message.content.trim().is_empty() {
-                    push_line(&mut out, &format!("assistant: {}", message.content));
-                }
-                for call in &message.tool_calls {
-                    push_line(
-                        &mut out,
-                        &format!(
-                            "assistant tool call: {} {}",
-                            call.name,
-                            truncate(call.arguments.trim(), TRANSCRIPT_TOOL_CHARS)
-                        ),
-                    );
-                }
-            }
-            Role::Tool => {
-                push_line(
-                    &mut out,
-                    &format!(
-                        "tool result: {}",
-                        truncate(message.content.trim(), TRANSCRIPT_TOOL_CHARS)
-                    ),
-                );
-            }
-            // System prompt, injected skills/recall messages, and UI event
-            // lines carry no turn facts.
-            Role::System | Role::Event => {}
-        }
-        if out.len() >= TRANSCRIPT_MAX_CHARS {
-            break;
-        }
-    }
-    truncate(&out, TRANSCRIPT_MAX_CHARS)
-}
-
-fn push_line(out: &mut String, line: &str) {
-    if out.len() >= TRANSCRIPT_MAX_CHARS {
-        return;
-    }
-    out.push_str(line.trim_end());
-    out.push('\n');
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -316,13 +267,13 @@ mod tests {
     }
 
     #[test]
-    fn summarize_task_carries_contract_paths_and_transcript() {
+    fn summarize_task_carries_contract_paths_and_instructions() {
         let task = summarize_task(
-            "user: hello",
+            "write rules here",
             std::path::Path::new("/tmp/m"),
             std::path::Path::new("/tmp/ws"),
         );
-        assert!(task.contains("user: hello"));
+        assert!(task.contains("write rules here"));
         assert!(task.contains("/tmp/m"));
         assert!(task.contains("/tmp/ws"));
         assert!(task.contains("\"written\": false"));
@@ -367,56 +318,11 @@ mod tests {
     }
 
     #[test]
-    fn format_transcript_from_last_user_message() {
-        let messages = vec![
-            Message::user("earlier turn"),
-            Message::assistant("earlier answer"),
-            Message::system("skill instructions"),
-            Message::event("noise"),
-            Message::user("current question"),
-            Message::system("recalled memory"),
-            Message::assistant("final answer"),
-        ];
-        let transcript = format_transcript(&messages);
-        assert!(transcript.contains("current question"));
-        assert!(transcript.contains("final answer"));
-        assert!(!transcript.contains("earlier turn"));
-        assert!(!transcript.contains("recalled memory"));
-        assert!(!transcript.contains("noise"));
-    }
-
-    #[test]
-    fn format_transcript_includes_tool_calls_and_results() {
-        let mut assistant = Message::assistant("working");
-        assistant.tool_calls.push(crate::tool::ToolCall {
-            id: "call-1".to_string(),
-            name: "shell".to_string(),
-            arguments: r#"{"command":"cargo test"}"#.to_string(),
-        });
-        let messages = vec![
-            Message::user("run the tests"),
-            assistant,
-            Message::tool("status=0\nstdout=```\nok\n```", "call-1"),
-        ];
-        let transcript = format_transcript(&messages);
-        assert!(transcript.contains("run the tests"));
-        assert!(transcript.contains("assistant tool call: shell"));
-        assert!(transcript.contains("cargo test"));
-        assert!(transcript.contains("tool result:"));
-    }
-
-    #[test]
-    fn format_transcript_empty_without_user_message() {
-        let messages = vec![Message::assistant("only an answer")];
-        assert_eq!(format_transcript(&messages), "");
-    }
-
-    #[test]
-    fn transcript_is_truncated() {
-        let long = "x".repeat(TRANSCRIPT_MAX_CHARS + 5000);
-        let messages = vec![Message::user(long)];
-        let transcript = format_transcript(&messages);
-        assert!(transcript.chars().count() <= TRANSCRIPT_MAX_CHARS + 1);
-        assert!(transcript.ends_with('…'));
+    fn truncate_recall_caps_length() {
+        let long = "x".repeat(RECALL_MAX_CHARS + 1000);
+        let trimmed = truncate_recall(&long);
+        assert!(trimmed.chars().count() <= RECALL_MAX_CHARS + 1);
+        assert!(trimmed.ends_with('…'));
+        assert_eq!(truncate_recall("short"), "short");
     }
 }

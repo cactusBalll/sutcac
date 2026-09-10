@@ -136,6 +136,58 @@ export interface CommandOutcome {
   ui: UiRequest | null;
 }
 
+/** One skill in the snapshot's skill catalog. */
+export interface SkillCatalogEntry {
+  name: string;
+  description: string;
+  disabled: boolean;
+}
+
+/** One configured MCP server in the snapshot. */
+export interface McpServerInfo {
+  name: string;
+  enabled: boolean;
+  connected: boolean;
+  tools: string[];
+}
+
+/** One agent definition in the snapshot's agent catalog. */
+export interface AgentCatalogEntry {
+  name: string;
+  description: string;
+  role: string | null;
+  disabled: boolean;
+  editable: boolean;
+}
+
+/** A saved history session (workspace cwd + first-prompt summary). */
+export interface SessionSummary {
+  id: number;
+  name: string;
+  updated_at: number;
+  model_id: string;
+  cwd: string;
+  summary: string;
+}
+
+/** Full raw `SKILL.md` contents for the skill preview. */
+export interface SkillPreview {
+  name: string;
+  description: string;
+  content: string;
+}
+
+/** Detail of one agent definition (raw `.md` content) for the editor. */
+export interface AgentDetail {
+  name: string;
+  description: string;
+  role: string | null;
+  disabled: boolean;
+  editable: boolean;
+  source_path: string;
+  content: string;
+}
+
 /**
  * Internally-tagged serde enum: `Handled(CommandOutcome)` merges the struct
  * fields into the same JSON map next to the `kind` tag.
@@ -161,6 +213,9 @@ export interface AppSnapshot {
   should_quit: boolean;
   memory_available: boolean;
   memory_session_enabled: boolean;
+  skill_catalog: SkillCatalogEntry[];
+  mcp_servers: McpServerInfo[];
+  agent_catalog: AgentCatalogEntry[];
   config_fields: [string, string][];
   config_field_specs: ConfigFieldSpec[];
   config_scopes: ConfigScopeSnapshot[];

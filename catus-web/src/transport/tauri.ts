@@ -6,10 +6,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type {
+  AgentDetail,
   AppSnapshot,
   InputLineOutcome,
   Message,
   RuntimeEventPayload,
+  SessionSummary,
+  SkillPreview,
 } from 'catus-ui';
 import type { CatusTransport, TransportHandlers } from 'catus-ui';
 
@@ -28,6 +31,11 @@ export const tauriTransport: CatusTransport = {
     invoke<string>('set_config_field', { scope, key, value }),
   removeConfigField: (scope, key) =>
     invoke<string>('remove_config_field', { scope, key }),
+  listSessions: (scope) => invoke<SessionSummary[]>('list_sessions', { scope }),
+  skillPreview: (name) => invoke<SkillPreview>('skill_preview', { name }),
+  agentDetail: (name) => invoke<AgentDetail>('get_agent_detail', { name }),
+  saveAgent: (name, content) => invoke<string>('save_agent', { name, content }),
+  createAgent: (name, content) => invoke<string>('create_agent', { name, content }),
   async subscribe(handlers: TransportHandlers) {
     // `app-quit` closes the window on the Rust side; nothing to render.
     await Promise.all([

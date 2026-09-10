@@ -173,6 +173,16 @@ fn dispatch(call: &ToolCall, args: &TaskArguments, ctx: &mut ToolContext<'_>) ->
             return err(call, 1, format!("catus: subagent '{}' not found", agent));
         }
     };
+    if agent_registry.is_disabled(agent) {
+        return err(
+            call,
+            1,
+            format!(
+                "catus: subagent '{}' is disabled for this session; it cannot be dispatched",
+                agent
+            ),
+        );
+    }
 
     let id = subagents.spawn(
         &definition,
@@ -632,6 +642,33 @@ mod tests {
             .await;
         assert_eq!(no_id.status, 2);
         assert!(no_id.stderr.contains("requires \"id\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_disabled_agents() {
+        let dir = std::env::temp_dir().join(format!("catus_task_disabled_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry = test_registry(&dir);
+        let mut subagents = manager();
+
+        let mut shell = ShellState::new();
+        let mut messages = Vec::new();
+        let registry = leak_registry(registry);
+        registry.set_disabled("coder", true);
+        let mut ctx = test_context(&mut shell, registry, &mut messages, &mut subagents);
+
+        let tool = TaskTool;
+        let result = tool
+            .execute(
+                &test_call(r#"{"agent": "coder", "task": "do things"}"#),
+                &mut ctx,
+            )
+            .await;
+        assert_eq!(result.status, 1);
+        assert!(result.stderr.contains("disabled"));
+        assert!(subagents.list().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

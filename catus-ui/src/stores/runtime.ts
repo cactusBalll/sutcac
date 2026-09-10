@@ -7,6 +7,7 @@ import type {
   ConfigScope,
   Message,
   RuntimeEventPayload,
+  SessionSummary,
   UiRequest,
 } from '../types';
 
@@ -22,6 +23,9 @@ export type Overlay =
   | { kind: 'ask'; questions: AskQuestion[] }
   | { kind: 'ui'; request: UiRequest }
   | null;
+
+/** Full-screen manager pages reachable from the left sidebar. */
+export type SidePanel = 'sessions' | 'skills' | 'mcp' | 'agents' | null;
 
 export const useRuntimeStore = defineStore('runtime', {
   state: () => ({
@@ -50,6 +54,17 @@ export const useRuntimeStore = defineStore('runtime', {
     sessionCwd: '',
     memoryAvailable: false,
     memorySessionEnabled: false,
+    skillCatalog: [] as AppSnapshot['skill_catalog'],
+    mcpServers: [] as AppSnapshot['mcp_servers'],
+    agentCatalog: [] as AppSnapshot['agent_catalog'],
+    /** Sessions of the current workspace (sidebar, newest 10). */
+    recentSessions: [] as SessionSummary[],
+    /** Every session of every workspace (full-screen history page). */
+    allSessions: [] as SessionSummary[],
+    /** Currently open full-screen sidebar page, if any. */
+    panel: null as SidePanel,
+    /** Whether the left sidebar is expanded (vs. an icon rail). */
+    sidebarOpen: true,
     /** Auto-scroll follows the stream unless the user scrolled up. */
     autoScroll: true,
     overlay: null as Overlay,
@@ -114,6 +129,9 @@ export const useRuntimeStore = defineStore('runtime', {
       this.sessionCwd = snap.session_cwd;
       this.memoryAvailable = snap.memory_available;
       this.memorySessionEnabled = snap.memory_session_enabled;
+      this.skillCatalog = snap.skill_catalog ?? [];
+      this.mcpServers = snap.mcp_servers ?? [];
+      this.agentCatalog = snap.agent_catalog ?? [];
 
       // Streamed deltas are always already included in the core messages by
       // the time a snapshot is emitted, so the live buffer can be dropped
@@ -223,6 +241,81 @@ export const useRuntimeStore = defineStore('runtime', {
     /** Open the config editor page (the bare-`/config` menu). */
     openConfigPage() {
       this.applyRequest({ page: 'show_config' });
+    },
+
+    /** Open a full-screen sidebar page. */
+    async openPanel(panel: Exclude<SidePanel, null>) {
+      this.panel = panel;
+      if (panel === 'sessions') await this.refreshSessions();
+    },
+
+    closePanel() {
+      this.panel = null;
+    },
+
+    /** Refresh the sidebar history list and the full history page. */
+    async refreshSessions() {
+      try {
+        const [recent, all] = await Promise.all([
+          backend().listSessions('current'),
+          backend().listSessions('all'),
+        ]);
+        this.recentSessions = recent;
+        this.allSessions = all;
+      } catch (e) {
+        console.error('list_sessions failed', e);
+      }
+    },
+
+    /** Start a new context: save the session, reset the conversation.
+     *  An optional path fully switches the workspace. */
+    async newContext(path = '') {
+      await this.pick('new_session', path);
+      await this.refreshSessions();
+    },
+
+    /** Toggle a skill for the LLM (the backend picks the direction). */
+    async toggleSkill(name: string) {
+      await this.pick('toggle_skill', name);
+    },
+
+    /** Toggle an MCP server (the backend picks the direction). */
+    async toggleMcp(name: string) {
+      await this.pick('toggle_mcp', name);
+    },
+
+    /** Toggle an agent's dispatch availability. */
+    async toggleAgent(name: string) {
+      await this.pick('toggle_agent', name);
+    },
+
+    /** Connect to one MCP server on demand. */
+    async connectMcp(name: string) {
+      await this.pick('connect_mcp', name);
+    },
+
+    /** Full raw `SKILL.md` contents for the skill preview. */
+    async skillPreview(name: string) {
+      return backend().skillPreview(name);
+    },
+
+    /** Detail of one agent definition (raw `.md` content). */
+    async agentDetail(name: string) {
+      return backend().agentDetail(name);
+    },
+
+    /** Save an edited agent definition. Refreshes the catalog on success. */
+    async saveAgent(name: string, content: string): Promise<string> {
+      const msg = await backend().saveAgent(name, content);
+      await this.refreshSnapshot();
+      return msg;
+    },
+
+    /** Create a new agent definition. Refreshes the catalog on success. */
+    async createAgent(name: string, content: string): Promise<string> {
+      const msg = await backend().createAgent(name, content);
+      await this.refreshSnapshot();
+      return msg;
     },
 
     /** Open the model picker from the status bar (the bare-`/model` menu). */

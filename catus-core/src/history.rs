@@ -44,6 +44,12 @@ pub const STATE_SHELL_EXPORTED: &str = "shell_exported";
 pub const STATE_TODOS: &str = "todos";
 /// `session_state` key holding the session-level Agent Memory toggle.
 pub const STATE_MEMORY_ENABLED: &str = "memory_enabled";
+/// `session_state` key holding the JSON list of disabled skill names.
+pub const STATE_DISABLED_SKILLS: &str = "disabled_skills";
+/// `session_state` key holding the JSON list of disabled MCP server names.
+pub const STATE_DISABLED_MCP: &str = "disabled_mcp_servers";
+/// `session_state` key holding the JSON list of disabled agent names.
+pub const STATE_DISABLED_AGENTS: &str = "disabled_agents";
 
 /// Wire-format mirror of [`ToolCall`] for persistence. [`ToolCall`]'s own
 /// `Serialize` impl produces the API request shape (`{"function": {...}}`),
@@ -82,13 +88,19 @@ pub fn tool_calls_from_json(json: &str) -> Vec<ToolCall> {
         .collect()
 }
 
-/// Summary row shown by `/resume` lists and the resume picker.
-#[derive(Debug, Clone)]
+/// Summary row shown by `/resume` lists, the web sidebar, and the session
+/// history page. `summary` carries the first user prompt (truncated) so
+/// lists can hint at the conversation content.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionSummary {
     pub id: i64,
     pub name: String,
     pub updated_at: i64,
     pub model_id: String,
+    /// Working directory the session was created in (the workspace key).
+    pub cwd: String,
+    /// First user prompt, truncated for list display.
+    pub summary: String,
 }
 
 /// Persisted per-session metadata.
@@ -106,6 +118,8 @@ pub struct SessionMeta {
     pub usage: Usage,
     pub active_skills: Vec<String>,
     pub tool_rounds: usize,
+    /// First user prompt summary; `None` leaves the stored value untouched.
+    pub summary: Option<String>,
 }
 
 /// Persisted state of one subagent.
