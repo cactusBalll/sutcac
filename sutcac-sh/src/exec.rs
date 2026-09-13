@@ -1900,6 +1900,37 @@ mod tests {
     }
 
     #[test]
+    fn dev_null_redirect_allowed_under_base_dir_restriction() {
+        // Path-based restrictions (base_dir set) must not reject the
+        // ubiquitous `>/dev/null` and `2>/dev/null` patterns: /dev/null is
+        // always allowed for read and write.
+        let tmp = std::env::temp_dir().join("sutcac_devnull_ws");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let policy = PermissionPolicy::allow_all().with_base_dir(&tmp);
+        let mut state = ShellState::with_policy_and_logger(policy, AuditLogger::null());
+
+        let mut parser = Parser::new("echo hi > /dev/null 2>/dev/null").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0, "stderr: {}", output.stderr);
+        assert_eq!(output.stdout, "");
+        assert_eq!(output.stderr, "");
+
+        // Reading from /dev/null is allowed too.
+        let mut parser = Parser::new("cat /dev/null").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        let output = execute_command(&cmd, &mut state);
+        assert_eq!(output.status, 0, "stderr: {}", output.stderr);
+
+        // Other device paths stay denied (write to /dev/zero is blocked).
+        let mut parser = Parser::new("echo hi > /dev/zero").unwrap();
+        let cmd = parser.parse().unwrap().remove(0);
+        assert_eq!(execute_command(&cmd, &mut state).status, 126);
+    }
+
+    #[test]
     fn allow_read_permits_git_log_with_config_override() {
         // With no hard-coded READ defaults, git must be explicitly tagged READ
         // via [shell.commands] for allow:read to permit it.

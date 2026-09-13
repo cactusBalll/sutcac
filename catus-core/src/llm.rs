@@ -17,6 +17,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 use crate::message::{Message, Role};
 use crate::tool::{ToolCall, ToolDefinition};
@@ -335,6 +336,11 @@ impl LlmClient {
         &self.session_id
     }
 
+    /// The API model id sent in the request's `model` field.
+    pub fn model_id(&self) -> &str {
+        &self.model.id
+    }
+
     fn auth_header(&self) -> HeaderValue {
         let value = format!("Bearer {}", self.provider.api_key);
         HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static(""))
@@ -378,7 +384,7 @@ impl LlmClient {
         tools: &[ToolDefinition],
         stream: bool,
     ) {
-        if !log::log_enabled!(log::Level::Debug) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
         let body = self.build_request(messages, tools, stream);
@@ -386,7 +392,7 @@ impl LlmClient {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         json.hash(&mut hasher);
-        log::debug!(
+        tracing::debug!(
             "llm request [session={}]: stream={} bytes={} hash={:016x}",
             self.session_id,
             stream,
@@ -422,6 +428,11 @@ impl LlmClient {
     }
 
     /// Send a non-streaming chat request and return the full assistant reply.
+    #[instrument(
+        name = "llm_request",
+        skip_all,
+        fields(session = %self.session_id, model = %self.model.id, stream = false)
+    )]
     pub async fn chat(
         &self,
         messages: &[Message],
@@ -429,9 +440,11 @@ impl LlmClient {
     ) -> Result<ChatReply, LlmError> {
         let mut last_error: Option<LlmError> = None;
         for attempt in 0..5 {
+            tracing::debug!(attempt, "chat retry loop attempt");
             match self.try_chat_once(messages, tools).await {
                 Ok(reply) => return Ok(reply),
                 Err(e) => {
+                    tracing::warn!(attempt, error = %e, "chat attempt failed; retrying");
                     last_error = Some(e);
                     tokio::time::sleep(std::time::Duration::from_secs(2_u64.pow(attempt))).await;
                 }
@@ -498,6 +511,11 @@ impl LlmClient {
 
     /// Send a streaming chat request and forward events to `tx`.
     /// Returns when the stream is exhausted or an error occurs.
+    #[instrument(
+        name = "llm_stream",
+        skip_all,
+        fields(session = %self.session_id, model = %self.model.id, stream = true)
+    )]
     pub async fn stream_chat(
         &self,
         messages: &[Message],
@@ -529,11 +547,11 @@ impl LlmClient {
             let data = event.data.trim();
 
             if data == "[DONE]" {
-                log::debug!("sse [DONE]");
+                tracing::debug!("sse [DONE]");
                 break;
             }
 
-            log::debug!("sse data: {}", data);
+            tracing::debug!("sse data: {}", data);
 
             let parsed: ChatResponse = match serde_json::from_str(data) {
                 Ok(v) => v,
@@ -553,7 +571,7 @@ impl LlmClient {
             // the token usage.
             if let Some(usage) = parsed.usage {
                 if last_usage != Some(usage) {
-                    log::info!(
+                    tracing::info!(
                         "sse usage [session={}]: prompt={} completion={} total={} cached={}",
                         self.session_id,
                         usage.prompt_tokens,
@@ -574,28 +592,28 @@ impl LlmClient {
 
             if let Some(delta) = choice.delta {
                 if !delta.content.is_empty() {
-                    log::debug!("sse text delta: {}", delta.content);
+                    tracing::debug!("sse text delta: {}", delta.content);
                     let _ = tx.send(StreamEvent::Text(delta.content)).await;
                 }
 
                 if !delta.reasoning_content.is_empty() {
-                    log::debug!("sse reasoning delta: {}", delta.reasoning_content);
+                    tracing::debug!("sse reasoning delta: {}", delta.reasoning_content);
                     let _ = tx
                         .send(StreamEvent::Reasoning(delta.reasoning_content))
                         .await;
                 }
 
                 if let Some(calls) = delta.tool_calls {
-                    log::debug!("sse tool-call delta chunks: {}", calls.len());
+                    tracing::debug!("sse tool-call delta chunks: {}", calls.len());
                     for call in calls {
                         let idx = call.index.unwrap_or(0);
                         let entry = partial_calls.entry(idx).or_default();
                         if let Some(id) = call.id {
-                            log::debug!("tool-call {} id = {}", idx, id);
+                            tracing::debug!("tool-call {} id = {}", idx, id);
                             entry.id = Some(id);
                         }
                         if let Some(name) = call.function.as_ref().and_then(|f| f.name.clone()) {
-                            log::debug!("tool-call {} name = {}", idx, name);
+                            tracing::debug!("tool-call {} name = {}", idx, name);
                             entry.name = Some(name);
                         }
                         if let Some(args) = call.function.as_ref().and_then(|f| f.arguments.clone())
@@ -606,7 +624,7 @@ impl LlmClient {
                 }
             }
 
-            log::debug!(
+            tracing::debug!(
                 "sse finish_reason = {:?}, pending partial calls = {}",
                 choice.finish_reason,
                 partial_calls.len()
@@ -615,7 +633,7 @@ impl LlmClient {
             if choice.finish_reason.as_deref() == Some("tool_calls") {
                 for (_, partial) in partial_calls.drain() {
                     if let Some(call) = partial.into_tool_call() {
-                        log::info!("streamed tool call: {} -> {}", call.id, call.name);
+                        tracing::info!("streamed tool call: {} -> {}", call.id, call.name);
                         let _ = tx.send(StreamEvent::ToolCall(call)).await;
                     }
                 }
@@ -625,13 +643,13 @@ impl LlmClient {
         // Some providers do not set finish_reason to "tool_calls" even when
         // tool-call deltas were streamed. Drain any remaining partial calls.
         if !partial_calls.is_empty() {
-            log::warn!(
+            tracing::warn!(
                 "stream ended with {} partial tool-call(s) unsent; draining",
                 partial_calls.len()
             );
             for (_, partial) in partial_calls.drain() {
                 if let Some(call) = partial.into_tool_call() {
-                    log::info!("drained tool call: {} -> {}", call.id, call.name);
+                    tracing::info!("drained tool call: {} -> {}", call.id, call.name);
                     let _ = tx.send(StreamEvent::ToolCall(call)).await;
                 }
             }

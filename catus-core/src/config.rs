@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use log::LevelFilter;
 use serde::{Deserialize, Serialize};
 use sutcac_sh::config::ShellConfig;
 
@@ -933,7 +932,7 @@ impl AppConfig {
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
             if let Err(e) = crate::resources::install_xdg_config() {
-                log::warn!("failed to initialize XDG config directory: {}", e);
+                tracing::warn!("failed to initialize XDG config directory: {}", e);
             }
         }
 
@@ -966,14 +965,14 @@ impl AppConfig {
 
     /// Return the effective log level. Parses `agent.log_level`; unrecognized
     /// values fall back to `info`.
-    pub fn effective_log_level(&self) -> LevelFilter {
+    pub fn effective_log_level(&self) -> tracing::Level {
         match self.agent.log_level.to_lowercase().as_str() {
-            "trace" => LevelFilter::Trace,
-            "debug" => LevelFilter::Debug,
-            "info" => LevelFilter::Info,
-            "warn" => LevelFilter::Warn,
-            "error" => LevelFilter::Error,
-            _ => LevelFilter::Info,
+            "trace" => tracing::Level::TRACE,
+            "debug" => tracing::Level::DEBUG,
+            "info" => tracing::Level::INFO,
+            "warn" => tracing::Level::WARN,
+            "error" => tracing::Level::ERROR,
+            _ => tracing::Level::INFO,
         }
     }
 

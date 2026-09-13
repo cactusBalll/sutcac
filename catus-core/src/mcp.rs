@@ -20,6 +20,7 @@ use rmcp::{
 };
 use serde_json::Value;
 use tokio::process::Command;
+use tracing::Instrument;
 
 use crate::config::{McpServerConfig, McpTransport};
 use crate::tool::{ToolCall, ToolResult};
@@ -237,36 +238,43 @@ impl McpManager {
         let mut warnings = Vec::new();
 
         for config in servers {
-            match McpClient::connect(config).await {
-                Ok(client) => {
-                    log::info!("connected to mcp server '{}'", config.name);
-                    let catalog = match client.list_tools().await {
-                        Ok(tools) => {
-                            log::info!(
-                                "mcp server '{}' advertises {} tool(s)",
-                                config.name,
-                                tools.len()
-                            );
-                            tools.into_iter().map(CachedTool::from_rmcp).collect()
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "failed to list tools from mcp server '{}': {}",
-                                config.name,
-                                e
-                            );
-                            warnings.push(format!("{}: {}", config.name, e));
-                            Vec::new()
-                        }
-                    };
-                    catalogs.insert(config.name.clone(), catalog);
-                    clients.insert(config.name.clone(), Arc::new(client));
-                }
-                Err(e) => {
-                    log::warn!("failed to connect to mcp server '{}': {}", config.name, e);
-                    warnings.push(format!("{}: {}", config.name, e));
+            // One span per server so connect/list failures trace under the
+            // server name.
+            let span = tracing::info_span!("mcp_connect", server = %config.name);
+            async {
+                match McpClient::connect(config).await {
+                    Ok(client) => {
+                        tracing::info!("connected to mcp server '{}'", config.name);
+                        let catalog = match client.list_tools().await {
+                            Ok(tools) => {
+                                tracing::info!(
+                                    "mcp server '{}' advertises {} tool(s)",
+                                    config.name,
+                                    tools.len()
+                                );
+                                tools.into_iter().map(CachedTool::from_rmcp).collect()
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "failed to list tools from mcp server '{}': {}",
+                                    config.name,
+                                    e
+                                );
+                                warnings.push(format!("{}: {}", config.name, e));
+                                Vec::new()
+                            }
+                        };
+                        catalogs.insert(config.name.clone(), catalog);
+                        clients.insert(config.name.clone(), Arc::new(client));
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to connect to mcp server '{}': {}", config.name, e);
+                        warnings.push(format!("{}: {}", config.name, e));
+                    }
                 }
             }
+            .instrument(span)
+            .await;
         }
 
         (
@@ -284,11 +292,12 @@ impl McpManager {
     /// startup or were configured after boot. An already-connected server is
     /// reconnected only by explicit request; callers should check
     /// [`McpManager::is_connected`] first.
+    #[tracing::instrument(skip(self, config), fields(server = %config.name))]
     pub async fn connect_one(&self, config: &McpServerConfig) -> Result<Vec<CachedTool>, McpError> {
         let client = McpClient::connect(config).await?;
         let catalog = client.list_tools().await?;
         let cached: Vec<CachedTool> = catalog.into_iter().map(CachedTool::from_rmcp).collect();
-        log::info!(
+        tracing::info!(
             "connected to mcp server '{}' ({} tool(s))",
             config.name,
             cached.len()

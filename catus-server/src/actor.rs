@@ -6,10 +6,6 @@
 //! The Tauri bridge differs only in how events leave the process (Tauri
 //! `emit` vs the axum broadcast channel).
 
-use std::fs::OpenOptions;
-
-use log::LevelFilter;
-use simplelog::{Config, WriteLogger};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use catus_core::app::{AgentDetail, AppSnapshot, InputLineOutcome, RuntimeEvent, SkillPreview};
@@ -126,7 +122,10 @@ pub async fn run(
     events: broadcast::Sender<BroadcastEvent>,
 ) -> Result<(), String> {
     let config: AppConfig = load_config()?;
-    init_logger(&config.effective_log_path(), config.effective_log_level());
+    let _log_guard = catus_core::logging::init_logging(
+        &config.effective_log_path(),
+        config.effective_log_level(),
+    );
 
     let mut runtime = bootstrap_runtime(config, false).await?;
 
@@ -157,12 +156,6 @@ pub async fn run(
     runtime.app.await_memory_passes().await;
     runtime.app.persist_session();
     Ok(())
-}
-
-fn init_logger(path: &std::path::Path, level: LevelFilter) {
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = WriteLogger::init(level, Config::default(), file);
-    }
 }
 
 /// Expand the `@agent_name <task>` shorthand, mirroring the TUI input layer.

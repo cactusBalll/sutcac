@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use sutcac_sh::exec::ShellState;
 use tokio::sync::{mpsc, oneshot};
+use tracing::Instrument;
 
 use crate::agents::{AgentDefinition, AgentRegistry, AgentRole};
 use crate::config::{AppConfig, ModelTier, TierModels};
@@ -799,7 +800,19 @@ impl SubagentRunner {
         }
     }
 
-    async fn run(mut self) {
+    async fn run(self) {
+        // The runner lives in a spawned task; give its whole turn loop a
+        // dedicated span so subagent activity (LLM rounds, tool calls,
+        // completeTask) nests under one trace node keyed by the subagent id.
+        let span = tracing::info_span!(
+            "subagent_run",
+            subagent = %self.id,
+            agent = %self.definition.name,
+        );
+        self.run_turn_loop().instrument(span).await;
+    }
+
+    async fn run_turn_loop(mut self) {
         let _ = self
             .event_tx
             .send(SubagentEvent::Started {
@@ -815,10 +828,16 @@ impl SubagentRunner {
             let tools = self.toolbox.definitions();
             let client = self.client.clone();
 
-            tokio::spawn(async move {
-                let result = client.stream_chat(&messages, &tools, event_tx).await;
-                let _ = done_tx.send(result).await;
-            });
+            // Carry the subagent span into the stream task so the LLM
+            // request nests under this subagent's trace node.
+            let span = tracing::Span::current();
+            tokio::spawn(
+                async move {
+                    let result = client.stream_chat(&messages, &tools, event_tx).await;
+                    let _ = done_tx.send(result).await;
+                }
+                .instrument(span),
+            );
 
             self.send_state(SubagentState::Streaming);
 

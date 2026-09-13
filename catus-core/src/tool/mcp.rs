@@ -91,7 +91,7 @@ impl McpServerTool {
                 };
                 match self.manager.call_tool(&self.server, &tool, arguments).await {
                     Ok(result) => {
-                        log::info!(
+                        tracing::info!(
                             "mcp tool finished: {}:{} status={} stdout_len={} stderr_len={}",
                             self.server,
                             tool,
@@ -102,7 +102,7 @@ impl McpServerTool {
                         Ok((result.stdout, result.stderr))
                     }
                     Err(e) => {
-                        log::warn!("mcp tool failed: {}:{} error={}", self.server, tool, e);
+                        tracing::warn!("mcp tool failed: {}:{} error={}", self.server, tool, e);
                         Err(format!("mcp tool failed: {}", e))
                     }
                 }

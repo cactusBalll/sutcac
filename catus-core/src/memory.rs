@@ -80,7 +80,7 @@ impl MemoryState {
         match registry.get_by_role(AgentRole::Memory) {
             Some(agent) => {
                 state.available = true;
-                log::info!(
+                tracing::info!(
                     "agent memory enabled; store at {}, agent '{}'",
                     state.memory_dir.display(),
                     agent.name
@@ -92,7 +92,7 @@ impl MemoryState {
                      was found; the Agent Memory subsystem stays disabled"
                         .to_string(),
                 );
-                log::warn!("{}", state.warnings[0]);
+                tracing::warn!("{}", state.warnings[0]);
             }
         }
         state

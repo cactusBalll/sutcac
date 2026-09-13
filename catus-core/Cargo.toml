@@ -10,7 +10,6 @@ dirs = "6.0.0"
 eventsource-stream = "0.2.3"
 futures = "0.3.34"
 http = "1"
-log = "0.4"
 reqwest = { version = "0.13.4", features = ["json", "stream", "cookies"] }
 rmcp = { version = "3.1.4", features = [
     "client",
@@ -25,6 +24,10 @@ sutcac-sh = { path = "../sutcac-sh" }
 tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.4"
 toml_edit = "0.25"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "chrono", "tracing-log"] }
 
 [dev-dependencies]
 tempfile = "3"

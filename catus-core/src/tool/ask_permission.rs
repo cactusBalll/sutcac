@@ -290,7 +290,7 @@ impl Tool for AskPermissionTool {
         Box::pin(async move {
             let cwd = ctx.shell_state.cwd.clone();
             let Some(request) = parse_ask_permission_request(&call.arguments, &cwd) else {
-                log::warn!("malformed tool call: {}", call.arguments);
+                tracing::warn!("malformed tool call: {}", call.arguments);
                 return ToolResult {
                     call: call.clone(),
                     status: 2,

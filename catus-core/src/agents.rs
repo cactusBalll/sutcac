@@ -269,7 +269,7 @@ impl AgentRegistry {
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => {
-                        log::warn!("failed to read entry in {}: {}", base.display(), e);
+                        tracing::warn!("failed to read entry in {}: {}", base.display(), e);
                         continue;
                     }
                 };
@@ -282,11 +282,11 @@ impl AgentRegistry {
                 }
                 match AgentDefinition::load(&path) {
                     Ok(agent) => {
-                        log::info!("discovered agent '{}' at {}", agent.name, path.display());
+                        tracing::info!("discovered agent '{}' at {}", agent.name, path.display());
                         registry.agents.push(agent);
                     }
                     Err(e) => {
-                        log::warn!("skipping invalid agent at {}: {}", path.display(), e);
+                        tracing::warn!("skipping invalid agent at {}: {}", path.display(), e);
                     }
                 }
             }

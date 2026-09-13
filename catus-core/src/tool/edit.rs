@@ -68,7 +68,7 @@ impl Tool for EditTool {
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let Some(args) = parse_arguments(&call.arguments) else {
-                log::warn!("malformed tool call: {}", call.arguments);
+                tracing::warn!("malformed tool call: {}", call.arguments);
                 return ToolResult {
                     call: call.clone(),
                     status: 2,
@@ -81,7 +81,7 @@ impl Tool for EditTool {
                 };
             };
 
-            log::info!(
+            tracing::info!(
                 "edit tool: {} ({} -> {} bytes)",
                 args.file_path,
                 args.old_string.len(),
@@ -111,7 +111,7 @@ impl Tool for EditTool {
                 }
             }
 
-            log::info!(
+            tracing::info!(
                 "edit tool finished: status={} stdout_len={} stderr_len={}",
                 output.status,
                 output.stdout.len(),

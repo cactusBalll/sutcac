@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use sutcac_sh::config::ShellConfig;
 use sutcac_sh::exec::ShellState;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use crate::agents::{AgentDefinition, AgentRegistry, AgentRole};
 use crate::config::{AppConfig, TierModels};
@@ -284,6 +285,10 @@ pub struct App {
     pub max_tool_rounds: usize,
     pending_tool_calls: Vec<ToolCall>,
     tool_rounds_this_turn: usize,
+    /// Monotonic turn counter, incremented at every user message submission.
+    /// Logging-only correlation field so flat file log lines from the LLM
+    /// stream task, tools, and subagents can be grouped per user turn.
+    turn_seq: u64,
     /// A tool call that is paused waiting for the user to answer questions
     /// in the ask overlay. The turn resumes via `complete_interaction` or
     /// `cancel_interaction` once the overlay closes.
@@ -586,7 +591,7 @@ impl App {
             Err(e) => {
                 // Tests and minimal setups run without a configured model; real
                 // runs are rejected earlier by config validation in main.
-                log::warn!("no usable model configuration ({}); using placeholder", e);
+                tracing::warn!("no usable model configuration ({}); using placeholder", e);
                 vec![Model::default()]
             }
         };
@@ -594,7 +599,7 @@ impl App {
         let tier_models = config.resolve_tier_models(&models).unwrap_or_else(|e| {
             // Tests and minimal setups run without a tier configuration; real
             // runs are rejected earlier by config validation in main.
-            log::warn!(
+            tracing::warn!(
                 "invalid tier model configuration ({}); tiers fall back to the current model",
                 e
             );
@@ -633,7 +638,7 @@ impl App {
             search_paths.extend(extra.iter().cloned());
         }
         let skill_registry = SkillRegistry::discover(&search_paths).unwrap_or_else(|e| {
-            log::warn!("failed to discover skills: {}", e);
+            tracing::warn!("failed to discover skills: {}", e);
             SkillRegistry::new()
         });
 
@@ -677,7 +682,7 @@ impl App {
             Some(dir) => match crate::history::SessionStore::open(dir) {
                 Ok(store) => (Some(store), new_session_name()),
                 Err(e) => {
-                    log::warn!("failed to open history database: {}", e);
+                    tracing::warn!("failed to open history database: {}", e);
                     (None, String::new())
                 }
             },
@@ -715,6 +720,7 @@ impl App {
             max_tool_rounds,
             pending_tool_calls: Vec::new(),
             tool_rounds_this_turn: 0,
+            turn_seq: 0,
             pending_interaction: None,
             history_store,
             current_session_id: None,
@@ -756,7 +762,7 @@ impl App {
             search_paths.extend(extra.iter().cloned());
         }
         let registry = AgentRegistry::discover(&search_paths).unwrap_or_else(|e| {
-            log::warn!("failed to discover agents: {}", e);
+            tracing::warn!("failed to discover agents: {}", e);
             AgentRegistry::new()
         });
 
@@ -765,7 +771,7 @@ impl App {
             return (registry, main, true);
         }
 
-        log::warn!("main.md agent definition not found; using empty placeholder");
+        tracing::warn!("main.md agent definition not found; using empty placeholder");
         let placeholder = AgentDefinition {
             name: "main".to_string(),
             description: "Default main agent".to_string(),
@@ -821,10 +827,10 @@ impl App {
 
         let (manager, warnings) = McpManager::connect(&mcp_config.servers).await;
         if manager.is_empty() {
-            log::warn!("no mcp servers connected");
+            tracing::warn!("no mcp servers connected");
             self.mcp_manager = None;
         } else {
-            log::info!("{} mcp server(s) connected", manager.len());
+            tracing::info!("{} mcp server(s) connected", manager.len());
             self.mcp_manager = Some(Arc::new(manager));
         }
         self.rebuild_toolbox();
@@ -853,7 +859,7 @@ impl App {
         if let Some(manager) = &self.mcp_manager {
             for server in manager.server_names() {
                 let tool = McpServerTool::new(manager.clone(), &server, self.disabled_mcp.clone());
-                log::info!(
+                tracing::info!(
                     "registered mcp gateway tool '{}' for server '{}'",
                     tool.name(),
                     server
@@ -883,8 +889,10 @@ impl App {
     /// and start streaming immediately.
     pub fn submit_user_message(&mut self, text: String) {
         let session_start = !self.messages.iter().any(|m| m.role == Role::User);
+        self.turn_seq += 1;
         self.messages.push(Message::user(text.clone()));
         self.tool_rounds_this_turn = 0;
+        tracing::info!(turn = self.turn_seq, "user message submitted");
         self.queue_event(RuntimeEvent::MessagesChanged);
         if session_start {
             self.maybe_dispatch_memory_recall(&text);
@@ -942,7 +950,7 @@ impl App {
 
     /// Store a tool call received from the streaming parser.
     pub fn add_tool_call(&mut self, call: ToolCall) {
-        log::info!("pending tool call added: {} -> {}", call.id, call.name);
+        tracing::info!("pending tool call added: {} -> {}", call.id, call.name);
         self.pending_tool_calls.push(call.clone());
         if let Some(last) = self.messages.last_mut() {
             if last.role == Role::Assistant {
@@ -962,7 +970,7 @@ impl App {
         self.queue_event(RuntimeEvent::MessagesChanged);
 
         if let Some(last) = self.messages.last() {
-            log::info!(
+            tracing::info!(
                 "assistant finished: content_len={} had_tool_calls={} pending_tool_calls={}",
                 last.content.len(),
                 last.had_tool_calls,
@@ -974,7 +982,7 @@ impl App {
         // `run_pending_tool`, not by text markers.
 
         if self.has_empty_assistant_placeholder() {
-            log::warn!("assistant response was empty; dropping placeholder message");
+            tracing::warn!("assistant response was empty; dropping placeholder message");
             self.messages.pop();
             self.messages.push(Message::event(
                 "Assistant returned an empty response".to_string(),
@@ -999,7 +1007,7 @@ impl App {
 
     /// Accumulate token usage reported for one completed LLM request.
     pub fn record_usage(&mut self, usage: &Usage) {
-        log::info!(
+        tracing::info!(
             "usage recorded: prompt={} completion={} total={} cached={}",
             usage.prompt_tokens,
             usage.completion_tokens,
@@ -1176,7 +1184,7 @@ impl App {
             task,
             crate::subagent::SubagentContextMode::Fork,
         );
-        log::info!("memory write pass dispatched as {}", id);
+        tracing::info!("memory write pass dispatched as {}", id);
         self.memory.pending_write = Some(id);
     }
 
@@ -2575,7 +2583,7 @@ impl App {
     /// log it at the provided level.
     pub fn add_event_message(&mut self, msg: impl Into<String>) {
         let text = msg.into();
-        log::warn!("{}", text);
+        tracing::warn!("{}", text);
         self.messages.push(Message::event(text));
         self.queue_event(RuntimeEvent::MessagesChanged);
     }
@@ -2673,21 +2681,21 @@ impl App {
     /// session. `tags` is a comma-separated list (case-insensitive).
     pub fn grant_session_permissions(&mut self, tags: &str) {
         self.shell_state.permissions.grant_tag(tags);
-        log::info!("session permissions granted via /permission: {}", tags);
+        tracing::info!("session permissions granted via /permission: {}", tags);
     }
 
     /// Revoke previously granted session permission tags from the main
     /// agent's shell policy. `tags` is a comma-separated list.
     pub fn revoke_session_permissions(&mut self, tags: &str) {
         self.shell_state.permissions.revoke_grants(tags);
-        log::info!("session permissions revoked via /permission: {}", tags);
+        tracing::info!("session permissions revoked via /permission: {}", tags);
     }
 
     /// Reset the main agent's shell permission policy to the configured
     /// default (drops all session grants).
     pub fn reset_session_permissions(&mut self) {
         self.rebuild_shell_policy();
-        log::info!("session permissions reset via /permission");
+        tracing::info!("session permissions reset via /permission");
     }
 
     /// Switch the main agent's shell permission policy to allow-all for the
@@ -2696,7 +2704,7 @@ impl App {
         self.shell_state.permissions.mode = sutcac_sh::permissions::PermissionMode::AllowAll;
         self.shell_state.permissions.session_grants =
             sutcac_sh::permissions::PermissionSet::empty();
-        log::info!("session permissions switched to allow_all via /auto");
+        tracing::info!("session permissions switched to allow_all via /auto");
     }
 
     /// Return true if the per-turn tool round limit has been reached.
@@ -2733,7 +2741,7 @@ impl App {
                 self.status = AppStatus::RunningTool;
                 let description = tool.describe_call(&call);
                 self.status_message = format!("Running: {}", description);
-                log::info!("running tool: {}", description);
+                tracing::info!(turn = self.turn_seq, tool = %call.name, "running tool: {description}");
                 self.messages
                     .push(Message::event(format!("tool: {}", description)));
 
@@ -2752,7 +2760,7 @@ impl App {
                 tool.execute(&call, &mut ctx).await
             }
             None => {
-                log::warn!("unknown tool call: {}", call.name);
+                tracing::warn!(turn = self.turn_seq, tool = %call.name, "unknown tool call");
                 ToolResult {
                     call: call.clone(),
                     status: 1,
@@ -2770,7 +2778,11 @@ impl App {
             // the frontend collect the answers; the turn resumes via
             // `complete_interaction` once they arrive. No result message is
             // pushed yet.
-            log::info!("tool '{}' is waiting for user input", call.name);
+            tracing::info!(
+                turn = self.turn_seq,
+                tool = %call.name,
+                "tool is waiting for user input"
+            );
             self.pending_interaction = Some((call, request.questions.clone()));
             self.queue_event(RuntimeEvent::InteractionRequested(request.questions));
             return None;
@@ -2826,7 +2838,7 @@ impl App {
                             &self.shell_state.cwd,
                         );
                     }
-                    log::info!("session permissions granted: {}", request.summary());
+                    tracing::info!("session permissions granted: {}", request.summary());
                     (
                         0,
                         format!("granted for this session: {}", request.summary()),
@@ -2851,7 +2863,7 @@ impl App {
             });
         }
         let stdout = serde_json::to_string(&answers).unwrap_or_else(|e| {
-            log::warn!("failed to serialize ask_user answers: {}", e);
+            tracing::warn!("failed to serialize ask_user answers: {}", e);
             "[]".to_string()
         });
         self.finish_interaction(|call| ToolResult {
@@ -2903,7 +2915,7 @@ impl App {
         match store.list_sessions(&self.session_cwd) {
             Ok(sessions) => sessions.into_iter().map(|s| s.name).collect(),
             Err(e) => {
-                log::warn!("failed to list sessions: {}", e);
+                tracing::warn!("failed to list sessions: {}", e);
                 Vec::new()
             }
         }
@@ -3041,7 +3053,7 @@ impl App {
                     self.session_name = name;
                 }
                 None => {
-                    log::warn!("failed to create history session row; skipping persist");
+                    tracing::warn!("failed to create history session row; skipping persist");
                     return;
                 }
             }
@@ -3064,18 +3076,18 @@ impl App {
         let state = self.persist_state();
         let store = self.history_store.as_ref().unwrap();
         if let Err(e) = store.save_meta(&meta) {
-            log::warn!("failed to save session metadata: {}", e);
+            tracing::warn!("failed to save session metadata: {}", e);
         }
         if let Err(e) =
             store.replace_messages(session, crate::history::MAIN_AGENT_ID, &self.messages)
         {
-            log::warn!("failed to save conversation messages: {}", e);
+            tracing::warn!("failed to save conversation messages: {}", e);
         }
         if let Err(e) = store.replace_subagents(session, &subagents) {
-            log::warn!("failed to save subagent state: {}", e);
+            tracing::warn!("failed to save subagent state: {}", e);
         }
         if let Err(e) = store.replace_state(session, &state) {
-            log::warn!("failed to save session state: {}", e);
+            tracing::warn!("failed to save session state: {}", e);
         }
     }
 
@@ -3091,17 +3103,17 @@ impl App {
         let mut should_resume = false;
         match &event {
             SubagentEvent::Started { id } => {
-                log::info!("subagent {} started", id);
+                tracing::info!("subagent {} started", id);
                 self.add_event_message(format!("subagent {} started", id));
             }
             SubagentEvent::StateChanged { id, state } => {
-                log::info!("subagent {} state changed to {:?}", id, state);
+                tracing::info!("subagent {} state changed to {:?}", id, state);
             }
             SubagentEvent::Message { id, message } => {
-                log::debug!("subagent {} message: {:?}", id, message.role);
+                tracing::debug!("subagent {} message: {:?}", id, message.role);
             }
             SubagentEvent::Completed { id, result } => {
-                log::info!("subagent {} completed", id);
+                tracing::info!("subagent {} completed", id);
                 self.add_event_message(format!(
                     "subagent {} completed ({} chars)",
                     id,
@@ -3121,8 +3133,8 @@ impl App {
                                 )));
                             }
                         }
-                        Some(_) => log::info!("memory recall pass returned recall=false"),
-                        None => log::warn!("memory recall pass returned an unparseable result"),
+                        Some(_) => tracing::info!("memory recall pass returned recall=false"),
+                        None => tracing::warn!("memory recall pass returned an unparseable result"),
                     }
                     // The user's turn was withheld for the recall pass; start
                     // the main stream with whatever was injected.
@@ -3131,11 +3143,11 @@ impl App {
                     self.memory.pending_write = None;
                     match crate::memory::parse_write_result(result) {
                         Some(parsed) if parsed.written => {
-                            log::info!("memory write pass recorded: {}", parsed.summary);
+                            tracing::info!("memory write pass recorded: {}", parsed.summary);
                             self.add_event_message(format!("memory updated: {}", parsed.summary));
                         }
-                        Some(_) => log::info!("memory write pass recorded nothing"),
-                        None => log::warn!("memory write pass returned an unparseable result"),
+                        Some(_) => tracing::info!("memory write pass recorded nothing"),
+                        None => tracing::warn!("memory write pass returned an unparseable result"),
                     }
                 } else if let Some(sub) = self.subagents.get(id) {
                     // Notify the parent that the subagent finished, without
@@ -3159,17 +3171,17 @@ impl App {
                 self.dispatch_queued_memory_write();
             }
             SubagentEvent::Error { id, error } => {
-                log::error!("subagent {} error: {}", id, error);
+                tracing::error!("subagent {} error: {}", id, error);
                 self.add_event_message(format!("subagent {} error: {}", id, error));
                 // A failed memory pass degrades to "no memory" instead of
                 // blocking the user's turn.
                 if self.memory.pending_recall.as_deref() == Some(id.as_str()) {
                     self.memory.pending_recall = None;
-                    log::warn!("memory recall pass failed; continuing without memory");
+                    tracing::warn!("memory recall pass failed; continuing without memory");
                     should_resume = true;
                 } else if self.memory.pending_write.as_deref() == Some(id.as_str()) {
                     self.memory.pending_write = None;
-                    log::warn!("memory write pass failed: {}", error);
+                    tracing::warn!("memory write pass failed: {}", error);
                 } else if let Some(sub) = self.subagents.get(id) {
                     if sub.parent_call_id.is_some() && !self.subagents.is_sync(id) {
                         let call_id = sub.parent_call_id.clone().unwrap();
@@ -3271,7 +3283,7 @@ impl App {
         if let Some(model) = self.models.iter().find(|m| m.id == snapshot.meta.model_id) {
             self.current_model = model.clone();
         } else if !snapshot.meta.model_id.is_empty() {
-            log::warn!(
+            tracing::warn!(
                 "saved model '{}' is not configured; keeping the current model",
                 snapshot.meta.model_id
             );
@@ -3474,7 +3486,7 @@ impl App {
             let models = match self.config.resolve_models() {
                 Ok(models) => models,
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "no usable model configuration in new workspace ({}); using placeholder",
                         e
                     );
@@ -3514,7 +3526,7 @@ impl App {
             search_paths.extend(extra.iter().cloned());
         }
         self.skill_registry = SkillRegistry::discover(&search_paths).unwrap_or_else(|e| {
-            log::warn!("failed to discover skills: {}", e);
+            tracing::warn!("failed to discover skills: {}", e);
             SkillRegistry::new()
         });
         self.agent_registry.set_disabled_names(Vec::new());
@@ -3552,7 +3564,7 @@ impl App {
             .config
             .resolve_tier_models(&self.models)
             .unwrap_or_else(|e| {
-                log::warn!(
+                tracing::warn!(
                     "invalid tier model configuration ({}); tiers fall back to the current model",
                     e
                 );
@@ -3621,11 +3633,23 @@ impl App {
         let client = self.client.clone();
         let event_tx = self.stream_tx.clone();
         let done_tx = self.done_tx.clone();
+        let turn = self.turn_seq;
 
-        tokio::spawn(async move {
-            let result = client.stream_chat(&messages, &tools, event_tx).await;
-            let _ = done_tx.send(result).await;
-        });
+        // The stream task outlives this call; carry the span into it so the
+        // LLM request, stream parsing, and usage events stay nested under the
+        // same trace as the rest of the turn.
+        let span = tracing::info_span!(
+            "llm_stream_task",
+            turn,
+            model = %client.model_id(),
+        );
+        tokio::spawn(
+            async move {
+                let result = client.stream_chat(&messages, &tools, event_tx).await;
+                let _ = done_tx.send(result).await;
+            }
+            .instrument(span),
+        );
     }
 
     /// Handle the completion of an LLM stream.
@@ -3638,9 +3662,10 @@ impl App {
             Ok(()) => {
                 self.finish_stream();
                 if self.has_pending_tool_call() {
-                    log::info!(
-                        "{} pending tool call(s); running tool",
-                        self.pending_tool_calls_count()
+                    tracing::info!(
+                        turn = self.turn_seq,
+                        count = self.pending_tool_calls_count(),
+                        "pending tool call(s); running tool"
                     );
                     self.run_pending_tool().await;
                     if self.pending_interaction.is_some() {
@@ -3659,14 +3684,14 @@ impl App {
                             self.max_tool_rounds(),
                             count
                         );
-                        log::warn!("{}", msg);
+                        tracing::warn!("{}", msg);
                         self.add_event_message(msg);
                     }
                     self.clear_pending_tool_calls();
                     self.persist_session();
                     TurnPhase::Complete
                 } else {
-                    log::info!("no pending tool call; turn complete");
+                    tracing::info!(turn = self.turn_seq, "no pending tool call; turn complete");
                     // Turn finished: hand the turn over to the memory
                     // subagent's summarize/write pass (forks the main
                     // context, runs in background; queued when busy).
@@ -3681,7 +3706,7 @@ impl App {
                 if self.has_empty_assistant_placeholder() {
                     self.messages.pop();
                 }
-                log::error!("llm stream error: {}", e);
+                tracing::error!(turn = self.turn_seq, error = %e, "llm stream error");
                 self.add_event_message(format!("LLM request failed: {}", e));
                 self.set_error("LLM request failed".to_string());
                 self.persist_session();

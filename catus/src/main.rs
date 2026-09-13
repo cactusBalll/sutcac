@@ -1,13 +1,10 @@
 //! catus: an Agent tool prototype with OpenAI-compatible API and TUI.
 
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use crossterm::event::Event;
-use log::LevelFilter;
-use simplelog::{Config, WriteLogger};
 use tokio::sync::mpsc;
 
 use catus::tui;
@@ -81,19 +78,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(prompt) = cli.test {
         let config = load_config().unwrap_or_else(exit_on_startup_error);
-        init_logger(&config.effective_log_path(), config.effective_log_level());
+        let _log_guard = catus_core::logging::init_logging(
+            &config.effective_log_path(),
+            config.effective_log_level(),
+        );
         return run_test_mode(prompt, config).await;
     }
 
     let config = load_config().unwrap_or_else(exit_on_startup_error);
-    init_logger(&config.effective_log_path(), config.effective_log_level());
+    let _log_guard = catus_core::logging::init_logging(
+        &config.effective_log_path(),
+        config.effective_log_level(),
+    );
     run_tui_mode(config).await
-}
-
-fn init_logger(path: &Path, level: LevelFilter) {
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = WriteLogger::init(level, Config::default(), file);
-    }
 }
 
 /// Switch the process into the requested workspace directory. Must run before

@@ -161,7 +161,7 @@ impl Tool for AskUserTool {
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let Some(questions) = parse_questions(&call.arguments) else {
-                log::warn!("malformed tool call: {}", call.arguments);
+                tracing::warn!("malformed tool call: {}", call.arguments);
                 return ToolResult {
                     call: call.clone(),
                     status: 2,

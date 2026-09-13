@@ -170,7 +170,7 @@ impl SkillRegistry {
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => {
-                        log::warn!("failed to read entry in {}: {}", base.display(), e);
+                        tracing::warn!("failed to read entry in {}: {}", base.display(), e);
                         continue;
                     }
                 };
@@ -180,11 +180,11 @@ impl SkillRegistry {
                 }
                 match Skill::load(&path) {
                     Ok(skill) => {
-                        log::info!("discovered skill '{}' at {}", skill.name, path.display());
+                        tracing::info!("discovered skill '{}' at {}", skill.name, path.display());
                         registry.skills.push(skill);
                     }
                     Err(e) => {
-                        log::warn!("skipping invalid skill at {}: {}", path.display(), e);
+                        tracing::warn!("skipping invalid skill at {}: {}", path.display(), e);
                     }
                 }
             }

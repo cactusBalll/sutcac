@@ -14,6 +14,7 @@
 use crate::app::App;
 use crate::config::{AppConfig, AppDirs};
 use crate::runtime::Runtime;
+use tracing::Instrument;
 
 /// Load the effective configuration.
 ///
@@ -47,9 +48,10 @@ pub fn load_config() -> Result<AppConfig, String> {
 /// Build the runtime and connect to the configured MCP servers.
 ///
 /// Requires a `main.md` agent definition. Startup warnings (memory subsystem,
-/// MCP) are reported through `log` when `log_warnings` is false and to stderr
+/// MCP) are reported through tracing when `log_warnings` is false and to stderr
 /// otherwise; startup events queued during initialization are drained.
 pub async fn bootstrap_runtime(config: AppConfig, log_warnings: bool) -> Result<Runtime, String> {
+    let span = tracing::info_span!("bootstrap");
     let mut runtime = Runtime::new(App::new(config));
     if !runtime.app.main_agent_from_file {
         return Err("main agent definition not found; create .sutcac/agents/main.md".to_string());
@@ -58,19 +60,20 @@ pub async fn bootstrap_runtime(config: AppConfig, log_warnings: bool) -> Result<
         if log_warnings {
             eprintln!("catus: memory warning: {}", warning);
         } else {
-            log::warn!("memory warning: {}", warning);
+            tracing::warn!(parent: span.clone(), "memory warning: {}", warning);
         }
     }
     // Drain startup events queued during initialization.
     while runtime.app.take_event().is_some() {}
 
-    let mcp_warnings = runtime.app.connect_mcp().await;
+    let mcp_warnings = runtime.app.connect_mcp().instrument(span.clone()).await;
     for warning in &mcp_warnings {
         if log_warnings {
             eprintln!("catus: mcp warning: {}", warning);
         } else {
-            log::warn!("mcp warning: {}", warning);
+            tracing::warn!(parent: span.clone(), "mcp warning: {}", warning);
         }
     }
+    tracing::info!(parent: span, "bootstrap complete");
     Ok(runtime)
 }

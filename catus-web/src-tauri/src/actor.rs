@@ -11,11 +11,7 @@
 //! - `snapshot`: a full [`AppSnapshot`] after structural state changes.
 //! - `app-quit`: the session requested a shutdown (`/exit`).
 
-use std::fs::OpenOptions;
-
-use log::LevelFilter;
 use serde_json::json;
-use simplelog::{Config, WriteLogger};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot};
 
@@ -128,7 +124,10 @@ pub enum Command {
 /// startup fails. All Tauri event emission happens here.
 pub async fn run(app: AppHandle, mut cmd_rx: mpsc::Receiver<Command>) -> Result<(), String> {
     let config: AppConfig = load_config()?;
-    init_logger(&config.effective_log_path(), config.effective_log_level());
+    let _log_guard = catus_core::logging::init_logging(
+        &config.effective_log_path(),
+        config.effective_log_level(),
+    );
 
     let mut runtime = bootstrap_runtime(config, false).await?;
 
@@ -163,12 +162,6 @@ pub async fn run(app: AppHandle, mut cmd_rx: mpsc::Receiver<Command>) -> Result<
     // once it stops there is nothing left to serve the webview.
     app.exit(0);
     Ok(())
-}
-
-fn init_logger(path: &std::path::Path, level: LevelFilter) {
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = WriteLogger::init(level, Config::default(), file);
-    }
 }
 
 /// Expand the `@agent_name <task>` shorthand, mirroring the TUI input layer.
@@ -499,7 +492,7 @@ async fn handle_runtime_event(app: &AppHandle, runtime: &mut Runtime, event: Run
     let payload = match serde_json::to_value(&event) {
         Ok(value) => value,
         Err(e) => {
-            log::error!("failed to serialize runtime event: {}", e);
+            tracing::error!("failed to serialize runtime event: {}", e);
             return;
         }
     };

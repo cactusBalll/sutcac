@@ -76,7 +76,7 @@ impl Tool for ReadTool {
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
             let Some(args) = parse_arguments(&call.arguments) else {
-                log::warn!("malformed tool call: {}", call.arguments);
+                tracing::warn!("malformed tool call: {}", call.arguments);
                 return ToolResult {
                     call: call.clone(),
                     status: 2,
@@ -89,7 +89,7 @@ impl Tool for ReadTool {
                 };
             };
 
-            log::info!(
+            tracing::info!(
                 "read tool: {} (offset={:?}, limit={:?})",
                 args.file_path,
                 args.offset,
@@ -109,7 +109,7 @@ impl Tool for ReadTool {
             }
             let output = execute_shell_command(&command, ctx.shell_state);
 
-            log::info!(
+            tracing::info!(
                 "read tool finished: status={} stdout_len={} stderr_len={}",
                 output.status,
                 output.stdout.len(),

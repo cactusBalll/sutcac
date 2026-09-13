@@ -85,7 +85,7 @@ async fn main() {
                 std::process::exit(0);
             }
             Err(e) => {
-                log::error!("startup failed: {}", e);
+                tracing::error!("startup failed: {}", e);
                 eprintln!("catus-server: {}", e);
                 let _ = actor_events.send(BroadcastEvent::StartupError(e));
             }

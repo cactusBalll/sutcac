@@ -333,7 +333,7 @@ pub fn run() {
             app.manage(tx);
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = actor::run(handle.clone(), rx).await {
-                    log::error!("startup failed: {}", e);
+                    tracing::error!("startup failed: {}", e);
                     eprintln!("catus-web: {}", e);
                     let _ = handle.emit("startup-error", e);
                 }

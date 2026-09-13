@@ -58,7 +58,7 @@ impl Tool for ShellTool {
             let Some(command) = parse_command(&call.arguments) else {
                 // Malformed arguments: report back to the model and consume the
                 // call instead of leaving it pending forever.
-                log::warn!("malformed tool call: {}", call.arguments);
+                tracing::warn!("malformed tool call: {}", call.arguments);
                 return ToolResult {
                     call: call.clone(),
                     status: 2,
@@ -71,9 +71,9 @@ impl Tool for ShellTool {
                 };
             };
 
-            log::info!("running shell command: {}", command);
+            tracing::info!("running shell command: {}", command);
             let output = execute_shell_command(&command, ctx.shell_state);
-            log::info!(
+            tracing::info!(
                 "shell command finished: status={} stdout_len={} stderr_len={}",
                 output.status,
                 output.stdout.len(),
@@ -152,7 +152,7 @@ pub fn execute_shell_command(cmd: &str, state: &mut ShellState) -> CommandOutput
     // Restore the working directory so later tool calls start from the same
     // directory the Agent was launched in.
     if let Err(e) = std::env::set_current_dir(&original_env_cwd) {
-        log::warn!("failed to restore working directory: {}", e);
+        tracing::warn!("failed to restore working directory: {}", e);
     }
     state.cwd = original_cwd;
 

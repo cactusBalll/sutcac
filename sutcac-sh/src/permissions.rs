@@ -498,6 +498,9 @@ impl PermissionPolicy {
                     format!("cannot resolve path {:?}", cp.path),
                 ));
             };
+            if is_always_allowed_path(&resolved) {
+                continue;
+            }
             match cp.access {
                 PathAccess::Read => {
                     if !self.is_readable(&resolved, cwd) {
@@ -577,6 +580,14 @@ impl PermissionPolicy {
 /// Canonicalize a list of paths, skipping entries that do not exist.
 fn canonicalize_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     paths.iter().filter_map(|p| p.canonicalize().ok()).collect()
+}
+
+/// Paths that are harmless to read from or write to regardless of the
+/// configured restrictions.  `/dev/null` is the canonical sink; without this
+/// carve-out the base-dir restriction would reject the ubiquitous
+/// `2>/dev/null` redirect pattern.
+fn is_always_allowed_path(resolved: &Path) -> bool {
+    resolved == Path::new("/dev/null")
 }
 
 /// Resolve a path for containment checks. Returns the canonical path if it
@@ -843,6 +854,39 @@ mod tests {
             &outside,
         );
         assert!(relative.is_ok());
+    }
+
+    #[test]
+    fn dev_null_is_always_allowed_under_path_restriction() {
+        let tmp = std::env::temp_dir();
+        let base = tmp.join("sutcac_devnull_base");
+        let _ = std::fs::create_dir_all(&base);
+
+        // Base directory set, empty path lists: only the base directory is
+        // readable and writable, plus /dev/null regardless of access mode.
+        let policy = PermissionPolicy::allow_all().with_base_dir(&base);
+        policy
+            .check_paths(&[CommandPath::new("/dev/null", PathAccess::Read)], &base)
+            .unwrap();
+        policy
+            .check_paths(&[CommandPath::new("/dev/null", PathAccess::Write)], &base)
+            .unwrap();
+        // A redirect target inside the base dir alongside /dev/null is fine.
+        policy
+            .check_paths(
+                &[
+                    CommandPath::new(base.join("out.txt"), PathAccess::Write),
+                    CommandPath::new("/dev/null", PathAccess::Write),
+                ],
+                &base,
+            )
+            .unwrap();
+        // Other device paths remain restricted.
+        assert!(
+            policy
+                .check_paths(&[CommandPath::new("/dev/zero", PathAccess::Read)], &base)
+                .is_err()
+        );
     }
 
     #[test]

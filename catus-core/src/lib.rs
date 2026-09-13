@@ -14,6 +14,7 @@ pub mod config;
 pub mod frontmatter;
 pub mod history;
 pub mod llm;
+pub mod logging;
 pub mod mcp;
 pub mod memory;
 pub mod message;
