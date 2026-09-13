@@ -24,6 +24,7 @@ mod ask_user;
 mod complete_task;
 mod edit;
 mod mcp;
+mod rag;
 mod read;
 mod shell;
 mod skill;
@@ -53,6 +54,7 @@ pub use ask_user::{
 pub use complete_task::CompleteTaskTool;
 pub use edit::EditTool;
 pub use mcp::McpServerTool;
+pub use rag::{RagIndexTool, RagSearchTool};
 pub use read::ReadTool;
 pub use shell::ShellTool;
 pub use skill::SkillTool;

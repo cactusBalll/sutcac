@@ -1,3 +1,3 @@
 [workspace]
-members = ["catus","catus-core","catus-server","catus-web/src-tauri","sutcac-sh","mcp-calc-server"]
+members = ["catus","catus-core","catus-rag","catus-server","catus-web/src-tauri","sutcac-sh","mcp-calc-server"]
 resolver = "3"

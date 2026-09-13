@@ -66,6 +66,10 @@ pub async fn bootstrap_runtime(config: AppConfig, log_warnings: bool) -> Result<
     // Drain startup events queued during initialization.
     while runtime.app.take_event().is_some() {}
 
+    // RAG pre-load: opening the index snapshot is cheap (the embedding model
+    // itself stays lazy), so auto-injection works from the very first turn.
+    runtime.app.preload_rag();
+
     let mcp_warnings = runtime.app.connect_mcp().instrument(span.clone()).await;
     for warning in &mcp_warnings {
         if log_warnings {

@@ -1,0 +1,23 @@
+[package]
+name = "catus-rag"
+version = "0.1.0"
+edition = "2024"
+description = "Local hybrid retrieval (EmbeddingGemma HNSW + Tantivy BM25 + RRF) for catus"
+license = "Apache-2.0"
+
+[dependencies]
+fastembed = { version = "6.1.0", default-features = false, features = [
+    "ort-load-dynamic",
+    "hf-hub-native-tls",
+] }
+tantivy = "0.26"
+hnsw_rs = "0.3"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+walkdir = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+toml = "1"
+regex = "1"

@@ -124,6 +124,8 @@ mod tests {
         assert!(CONFIG_TOML.contains("[[providers]]"));
         assert!(CONFIG_TOML.contains("[[models]]"));
         assert!(CONFIG_TOML.contains("[agent.models]"));
+        assert!(CONFIG_TOML.contains("[rag]"));
+        assert!(CONFIG_TOML.contains("model = \"EmbeddingGemma300MQ4\""));
         assert!(AGENT_MAIN_MD.starts_with("---\nname: main\n"));
         assert!(AGENT_CODER_MD.starts_with("---\nname: coder\n"));
         assert!(AGENT_MEMORY_MD.starts_with("---\nname: memory\n"));

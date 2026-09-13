@@ -62,6 +62,60 @@ auto_write = true
 performance = "deepseek-v4-flash"
 # efficient = "kimi-k2"
 
+# Optional local hybrid retrieval (catus-rag). When enabled, `rag_search`
+# and `rag_index` tools plus optional per-turn context injection become
+# available for the workspace. The index lives in ./.sutcac/rag/ by default
+# and only whitelisted text files (code + Markdown) are indexed.
+# NOTE: the first `rag_search` / `rag index` lazily downloads the
+# EmbeddingGemma-300M-Q4 embedding model (~190MB) to the fastembed cache,
+# and the ONNX Runtime shared library must be reachable at runtime
+# (`ORT_DYLIB_PATH` pointing at a `libonnxruntime.so`, e.g. from the
+# `onnxruntime` pip package).
+[rag]
+# Master switch; disable keeps catus-rag fully dormant (no tools advertised).
+enabled = false
+# Expose the rag_search / rag_index tools to the LLM and subagents.
+tools_enabled = true
+# Per-turn injection: after each user message, top-k relevant chunks are
+# appended as an extra system message (off by default; /rag auto on|off can
+# override this per session).
+auto_inject = false
+# Injection budget.
+inject_top_k = 3
+inject_max_chars = 4000
+# Index snapshot directory. Empty = <workspace>/.sutcac/rag.
+# index_dir = ""
+
+# Embedding settings. `query_prefix` is fixed by the model card; switching
+# model or mrl_dim invalidates an existing index (rebuild with /rag rebuild).
+[rag.embedding]
+model = "EmbeddingGemma300MQ4"
+query_prefix = "task: search result | query:"
+mrl_dim = 768
+
+# Dense (HNSW) lane: graph connectivity, build & query search depths.
+[rag.dense]
+m = 16
+ef_construction = 128
+ef_search = 64
+recall_top = 50
+
+# Lexical (Tantivy BM25) lane.
+[rag.bm25]
+recall_top = 50
+
+# Fusion settings (RRF only in this iteration).
+[rag.fusion]
+method = "rrf"
+rrf_k = 60
+alpha = 0.4
+
+# Indexable-file whitelist: code + Markdown by default; extra extensions and
+# concrete path components to always skip go here.
+[rag.filter]
+extra_exts = []
+exclude = [".git", ".hg", ".svn", "target", "node_modules", "dist", "build", "__pycache__", ".venv", ".sutcac"]
+
 # Optional MCP client configuration. catus connects to the configured MCP
 # servers at startup and exposes their tools to the LLM alongside the built-in
 # `shell` tool. Tool names are prefixed with `{server_name}__`, e.g.

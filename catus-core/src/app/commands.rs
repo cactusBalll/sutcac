@@ -942,6 +942,156 @@ impl SlashCommand for MemoryCommand {
 /// Built-in slash commands available in the TUI.
 ///
 /// The registry is initialized lazily on first access.
+/// Manage the workspace RAG hybrid index.
+pub struct RagCommand;
+
+impl SlashCommand for RagCommand {
+    fn name(&self) -> &'static str {
+        "rag"
+    }
+
+    fn description(&self) -> &'static str {
+        "Show / manage the workspace hybrid retrieval index"
+    }
+
+    fn usage(&self) -> &'static str {
+        "/rag [status | index [path] | rebuild | auto on|off | path]"
+    }
+
+    fn subcommands(&self) -> &[&'static str] {
+        &["status", "index", "rebuild", "auto", "path"]
+    }
+
+    fn help(&self, subcommand: Option<&str>) -> String {
+        match subcommand {
+            Some("index") => "Usage: /rag index [path...]
+                Add files or whole directories to the index (whitelisted Text/Markdown/Code).                Without arguments, scan the entire workspace."
+                .to_string(),
+            Some("rebuild") => {
+                "Usage: /rag rebuild
+Clear the index directory and rebuild it from scratch.".to_string()
+            }
+            Some("auto") => "Usage: /rag auto on|off
+                Toggle automatic per-turn injection (session-level override).".to_string(),
+            Some("path") => "Usage: /rag path
+Show the index directory path.".to_string(),
+            Some("status") | None => "Usage: /rag [status]
+Show index status.".to_string(),
+            Some(sub) => format!("Unknown subcommand '{}' for /rag", sub),
+        }
+    }
+
+    fn record_history(&self, args: Option<&str>) -> bool {
+        args.is_some()
+    }
+
+    fn execute<'a>(
+        &'a self,
+        app: &'a mut App,
+        args: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<Option<UiRequest>, CommandError>> {
+        Box::pin(async move {
+            app.status = AppStatus::Idle;
+            let args = args.map(str::trim).filter(|s| !s.is_empty());
+            let Some(manager) = app.rag_manager.clone() else {
+                app.add_event_message("rag: disabled (set [rag].enabled = true)");
+                return Ok(None);
+            };
+            match args {
+                None => {
+                    app.add_event_message(app.rag_status_message());
+                    app.set_transient_message("RAG status");
+                }
+                Some(args) => {
+                    let mut parts = args.splitn(2, ' ');
+                    let sub = parts.next().unwrap_or("");
+                    let rest = parts.next().map(str::trim).filter(|s| !s.is_empty());
+                    match sub {
+                        "status" => {
+                            app.add_event_message(app.rag_status_message());
+                            app.set_transient_message("RAG status");
+                        }
+                        "index" => {
+                            let roots: Vec<std::path::PathBuf> = rest
+                                .map(|r| {
+                                    r.split_whitespace().map(std::path::PathBuf::from).collect()
+                                })
+                                .unwrap_or_else(|| vec![std::path::PathBuf::from(".")]);
+                            app.status = AppStatus::RunningTool;
+                            app.status_message = "Indexing workspace...".to_string();
+                            let result =
+                                tokio::task::spawn_blocking(move || manager.index_paths(&roots))
+                                    .await;
+                            match result {
+                                Ok(Ok(summary)) => {
+                                    app.add_event_message(format!("rag: {}", summary));
+                                    // Replay of a pending dense lane finished
+                                    // in the same batch; refresh status.
+                                    app.add_event_message(app.rag_status_message());
+                                }
+                                Ok(Err(e)) => {
+                                    app.add_event_message(format!("rag index failed: {}", e));
+                                }
+                                Err(e) => {
+                                    app.add_event_message(format!("/rag index task failed: {}", e));
+                                }
+                            }
+                            app.set_transient_message("RAG index updated");
+                        }
+                        "rebuild" => {
+                            let mgr2 = manager.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                mgr2.wipe().map_err(|e| e.to_string())?;
+                                mgr2.index_paths(&[std::path::PathBuf::from(".")])
+                            })
+                            .await;
+                            match result {
+                                Ok(Ok(summary)) => {
+                                    app.add_event_message(format!("rag: rebuild: {}", summary))
+                                }
+                                Ok(Err(e)) => {
+                                    app.add_event_message(format!("rag rebuild failed: {}", e))
+                                }
+                                Err(e) => {
+                                    app.add_event_message(format!("rag rebuild task failed: {}", e))
+                                }
+                            }
+                            app.set_transient_message("RAG index rebuilt");
+                        }
+                        "auto" => {
+                            let on = match rest {
+                                Some("on") => true,
+                                Some("off") => false,
+                                other => {
+                                    return Err(format!(
+                                        "usage: /rag auto on|off (got: {:?})",
+                                        other
+                                    )
+                                    .into());
+                                }
+                            };
+                            let msg = app.rag_set_auto_inject(on);
+                            app.set_transient_message(&msg);
+                            app.add_event_message(msg);
+                        }
+                        "path" => {
+                            let msg = format!("index directory: {}", manager.index_dir().display());
+                            app.add_event_message(msg);
+                            app.set_transient_message("RAG index directory shown");
+                        }
+                        _ => {
+                            return Err("unknown /rag subcommand: use /rag status, index,                                         rebuild, auto on|off, path"
+                                .to_owned()
+                                .into());
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        })
+    }
+}
+
 pub static BUILT_IN_REGISTRY: LazyLock<CommandRegistry> = LazyLock::new(|| {
     CommandRegistry::new(vec![
         Box::new(HelpCommand),
@@ -957,6 +1107,7 @@ pub static BUILT_IN_REGISTRY: LazyLock<CommandRegistry> = LazyLock::new(|| {
         Box::new(PermissionCommand),
         Box::new(AutoCommand),
         Box::new(McpCommand),
+        Box::new(RagCommand),
     ])
 });
 

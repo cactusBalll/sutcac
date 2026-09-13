@@ -13,15 +13,17 @@ use tracing::Instrument;
 use crate::agents::{AgentDefinition, AgentRegistry, AgentRole};
 use crate::config::{AppConfig, TierModels};
 use crate::llm::{LlmClient, LlmError, Model, StreamEvent, Usage};
+
 use crate::mcp::McpManager;
 use crate::message::{Message, Role};
+use crate::rag::RagManager;
 use crate::skills::SkillRegistry;
 use crate::subagent::SubagentManager;
 use crate::tool::McpServerTool;
 use crate::tool::{
-    AskAnswer, AskPermissionTool, AskQuestion, AskUserTool, EditTool, GRANT_SESSION, ReadTool,
-    ShellTool, SkillTool, TaskSyncTool, TaskTool, TodoList, TodoTool, Tool, ToolCall, ToolContext,
-    ToolResult, Toolbox, parse_ask_permission_request,
+    AskAnswer, AskPermissionTool, AskQuestion, AskUserTool, EditTool, GRANT_SESSION, RagIndexTool,
+    RagSearchTool, ReadTool, ShellTool, SkillTool, TaskSyncTool, TaskTool, TodoList, TodoTool,
+    Tool, ToolCall, ToolContext, ToolResult, Toolbox, parse_ask_permission_request,
 };
 
 pub mod command;
@@ -330,6 +332,11 @@ pub struct App {
     pub todos: TodoList,
     /// Connected MCP servers, if any.
     pub mcp_manager: Option<Arc<McpManager>>,
+    /// Workspace hybrid index bridge when `[rag].enabled` is true.
+    pub rag_manager: Option<std::sync::Arc<RagManager>>,
+    /// Session override for `[rag].auto_inject` (`/rag auto on|off`); falls
+    /// back to the config value when unset.
+    pub rag_auto_inject_session: Option<bool>,
     /// MCP servers temporarily disabled for this session. Shared with the
     /// gateway tools: disabled servers keep their connection and advertised
     /// tool (request prefix stays stable); the tool just rejects actions.
@@ -644,6 +651,29 @@ impl App {
 
         let max_tool_rounds = config.agent.max_tool_rounds;
 
+        // Workspace RAG index: build the (cheap) manager when `[rag]` is
+        // enabled; the embedding model + hybrid index load lazily on first
+        // use (tool call or /rag index) so cold start is unaffected.
+        let rag_manager = match config.rag.clone().filter(|r| r.enabled) {
+            Some(rag_cfg) => {
+                let index_dir = if rag_cfg.index_dir.is_empty() {
+                    std::path::Path::new(&session_cwd)
+                        .join(".sutcac")
+                        .join("rag")
+                } else {
+                    let p = std::path::PathBuf::from(&rag_cfg.index_dir);
+                    if p.is_absolute() {
+                        p
+                    } else {
+                        std::path::Path::new(&session_cwd).join(p)
+                    }
+                };
+                tracing::info!(target: "rag", "rag enabled; index dir {}", index_dir.display());
+                Some(crate::rag::RagManager::new(index_dir, rag_cfg))
+            }
+            None => None,
+        };
+
         // Composition root: register the built-in tools; MCP tools are added
         // in `connect_mcp` as servers come online.
         let mut toolbox = Toolbox::default();
@@ -658,6 +688,15 @@ impl App {
         toolbox.register(std::sync::Arc::new(TaskSyncTool));
         // The TODO list is a main-agent-only session tool.
         toolbox.register(std::sync::Arc::new(TodoTool));
+
+        // RAG tools (rag_search / rag_index) when [rag] is enabled; they are
+        // visible to subagents too and always registered in this exact order.
+        if let Some(mgr) = &rag_manager {
+            if mgr.config().tools_enabled {
+                toolbox.register(std::sync::Arc::new(RagSearchTool::new(mgr.clone())));
+                toolbox.register(std::sync::Arc::new(RagIndexTool::new(mgr.clone())));
+            }
+        }
 
         // Apply the main agent's allowed-tools filter if it specifies any.
         let toolbox = if main_agent.allowed_tools.is_empty() || main_agent.inherits_tools() {
@@ -712,6 +751,8 @@ impl App {
             active_skills: Vec::new(),
             todos: TodoList::new(),
             mcp_manager: None,
+            rag_manager: rag_manager.clone(),
+            rag_auto_inject_session: None,
             disabled_mcp: crate::mcp::McpDisabledServers::new(),
             memory,
             toolbox,
@@ -856,6 +897,13 @@ impl App {
         // The TODO list is a main-agent-only session tool.
         toolbox.register(std::sync::Arc::new(TodoTool));
 
+        if let Some(mgr) = &self.rag_manager {
+            if mgr.config().tools_enabled {
+                toolbox.register(std::sync::Arc::new(RagSearchTool::new(mgr.clone())));
+                toolbox.register(std::sync::Arc::new(RagIndexTool::new(mgr.clone())));
+            }
+        }
+
         if let Some(manager) = &self.mcp_manager {
             for server in manager.server_names() {
                 let tool = McpServerTool::new(manager.clone(), &server, self.disabled_mcp.clone());
@@ -894,10 +942,110 @@ impl App {
         self.tool_rounds_this_turn = 0;
         tracing::info!(turn = self.turn_seq, "user message submitted");
         self.queue_event(RuntimeEvent::MessagesChanged);
+        self.inject_rag_context(&text);
         if session_start {
             self.maybe_dispatch_memory_recall(&text);
         }
         self.persist_session();
+    }
+
+    /// RAG auto-injection: when `[rag].auto_inject` (or the session override
+    /// via `/rag auto`) is on and the hybrid index is already loaded in this
+    /// process, append an append-only system message with the top-k chunks
+    /// relevant to this turn's user text. A cold index never blocks the turn
+    /// loop — it injects nothing until `/rag index` or a `rag_index` tool
+    /// call has loaded it. Everything added between turns stays append-only
+    /// (see docs/prompt-cache-investigation.md).
+    fn inject_rag_context(&mut self, user_text: &str) {
+        if !self.rag_auto_inject_effective() {
+            return;
+        }
+        let Some(manager) = &self.rag_manager else {
+            return;
+        };
+        let Some(rag_cfg) = self.config.rag.clone() else {
+            return;
+        };
+        let Some(hits) = manager.search_loaded(user_text, rag_cfg.inject_top_k, None) else {
+            tracing::info!(target: "rag", "auto inject skipped: index not loaded");
+            return;
+        };
+        if hits.is_empty() {
+            return;
+        }
+        let mut snippets = String::new();
+        let mut budget = rag_cfg.inject_max_chars;
+        for hit in hits {
+            if budget == 0 {
+                break;
+            }
+            let body: String = hit.text.chars().take(budget).collect();
+            budget = budget.saturating_sub(body.len());
+            let label = if hit.symbol.is_empty() {
+                format!("{}_searchable_{}", hit.path, hit.doc_id)
+            } else {
+                format!("{}_local_{}", hit.path, hit.symbol)
+            };
+            snippets.push_str(&format!("-- {} ({}) --\n{}\n", label, hit.lang, body));
+        }
+        self.messages.push(Message::system(format!(
+            "Automatically retrieved workspace context relevant to the user's request              (local hybrid index; cite paths when you use them):\n{}",
+            snippets
+        )));
+        tracing::info!(target: "rag", "rag auto-inject appended a context message");
+    }
+
+    /// Effective `auto_inject` (session override beats config).
+    pub fn rag_auto_inject_effective(&self) -> bool {
+        self.rag_auto_inject_session.unwrap_or_else(|| {
+            self.config
+                .rag
+                .as_ref()
+                .map(|r| r.auto_inject)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Open the index snapshot at startup when `[rag]` is enabled so
+    /// auto-injection works from the first turn. Cheap: the embedding model
+    /// itself loads only on first actual embed call.
+    pub fn preload_rag(&mut self) {
+        if self.rag_manager.is_none() || !self.rag_auto_inject_effective() {
+            return;
+        }
+        let Some(manager) = &self.rag_manager else {
+            return;
+        };
+        match manager.ensure_loaded() {
+            Ok(()) => {
+                tracing::info!(target: "rag", "rag index preloaded at {}", manager.index_dir().display())
+            }
+            Err(e) => tracing::warn!(target: "rag", "rag preload failed: {}", e),
+        }
+    }
+
+    /// `/rag status` one-liner.
+    pub fn rag_status_message(&self) -> String {
+        match &self.rag_manager {
+            Some(manager) => {
+                if let Some(cfg) = &self.config.rag {
+                    if cfg.auto_inject && self.rag_auto_inject_session == Some(false) {
+                        return format!("{} (auto inject off this session)", manager.status_line());
+                    }
+                }
+                manager.status_line()
+            }
+            None => "rag: disabled (set [rag].enabled = true)".to_string(),
+        }
+    }
+
+    /// `/rag auto on|off`: set the session-level injection override.
+    pub fn rag_set_auto_inject(&mut self, on: bool) -> String {
+        self.rag_auto_inject_session = Some(on);
+        format!(
+            "rag auto inject {} for this session",
+            if on { "on" } else { "off" }
+        )
     }
 
     /// Handle one submitted input line: slash commands take precedence;
@@ -3754,6 +3902,7 @@ mod tests {
             },
             shell: None,
             mcp: None,
+            rag: None,
             dirs: crate::config::AppDirs {
                 history: Some(dir.to_path_buf()),
                 memory: dir.join("memory-book"),

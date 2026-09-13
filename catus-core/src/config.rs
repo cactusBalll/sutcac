@@ -40,6 +40,10 @@ pub struct AppConfig {
     /// configured MCP servers and exposes their tools to the LLM alongside the
     /// built-in `shell` tool.
     pub mcp: Option<McpConfig>,
+    /// Optional RAG configuration (`[rag]` table): the local hybrid index
+    /// exposed through tools and optional per-turn injection. When absent or
+    /// `enabled = false`, catus-rag stays dormant.
+    pub rag: Option<catus_rag::RagConfig>,
     /// Runtime storage directories. Not configurable via TOML; production
     /// binaries set them from the XDG base directory via
     /// [`AppDirs::from_xdg`], tests keep the disabled default so persistence
@@ -777,6 +781,7 @@ impl Default for AppConfig {
             agent: AgentConfig::default(),
             shell: None,
             mcp: None,
+            rag: None,
             dirs: AppDirs::default(),
         }
     }

@@ -18,6 +18,7 @@ pub mod logging;
 pub mod mcp;
 pub mod memory;
 pub mod message;
+pub mod rag;
 pub mod resources;
 pub mod runtime;
 pub mod skills;

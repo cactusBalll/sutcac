@@ -33,6 +33,7 @@ fn test_config(dir: &Path) -> AppConfig {
         agent: AgentConfig::default(),
         shell: None,
         mcp: None,
+        rag: None,
         dirs: AppDirs {
             history: None,
             memory: dir.join("memory"),
