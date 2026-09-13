@@ -136,7 +136,7 @@ impl LexicalIndex {
             .search(&parsed, &TopDocs::with_limit(limit.max(1)).order_by_score())
             .map_err(|e| RagError::Index(format!("tantivy search: {}", e)))?;
         let mut out = Vec::with_capacity(hits.len());
-        for (_score, addr) in hits {
+        for (score, addr) in hits {
             let doc = searcher
                 .doc::<TantivyDocument>(addr)
                 .map_err(|e| RagError::Index(format!("tantivy doc: {}", e)))?;
@@ -166,7 +166,7 @@ impl LexicalIndex {
                     path,
                     lang,
                 },
-                0.0,
+                score,
             ));
         }
         Ok(out)
@@ -242,6 +242,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0.doc_id, 1);
         assert!(hits[0].0.text.contains("parse_context_window"));
+        assert!(hits[0].1 > 0.0, "BM25 score must be surfaced");
         std::fs::remove_dir_all(&dir).ok();
     }
 

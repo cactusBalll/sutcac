@@ -67,10 +67,12 @@ performance = "deepseek-v4-flash"
 # available for the workspace. The index lives in ./.sutcac/rag/ by default
 # and only whitelisted text files (code + Markdown) are indexed.
 # NOTE: the first `rag_search` / `rag index` lazily downloads the
-# EmbeddingGemma-300M-Q4 embedding model (~190MB) to the fastembed cache,
-# and the ONNX Runtime shared library must be reachable at runtime
-# (`ORT_DYLIB_PATH` pointing at a `libonnxruntime.so`, e.g. from the
-# `onnxruntime` pip package).
+# EmbeddingGemma-300M-Q4 embedding model (~190MB) to the fastembed cache.
+# The ONNX Runtime shared library is provided automatically: when
+# `[rag].enabled` is set, catus reuses an existing `ORT_DYLIB_PATH`, then a
+# previously downloaded copy under ~/.config/catus/ort/, and otherwise
+# downloads the official release tarball once
+# (`catus --setup-ort [--ort-version 1.30.0]` does the same on demand).
 [rag]
 # Master switch; disable keeps catus-rag fully dormant (no tools advertised).
 enabled = false

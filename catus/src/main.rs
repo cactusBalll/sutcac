@@ -29,6 +29,15 @@ struct Cli {
     /// (existing files are never overwritten) and exit.
     #[arg(long)]
     install_project_config: bool,
+    /// Download the ONNX Runtime shared library (needed by the RAG embedding
+    /// lane when [rag].enabled) into ~/.config/catus/ort/ and print the path,
+    /// then exit. Idempotent: a previously downloaded copy is reused.
+    #[arg(long)]
+    setup_ort: bool,
+    /// ONNX Runtime release version for --setup-ort (default: the pinned
+    /// catus-core version).
+    #[arg(long, value_name = "VERSION")]
+    ort_version: Option<String>,
 }
 
 enum UiEvent {
@@ -74,6 +83,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         return Ok(());
+    }
+
+    if cli.setup_ort {
+        let version = cli
+            .ort_version
+            .as_deref()
+            .unwrap_or(catus_core::ort::ORT_VERSION);
+        return match catus_core::ort::ensure_dylib_env(version).await {
+            Ok(path) => {
+                println!("catus: onnxruntime {} ready: {}", version, path.display());
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("catus: setup-ort failed: {}", e);
+                std::process::exit(1);
+            }
+        };
     }
 
     if let Some(prompt) = cli.test {

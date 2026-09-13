@@ -49,8 +49,13 @@ pub struct SearchOpts {
 #[derive(Debug, Clone)]
 pub struct Hit {
     pub doc_id: u64,
-    /// RRF fused score (rank-based, design §4.5).
+    /// RRF fused score (rank-based, design §4.5); theoretical max `2/(k+1)`.
     pub score: f32,
+    /// Raw dense lane evidence: cosine similarity `1 - dist` (`None` when the
+    /// hit came from the lexical lane alone).
+    pub dense_score: Option<f32>,
+    /// Raw BM25 score (`None` when the hit came from the dense lane alone).
+    pub bm25_score: Option<f32>,
     pub path: String,
     pub lang: String,
     pub symbol: String,
@@ -413,39 +418,68 @@ impl HybridIndex {
             Vec::new()
         };
 
-        // 2. Lexical lane.
+        // 2. Lexical lane. Rows arrive in descending BM25-score order; they
+        // are fused in that order so RRF ranks stay deterministic (no
+        // HashMap re-iteration).
         let bm25_rows = self.lexical.search(query, self.cfg.bm25.recall_top)?;
-        let bm25_hits: HashMap<u64, String> = bm25_rows
-            .into_iter()
-            .map(|(row, _)| (row.doc_id, row.text))
-            .collect();
 
-        // 3. RRF fusion.
+        // 3. RRF fusion. Both lanes keep their rank order; the raw lane
+        // scores (cosine similarity / BM25) ride along for observability.
+        struct Fused {
+            score: f32,
+            dense: bool,
+            bm25: bool,
+            dense_sim: Option<f32>,
+            bm25_score: Option<f32>,
+            text: Option<String>,
+        }
+        let mut fused: HashMap<u64, Fused> = HashMap::new();
         let rrf_k = self.cfg.fusion.rrf_k as f32;
-        let mut fused: HashMap<u64, (f32, bool, bool, Option<String>)> = HashMap::new();
-        for (rank, (id, _dist)) in dense_hits.iter().enumerate() {
-            let e = fused.entry(*id).or_insert((0.0, false, false, None));
-            e.0 += 1.0 / (rrf_k + rank as f32 + 1.0);
-            e.1 = true;
+        for (rank, (id, dist)) in dense_hits.into_iter().enumerate() {
+            let e = fused.entry(id).or_insert_with(|| Fused {
+                score: 0.0,
+                dense: false,
+                bm25: false,
+                dense_sim: None,
+                bm25_score: None,
+                text: None,
+            });
+            e.score += 1.0 / (rrf_k + rank as f32 + 1.0);
+            e.dense = true;
+            e.dense_sim = Some((1.0 - dist).clamp(0.0, 1.0));
         }
-        for (rank, (id, text)) in bm25_hits.iter().enumerate() {
-            let e = fused.entry(*id).or_insert((0.0, false, false, None));
-            e.0 += 1.0 / (rrf_k + rank as f32 + 1.0);
-            e.2 = true;
-            e.3 = Some(text.clone());
+        for (rank, (row, bm25)) in bm25_rows.into_iter().enumerate() {
+            let e = fused.entry(row.doc_id).or_insert_with(|| Fused {
+                score: 0.0,
+                dense: false,
+                bm25: false,
+                dense_sim: None,
+                bm25_score: None,
+                text: None,
+            });
+            e.score += 1.0 / (rrf_k + rank as f32 + 1.0);
+            e.bm25 = true;
+            e.bm25_score = Some(bm25);
+            e.text = Some(row.text);
         }
 
-        // 4. Sort + logical-delete filter.
-        let mut results: Vec<(u64, f32, bool, bool, Option<String>)> = fused
+        // 4. Sort + logical-delete filter. Ties (equal RRF scores, e.g.
+        // rank-1 from a single lane) break on ascending doc_id so the
+        // ordering is reproducible.
+        let mut results: Vec<(u64, Fused)> = fused
             .into_iter()
             .filter(|(id, _)| !self.deleted.contains(id))
-            .map(|(id, (score, dense, bm25, text))| (id, score, dense, bm25, text))
             .collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         // 5. 回表 + filters.
         let mut out = Vec::new();
-        for (id, score, dense_lane, bm25_lane, bm25_text) in results.into_iter().take(k) {
+        for (id, e) in results.into_iter().take(k) {
             let Some(meta) = self.mapping.get(&id) else {
                 continue;
             };
@@ -459,11 +493,11 @@ impl HybridIndex {
                     continue;
                 }
             }
-            let text = match bm25_text {
-                Some(t) => t,
+            let text = match &e.text {
+                Some(t) => t.clone(),
                 None => self.lexical.row_for(id)?.unwrap_or_default(),
             };
-            let source = match (dense_lane, bm25_lane) {
+            let source = match (e.dense, e.bm25) {
                 (true, true) => SourceLane::Both,
                 (true, false) => SourceLane::DenseOnly,
                 (false, true) => SourceLane::Bm25Only,
@@ -471,7 +505,9 @@ impl HybridIndex {
             };
             out.push(Hit {
                 doc_id: id,
-                score,
+                score: e.score,
+                dense_score: if e.dense { e.dense_sim } else { None },
+                bm25_score: if e.bm25 { e.bm25_score } else { None },
                 path: meta.path.clone(),
                 lang: meta.lang.clone(),
                 symbol: meta.symbol.clone(),
@@ -573,6 +609,37 @@ mod tests {
             .unwrap();
         assert!(!hits.is_empty(), "expected fusion hits");
         assert!(hits[0].path.contains("llm.rs"));
+        // Both lanes must have seen this chunk: raw lane scores ride along.
+        assert!(
+            hits[0].dense_score.is_some(),
+            "missing dense score: {:?}",
+            hits[0]
+        );
+        assert!(
+            hits[0].bm25_score.is_some() && hits[0].bm25_score.unwrap() > 0.0,
+            "missing lexical score: {:?}",
+            hits[0]
+        );
+        let top = hits[0].score;
+        // RRF is rank-only: both lanes must add at most 1/(k+1) each, so
+        // the fused score never exceeds 2/(k+1) with the default k=60.
+        assert!(top <= 2.0 / 61.0, "RRF score out of range: {}", top);
+
+        // Fusion must be deterministic (regression: the lexical RRF rank
+        // used to come out of unordered HashMap iteration).
+        let hits_again = idx
+            .search("stream_chat model request", 5, &SearchOpts::default())
+            .unwrap();
+        let ids_a: Vec<u64> = hits.iter().map(|h| h.doc_id).collect();
+        let ids_b: Vec<u64> = hits_again.iter().map(|h| h.doc_id).collect();
+        assert_eq!(ids_a, ids_b, "fused ranking is not reproducible");
+        assert!(
+            hits_again
+                .iter()
+                .zip(hits.iter())
+                .all(|(b, a)| (b.score - a.score).abs() < f32::EPSILON),
+            "fused scores drifted between identical searches"
+        );
 
         // Metadata survives reopen and model mismatch is refused.
         drop(idx);

@@ -79,16 +79,33 @@ const RAG_INDEX_SCHEMA: &str = r#"{
   }
 }"#;
 
-/// Format hits into a compact LLM-readable listing.
+/// Format hits into a compact LLM-readable listing. `score` is the RRF
+/// fused rank score (theoretical max 2/(k+1) ≈ 0.033 for k=60, so small
+/// values are normal); `dense`/`bm25` show the raw per-lane evidence and
+/// `lanes` the provenance, which makes lane failures (e.g. a silently
+/// degraded dense lane) visible in the output itself.
 fn format_hits(hits: &[catus_rag::Hit]) -> String {
     if hits.is_empty() {
         return "(no matches)".to_string();
     }
+    let lanes = |lanes: catus_rag::SourceLane| match lanes {
+        catus_rag::SourceLane::Both => "both",
+        catus_rag::SourceLane::DenseOnly => "dense",
+        catus_rag::SourceLane::Bm25Only => "bm25",
+    };
     let mut out = String::new();
     for hit in hits {
         let snip = hit.text.lines().collect::<Vec<_>>().join("\n");
+        let dense = match hit.dense_score {
+            Some(s) => format!("{:.3}", s),
+            None => "-".to_string(),
+        };
+        let bm25 = match hit.bm25_score {
+            Some(s) => format!("{:.2}", s),
+            None => "-".to_string(),
+        };
         out.push_str(&format!(
-            "## {}:{} (score {:.3})\n{}\n---\n",
+            "## {}:{} (score {:.3}, dense {}, bm25 {}, lanes {})\n{}\n---\n",
             hit.path,
             if hit.symbol.is_empty() {
                 "?"
@@ -96,6 +113,9 @@ fn format_hits(hits: &[catus_rag::Hit]) -> String {
                 hit.symbol.as_str()
             },
             hit.score,
+            dense,
+            bm25,
+            lanes(hit.source),
             snip
         ));
     }
@@ -319,6 +339,8 @@ mod tests {
         let hit = catus_rag::Hit {
             doc_id: 1,
             score: 0.03,
+            dense_score: Some(0.999),
+            bm25_score: Some(4.12),
             path: "src/lib.rs".into(),
             lang: "rust".into(),
             symbol: "main".into(),
@@ -327,5 +349,25 @@ mod tests {
         };
         let out = format_hits(&[hit]);
         assert!(out.contains("src/lib.rs:main"), "{}", out);
+        assert!(out.contains("score 0.030"), "{}", out);
+        assert!(out.contains("dense 0.999"), "{}", out);
+        assert!(out.contains("bm25 4.12"), "{}", out);
+        assert!(out.contains("lanes both"), "{}", out);
+        // Dense-only hits hide the lexical lane.
+        let dense_only = catus_rag::Hit {
+            doc_id: 2,
+            score: 0.016,
+            dense_score: Some(0.87),
+            bm25_score: None,
+            path: "src/other.rs".into(),
+            lang: "rust".into(),
+            symbol: String::new(),
+            text: "fn other() {}".into(),
+            source: catus_rag::SourceLane::DenseOnly,
+        };
+        let out = format_hits(&[dense_only]);
+        assert!(out.contains("dense 0.870"), "{}", out);
+        assert!(out.contains("bm25 -"), "{}", out);
+        assert!(out.contains("lanes dense"), "{}", out);
     }
 }

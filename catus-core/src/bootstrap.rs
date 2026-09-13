@@ -66,6 +66,30 @@ pub async fn bootstrap_runtime(config: AppConfig, log_warnings: bool) -> Result<
     // Drain startup events queued during initialization.
     while runtime.app.take_event().is_some() {}
 
+    // ONNX Runtime provisioning: when RAG is enabled the embedding lane
+    // (fastembed + ort-load-dynamic) needs a shared `libonnxruntime` reachable
+    // through `ORT_DYLIB_PATH`. Reuse an existing valid path or a previous
+    // download, otherwise fetch the release archive from GitHub once; the
+    // environment variable is injected before the model loads lazily.
+    if runtime.app.config.rag.as_ref().is_some_and(|r| r.enabled) {
+        match crate::ort::ensure_dylib_env(crate::ort::ORT_VERSION).await {
+            Ok(path) => {
+                if log_warnings {
+                    println!("catus: rag: onnxruntime library at {}", path.display());
+                }
+                tracing::info!(target: "rag", "onnxruntime library: {}", path.display());
+            }
+            Err(e) => {
+                let msg = format!("rag warning: {}", e);
+                if log_warnings {
+                    eprintln!("catus: {}", msg);
+                } else {
+                    tracing::warn!(parent: span.clone(), "{}", msg);
+                }
+            }
+        }
+    }
+
     // RAG pre-load: opening the index snapshot is cheap (the embedding model
     // itself stays lazy), so auto-injection works from the very first turn.
     runtime.app.preload_rag();
