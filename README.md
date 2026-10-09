@@ -1,5 +1,7 @@
 # sutcac
 
+![arch](./arch.jpeg)
+
 **An OpenAI-compatible coding agent runtime with four frontends — a terminal UI, a Tauri desktop/web app, an HTTP/WebSocket server, and a headless one-shot mode — plus a Bash-compatible shell and a local hybrid-retrieval index.**
 
 [中文文档](README.CN.md) · [Agent/contributor guide](AGENTS.md)

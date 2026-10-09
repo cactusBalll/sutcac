@@ -1,5 +1,7 @@
 # sutcac
 
+![arch](./arch.jpeg)
+
 **一个兼容 OpenAI API 的编码 Agent 运行时，提供四种前端 —— 终端 TUI、Tauri 桌面/网页应用、HTTP/WebSocket 服务端，以及无头一次性模式 —— 并内置一个兼容 Bash 的 shell 与本地混合检索索引。**
 
 [English](README.md) · [Agent / 贡献者指南](AGENTS.md)
